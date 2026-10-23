@@ -830,3 +830,112 @@ func TestCopyResponseDoesNotFlushNormalJSON(t *testing.T) {
 		t.Fatalf("unexpected body: got %q", rec.Body.String())
 	}
 }
+
+const subscriptionRequired403 = `{"error":{"message":"Upstream request failed: An active OpenCode Go subscription is required to use Go models"}}`
+
+func TestIsKeyDead403Subscription(t *testing.T) {
+	resp := &http.Response{StatusCode: 403, Header: http.Header{}, Body: io.NopCloser(strings.NewReader(subscriptionRequired403))}
+	if !isKeyDead(resp) {
+		t.Fatal("expected 403 subscription-required to be a dead key")
+	}
+	other := `{"error":{"message":"forbidden"}}`
+	resp = &http.Response{StatusCode: 403, Header: http.Header{}, Body: io.NopCloser(strings.NewReader(other))}
+	if isKeyDead(resp) {
+		t.Fatal("expected other 403 not to be a dead key")
+	}
+	if got, _ := io.ReadAll(resp.Body); string(got) != other {
+		t.Fatalf("body not restored: %q", got)
+	}
+	resp = &http.Response{StatusCode: 200, Header: http.Header{}, Body: io.NopCloser(strings.NewReader(subscriptionRequired403))}
+	if isKeyDead(resp) {
+		t.Fatal("expected 200 not to be a dead key")
+	}
+}
+
+func TestProxyRotatesOn403SubscriptionRequired(t *testing.T) {
+	var gotKeys []string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotKeys = append(gotKeys, r.Header.Get("Authorization"))
+		if r.Header.Get("Authorization") == "Bearer bad" {
+			w.WriteHeader(http.StatusForbidden)
+			_, _ = w.Write([]byte(subscriptionRequired403))
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"ok":true}`))
+	}))
+	defer upstream.Close()
+
+	app := newApp(Config{ProxyAPIKey: "p", UpstreamAPIKeys: []string{"bad", "good"}, UpstreamBaseURL: upstream.URL, MaxRequestBodyBytes: 1024})
+	rec := doProxyReq(app)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d body %s", rec.Code, rec.Body.String())
+	}
+	if strings.Join(gotKeys, ",") != "Bearer bad,Bearer good" {
+		t.Fatalf("unexpected keys: %v", gotKeys)
+	}
+	st := app.keys.Status()
+	if st.Keys[0].State != string(KeyExhausted) || st.Keys[1].State != string(KeyAvailable) {
+		t.Fatalf("unexpected key states: %+v", st.Keys)
+	}
+}
+
+func TestProxyPassesThroughOther403(t *testing.T) {
+	var calls atomic.Int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		w.WriteHeader(http.StatusForbidden)
+		_, _ = w.Write([]byte(`{"error":{"message":"model not allowed"}}`))
+	}))
+	defer upstream.Close()
+
+	app := newApp(Config{ProxyAPIKey: "p", UpstreamAPIKeys: []string{"k1", "k2"}, UpstreamBaseURL: upstream.URL, MaxRequestBodyBytes: 1024})
+	rec := doProxyReq(app)
+	if rec.Code != http.StatusForbidden || !strings.Contains(rec.Body.String(), "model not allowed") {
+		t.Fatalf("expected 403 passthrough, got %d body %s", rec.Code, rec.Body.String())
+	}
+	if calls.Load() != 1 {
+		t.Fatalf("expected a single upstream call, got %d", calls.Load())
+	}
+	if st := app.keys.Status(); st.Keys[0].State != string(KeyAvailable) {
+		t.Fatalf("expected key 0 available, got %+v", st.Keys[0])
+	}
+}
+
+func TestProxyAllKeys403SubscriptionExhausted(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusForbidden)
+		_, _ = w.Write([]byte(subscriptionRequired403))
+	}))
+	defer upstream.Close()
+
+	app := newApp(Config{ProxyAPIKey: "p", UpstreamAPIKeys: []string{"k1", "k2"}, UpstreamBaseURL: upstream.URL, MaxRequestBodyBytes: 1024})
+	rec := doProxyReq(app)
+	if rec.Code != http.StatusTooManyRequests || !strings.Contains(rec.Body.String(), "all upstream keys exhausted") {
+		t.Fatalf("expected 429 all exhausted, got %d body %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestValidateKeysMarksExhaustedOn403Subscription(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") == "Bearer good" {
+			_, _ = w.Write([]byte(`{"data":[]}`))
+			return
+		}
+		w.WriteHeader(http.StatusForbidden)
+		_, _ = w.Write([]byte(subscriptionRequired403))
+	}))
+	defer upstream.Close()
+	app := newApp(Config{ProxyAPIKey: "p", UpstreamAPIKeys: []string{"good", "bad"}, UpstreamBaseURL: upstream.URL, MaxRequestBodyBytes: 1})
+	req := httptest.NewRequest(http.MethodPost, "/admin/validate-keys", nil)
+	req.Header.Set("Authorization", "Bearer p")
+	rec := httptest.NewRecorder()
+	app.ServeHTTP(rec, req)
+	var out ValidateKeysResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+		t.Fatal(err)
+	}
+	if len(out.Results) != 2 || out.Results[0].State != string(KeyAvailable) || out.Results[1].State != string(KeyExhausted) {
+		t.Fatalf("unexpected results: %+v", out.Results)
+	}
+}

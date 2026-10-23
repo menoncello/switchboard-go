@@ -764,7 +764,7 @@ func (a *App) handleValidateKeys(w http.ResponseWriter, r *http.Request) {
 			resp.Body.Close()
 			a.keys.MarkAvailable(i)
 			res.State = string(KeyAvailable)
-		} else if resp.StatusCode == http.StatusTooManyRequests && isQuota429(resp) {
+		} else if isKeyDead(resp) {
 			io.Copy(io.Discard, resp.Body)
 			resp.Body.Close()
 			a.keys.SetState(i, KeyExhausted)
@@ -805,7 +805,7 @@ func (a *App) proxyV1(w http.ResponseWriter, r *http.Request, style APIStyle) {
 			http.Error(w, reqErr.Error(), http.StatusBadGateway)
 			return
 		}
-		if resp.StatusCode == http.StatusTooManyRequests && isQuota429(resp) {
+		if isKeyDead(resp) {
 			_ = resp.Body.Close()
 			a.keys.MarkExhausted(idx)
 			if a.keys.ShouldNotifySwitch(idx) {
@@ -937,6 +937,19 @@ func copyResponse(w http.ResponseWriter, resp *http.Response) {
 	} else {
 		_, _ = io.Copy(w, resp.Body)
 	}
+}
+
+// isKeyDead reports whether the upstream response means this key cannot serve
+// requests and the next one should be tried: a quota 429, or the 403 OpenCode Go
+// returns when the key's subscription is gone. Like isQuota429, it restores resp.Body.
+func isKeyDead(resp *http.Response) bool {
+	if resp.StatusCode != http.StatusForbidden {
+		return isQuota429(resp)
+	}
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+	resp.Body.Close()
+	resp.Body = io.NopCloser(bytes.NewReader(body))
+	return strings.Contains(strings.ToLower(string(body)), "subscription is required")
 }
 
 func isQuota429(resp *http.Response) bool {
