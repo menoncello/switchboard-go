@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"compress/gzip"
 	"encoding/json"
 	"io"
 	"net/http"
@@ -937,5 +938,106 @@ func TestValidateKeysMarksExhaustedOn403Subscription(t *testing.T) {
 	}
 	if len(out.Results) != 2 || out.Results[0].State != string(KeyAvailable) || out.Results[1].State != string(KeyExhausted) {
 		t.Fatalf("unexpected results: %+v", out.Results)
+	}
+}
+
+func TestProxyRotatesOn403SubscriptionCompressed(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") != "Bearer bad" {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"ok":true}`))
+			return
+		}
+		if strings.Contains(r.Header.Get("Accept-Encoding"), "gzip") {
+			w.Header().Set("Content-Encoding", "gzip")
+			w.WriteHeader(http.StatusForbidden)
+			zw := gzip.NewWriter(w)
+			_, _ = zw.Write([]byte(subscriptionRequired403))
+			_ = zw.Close()
+			return
+		}
+		w.WriteHeader(http.StatusForbidden)
+		_, _ = w.Write([]byte(subscriptionRequired403))
+	}))
+	defer upstream.Close()
+
+	app := newApp(Config{ProxyAPIKey: "p", UpstreamAPIKeys: []string{"bad", "good"}, UpstreamBaseURL: upstream.URL, MaxRequestBodyBytes: 1024})
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"glm-5.1","messages":[]}`))
+	req.Header.Set("Authorization", "Bearer p")
+	req.Header.Set("Accept-Encoding", "gzip, deflate, br")
+	rec := httptest.NewRecorder()
+	app.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d body %q", rec.Code, rec.Body.String())
+	}
+}
+
+func TestProxyDecompressesUpstreamBodyForClient(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Content-Encoding", "gzip")
+		zw := gzip.NewWriter(w)
+		_, _ = zw.Write([]byte(`{"ok":true}`))
+		_ = zw.Close()
+	}))
+	defer upstream.Close()
+
+	app := newApp(Config{ProxyAPIKey: "p", UpstreamAPIKeys: []string{"k1"}, UpstreamBaseURL: upstream.URL, MaxRequestBodyBytes: 1024})
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{}`))
+	req.Header.Set("Authorization", "Bearer p")
+	req.Header.Set("Accept-Encoding", "gzip, deflate, br")
+	rec := httptest.NewRecorder()
+	app.ServeHTTP(rec, req)
+	if rec.Body.String() != `{"ok":true}` || rec.Header().Get("Content-Encoding") != "" {
+		t.Fatalf("expected plain body without Content-Encoding, got %q (%q)", rec.Body.String(), rec.Header().Get("Content-Encoding"))
+	}
+}
+
+func TestProxyStreamsSSEFromGzipUpstream(t *testing.T) {
+	release := make(chan struct{})
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.Header().Set("Content-Encoding", "gzip")
+		zw := gzip.NewWriter(w)
+		_, _ = zw.Write([]byte("data: one\n\n"))
+		_ = zw.Flush()
+		w.(http.Flusher).Flush()
+		select {
+		case <-release:
+		case <-time.After(5 * time.Second):
+		}
+		_, _ = zw.Write([]byte("data: two\n\n"))
+		_ = zw.Close()
+	}))
+	defer upstream.Close()
+
+	srv := httptest.NewServer(newApp(Config{ProxyAPIKey: "p", UpstreamAPIKeys: []string{"k1"}, UpstreamBaseURL: upstream.URL, MaxRequestBodyBytes: 1024}))
+	defer srv.Close()
+	req, _ := http.NewRequest(http.MethodPost, srv.URL+"/v1/chat/completions", strings.NewReader(`{}`))
+	req.Header.Set("Authorization", "Bearer p")
+	req.Header.Set("Accept-Encoding", "gzip, deflate, br")
+	resp, err := srv.Client().Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	first := make(chan string, 1)
+	go func() {
+		buf := make([]byte, len("data: one\n\n"))
+		_, _ = io.ReadFull(resp.Body, buf)
+		first <- string(buf)
+	}()
+	select {
+	case got := <-first:
+		if got != "data: one\n\n" {
+			t.Fatalf("unexpected first event %q", got)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("first SSE event not streamed before upstream finished")
+	}
+	close(release)
+	rest, _ := io.ReadAll(resp.Body)
+	if string(rest) != "data: two\n\n" {
+		t.Fatalf("unexpected rest %q", rest)
 	}
 }

@@ -845,6 +845,9 @@ func (a *App) doUpstream(ctx context.Context, r *http.Request, body []byte, key 
 		return nil, err
 	}
 	copyHeaders(req.Header, r.Header)
+	// Let the Transport negotiate gzip itself: it only decompresses transparently
+	// when it set Accept-Encoding, and isKeyDead needs to read the plain body.
+	req.Header.Del("Accept-Encoding")
 	if apiStyle == APIStyleAnthropic {
 		req.Header.Set("x-api-key", key)
 		if strings.TrimSpace(req.Header.Get("anthropic-version")) == "" {
