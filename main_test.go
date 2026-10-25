@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"io"
+	"log"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -828,5 +829,169 @@ func TestCopyResponseDoesNotFlushNormalJSON(t *testing.T) {
 	expectedBody := `{"choices": [{"message": {"content": "Hello World"}}]}`
 	if rec.Body.String() != expectedBody {
 		t.Fatalf("unexpected body: got %q", rec.Body.String())
+	}
+}
+
+const fakeUsageBody = `{"usage":{"rolling":{"percent":12.5,"resetsAt":"2026-10-25T12:00:00Z"},"weekly":{"percent":40,"resetsAt":"2026-10-27T00:00:00Z"},"monthly":{"percent":7,"resetsAt":"2026-11-01T00:00:00Z"}}}`
+
+// fakeUsageServer answers /usage per Bearer key: "sk-good*" gets windows, "sk-bad*" gets 401.
+func fakeUsageServer(t *testing.T, hits *int32) *httptest.Server {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(hits, 1)
+		if strings.HasPrefix(r.Header.Get("Authorization"), "Bearer sk-good") {
+			_, _ = w.Write([]byte(fakeUsageBody))
+			return
+		}
+		http.Error(w, "nope", http.StatusUnauthorized)
+	}))
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+func getKeysReport(t *testing.T, app *App) (int, string, KeysReportResponse) {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodGet, "/admin/keys", nil)
+	req.Header.Set("Authorization", "Bearer p")
+	rec := httptest.NewRecorder()
+	app.ServeHTTP(rec, req)
+	var out KeysReportResponse
+	if rec.Code == http.StatusOK {
+		if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return rec.Code, rec.Body.String(), out
+}
+
+func TestAdminKeysUsageSuccess(t *testing.T) {
+	var hits int32
+	srv := fakeUsageServer(t, &hits)
+	app := newApp(Config{ProxyAPIKey: "p", UpstreamAPIKeys: []string{"sk-good-1", "sk-good-2"}, KeyNames: []string{"principal", "reserva"}, UsageURL: srv.URL, UsageCacheTTL: time.Minute, RetryExhaustedAfter: time.Hour})
+	app.keys.MarkExhausted(1)
+	code, body, out := getKeysReport(t, app)
+	if code != http.StatusOK {
+		t.Fatalf("got %d %s", code, body)
+	}
+	if len(out.Keys) != 2 || out.GeneratedAt == "" || out.UsageCachedSeconds != 60 {
+		t.Fatalf("unexpected report: %s", body)
+	}
+	k0, k1 := out.Keys[0], out.Keys[1]
+	if k0.Name != "principal" || !k0.Eligible {
+		t.Fatalf("key 0: %+v", k0)
+	}
+	if k1.Name != "reserva" || k1.State != "exhausted" || k1.Eligible || k1.Last429Time == "" {
+		t.Fatalf("key 1: %+v", k1)
+	}
+	u := k0.Usage
+	if u == nil || u.Rolling.Percent != 12.5 || u.Weekly.Percent != 40 || u.Monthly.Percent != 7 {
+		t.Fatalf("usage: %+v", u)
+	}
+	if string(u.Weekly.ResetsAt) != `"2026-10-27T00:00:00Z"` {
+		t.Fatalf("resets_at: %s", u.Weekly.ResetsAt)
+	}
+	if !strings.Contains(body, `"resets_at"`) || strings.Contains(body, "resetsAt") {
+		t.Fatalf("expected snake_case resets_at: %s", body)
+	}
+}
+
+func TestAdminKeysOneKeyErrorOneGood(t *testing.T) {
+	var hits int32
+	srv := fakeUsageServer(t, &hits)
+	app := newApp(Config{ProxyAPIKey: "p", UpstreamAPIKeys: []string{"sk-bad-secret", "sk-good-secret"}, UsageURL: srv.URL})
+	_, body, out := getKeysReport(t, app)
+	if out.Keys[0].UsageError != "HTTP 401" || out.Keys[0].Usage != nil {
+		t.Fatalf("key 0: %+v", out.Keys[0])
+	}
+	if out.Keys[1].UsageError != "" || out.Keys[1].Usage == nil {
+		t.Fatalf("key 1: %+v", out.Keys[1])
+	}
+	if out.Keys[0].Name != "" || out.Keys[1].Name != "" {
+		t.Fatalf("names should be empty: %s", body)
+	}
+}
+
+func TestAdminKeysNeverLeaksKeyValue(t *testing.T) {
+	var hits int32
+	srv := fakeUsageServer(t, &hits)
+	dead := httptest.NewServer(http.NotFoundHandler())
+	deadURL := dead.URL
+	dead.Close() // connection refused: the url.Error text would carry the URL, not the key
+	var logs bytes.Buffer
+	log.SetOutput(&logs)
+	defer log.SetOutput(os.Stderr)
+	for _, usageURL := range []string{srv.URL, deadURL} {
+		app := newApp(Config{ProxyAPIKey: "p", UpstreamAPIKeys: []string{"sk-bad-SEGREDO123", "sk-good-SEGREDO456"}, KeyNames: []string{"a", "b"}, UsageURL: usageURL})
+		_, body, _ := getKeysReport(t, app)
+		for _, secret := range []string{"SEGREDO123", "SEGREDO456", "sk-bad", "sk-good"} {
+			if strings.Contains(body, secret) || strings.Contains(logs.String(), secret) {
+				t.Fatalf("leaked %q\nbody: %s\nlogs: %s", secret, body, logs.String())
+			}
+		}
+	}
+	if !strings.Contains(logs.String(), "usage query failed") {
+		t.Fatalf("expected the failure to be logged: %q", logs.String())
+	}
+}
+
+func TestAdminKeysCache(t *testing.T) {
+	var hits int32
+	srv := fakeUsageServer(t, &hits)
+	now := time.Now()
+	app := newApp(Config{ProxyAPIKey: "p", UpstreamAPIKeys: []string{"sk-good-1", "sk-good-2"}, UsageURL: srv.URL, UsageCacheTTL: time.Minute})
+	app.usage.now = func() time.Time { return now }
+	getKeysReport(t, app)
+	getKeysReport(t, app)
+	if got := atomic.LoadInt32(&hits); got != 2 {
+		t.Fatalf("expected 2 upstream hits (1 per key), got %d", got)
+	}
+	now = now.Add(61 * time.Second)
+	getKeysReport(t, app)
+	if got := atomic.LoadInt32(&hits); got != 4 {
+		t.Fatalf("expected refresh after TTL (4 hits), got %d", got)
+	}
+}
+
+func TestAdminKeysNamesMissingOrShort(t *testing.T) {
+	var hits int32
+	srv := fakeUsageServer(t, &hits)
+	long := strings.Repeat("x", 60)
+	cfg := Config{ProxyAPIKey: "p", UpstreamAPIKeys: []string{"sk-good-1", "sk-good-2", "sk-good-3"}, UsageURL: srv.URL, KeyNames: parseKeyNames("principal,\n" + long + "\n")}
+	_, _, out := getKeysReport(t, newApp(cfg))
+	if out.Keys[0].Name != "principal" || out.Keys[1].Name != long[:40] || out.Keys[2].Name != "" {
+		t.Fatalf("names: %q %q %q", out.Keys[0].Name, out.Keys[1].Name, out.Keys[2].Name)
+	}
+	if got := parseKeyNames("a\r\nb, c"); got[0] != "ab" || got[1] != "c" {
+		t.Fatalf("got %q", got)
+	}
+}
+
+func TestAdminKeysAuthAndMethod(t *testing.T) {
+	app := newApp(Config{ProxyAPIKey: "p", UpstreamAPIKeys: []string{"sk-good-1"}})
+	req := httptest.NewRequest(http.MethodGet, "/admin/keys", nil)
+	rec := httptest.NewRecorder()
+	app.ServeHTTP(rec, req)
+	if rec.Code != http.StatusUnauthorized || !strings.Contains(rec.Body.String(), "invalid_api_key") {
+		t.Fatalf("no bearer: %d %s", rec.Code, rec.Body.String())
+	}
+	req = httptest.NewRequest(http.MethodPost, "/admin/keys", nil)
+	req.Header.Set("Authorization", "Bearer p")
+	rec = httptest.NewRecorder()
+	app.ServeHTTP(rec, req)
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("POST should not match (same as other admin routes), got %d", rec.Code)
+	}
+}
+
+func TestUsageCacheTTLEnv(t *testing.T) {
+	t.Setenv("USAGE_CACHE_TTL", "5x")
+	cfg := defaultConfig()
+	applyEnvOverrides(&cfg)
+	cfg.ProxyAPIKey, cfg.UpstreamAPIKeys = "p", []string{"k"}
+	if err := validateConfig(cfg); err == nil {
+		t.Fatal("expected invalid USAGE_CACHE_TTL to fail validation")
+	}
+	if d := defaultConfig(); d.UsageCacheTTL != 60*time.Second || d.UsageURL != "https://opencode.ai/zen/go/v1/usage" {
+		t.Fatalf("defaults: %+v", d)
 	}
 }
