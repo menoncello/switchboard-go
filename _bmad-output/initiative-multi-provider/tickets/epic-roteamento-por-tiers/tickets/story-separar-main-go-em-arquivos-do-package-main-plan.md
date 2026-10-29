@@ -3,7 +3,7 @@ title: 'Separar main.go em arquivos do package main'
 type: 'refactor'
 ticket: '1'
 created: '2026-10-29'
-status: 'built'
+status: done
 baseline_revision: '411af6caca1c2d8524481eb6724ed38294a8bfe9'
 route: 'full'
 route_source: 'auto'
@@ -49,12 +49,12 @@ deferred: []
 ## Tasks & Acceptance
 
 **Execution:**
-- [ ] `config.go` -- criar com o código de config -- responsabilidade config
-- [ ] `keys.go` -- criar com `KeyManager` e tipos de status -- responsabilidade chaves
-- [ ] `server.go` -- criar com `App`, handlers e `validateConfigAndPrint` -- responsabilidade servidor
-- [ ] `proxy.go` -- criar com `APIStyle`, `proxyV1` e helpers de upstream/erro -- responsabilidade proxy
-- [ ] `notify.go` -- criar com `SMTPNotifier` e `sendMail` -- responsabilidade notificação
-- [ ] `main.go` -- reduzir a `main()` e seus imports -- só montagem do servidor
+- [x] `config.go` -- criar com o código de config -- responsabilidade config
+- [x] `keys.go` -- criar com `KeyManager` e tipos de status -- responsabilidade chaves
+- [x] `server.go` -- criar com `App`, handlers e `validateConfigAndPrint` -- responsabilidade servidor
+- [x] `proxy.go` -- criar com `APIStyle`, `proxyV1` e helpers de upstream/erro -- responsabilidade proxy
+- [x] `notify.go` -- criar com `SMTPNotifier` e `sendMail` -- responsabilidade notificação
+- [x] `main.go` -- reduzir a `main()` e seus imports -- só montagem do servidor
 
 **Acceptance Criteria:**
 - Given o repositório após a mudança, when rodar `go build ./... && go vet ./... && go test ./...`, then tudo passa sem alterar `main_test.go`.
@@ -88,3 +88,25 @@ Rota full: mover ~1100 linhas entre 6 arquivos, mecânico mas amplo.
 - Follow-up review recommended: false (nenhum patch aplicado).
 - Verification: `gofmt -l .` vazio; `go build`, `go vet`, `go test` passam; `main_test.go` e `adminkeys.go` intactos; comparação das linhas ordenadas mostra só diferenças de `package`/`import`.
 - Residual risks: nenhum conhecido.
+
+## Code Review
+
+### 2026-10-29
+0 decision-needed, 1 patch, 5 defer, 8 rejected.
+
+- [x] [Review][Patch] Plan: Execution checkboxes unticked although status is built [story-separar-main-go-em-arquivos-do-package-main-plan.md:51]
+- [x] [Review][Defer] proxyV1 devolve o erro de transporte cru ao cliente (vaza a URL do upstream, ignora o formato por estilo) [proxy.go:40] — deferred: pre-existing
+- [x] [Review][Defer] Valores inválidos de MAX_REQUEST_BODY_BYTES e SMTP_PORT são ignorados em silêncio [config.go:223,262] — deferred: pre-existing
+- [x] [Review][Defer] Código morto carregado na divisão: validateConfigAndPrint e KeyManager.AdvanceOnExhaustion [server.go:226, keys.go:105] — deferred: pre-existing, a story só move código
+- [x] [Review][Defer] yamlConfig não tem usage_url nem usage_cache_ttl (só por variável de ambiente) [config.go:96] — deferred: pre-existing
+- [x] [Review][Defer] proxyV1 detecta body grande por strings.Contains no texto do erro [proxy.go:24] — deferred: pre-existing
+
+#### Rejected
+- Log de startup duplica safeConfigSummary / validateConfig chamado duas vezes (low): os textos diferem, unir muda a saída; a validação dupla é inofensiva.
+- Code Map do plano com linhas desatualizadas (low): documento histórico, reescrever não vale.
+- "Comparação das linhas ordenadas" como verificação fraca (false): a diferença ordenada entre o main.go antigo e os arquivos novos é vazia, só mudam `package`/`import`.
+- Log de review sem evidência e sem plano de conflito de merge (low): comentário de processo, sem defeito no código.
+- Falta `.git-blame-ignore-revs` (low): raramente visível, exige arquivo extra.
+- Divisão de responsabilidade incompleta (adminkeys.go, tipos ValidateKey*) (low): o plano proíbe mexer em adminkeys.go; corrigir editaria a intenção.
+- isQuota429 trata "exhausted" como cota (low): heurística intencional.
+- handleValidateKeys repete Discard+Close três vezes (low): duplicação cosmética.
