@@ -3,7 +3,7 @@ id: 2
 type: epic
 title: "O proxy troca de provedor quando um falha"
 parent: initiative-multi-provider
-covers: [R1, R2, R3, R4, R6, R7, R8, R10, R11, R12]
+covers: [R1, R2, R3, R4, R6, R7, R8, R10, R11, R12, R16]
 sources: []
 companions: []
 after: []
@@ -28,10 +28,11 @@ Para o Eduardo e os agentes Hermes: uma request não falha por cota esgotada enq
 - R3 (parent R3): Cada tier declara os estilos de API que fala (OpenAI, Anthropic) e é pulado se não falar o do request; não há tradução entre estilos.
 - R4 (parent R4): Toda a config fica no proxy; os agentes mantêm o mesmo URL e a mesma `PROXY_API_KEY`.
 - R6 (parent R6): Tiers gratuitos (`free: true`) entram como os demais.
-- R7 (parent R7): 429, 5xx, 401, 402 e 404 do upstream colocam o tier em cooldown e a request segue ao próximo; 400 não faz failover. Erro de conexão e timeout antes do primeiro byte da resposta também fazem failover.
+- R7 (parent R7): 429, 5xx, 401, 402 e 404 do upstream colocam o tier em cooldown e a request segue ao próximo; 400 não faz failover. Erro de conexão e timeout antes do primeiro byte da resposta também fazem failover, sem cooldown.
 - R8 (parent R8): Um modelo só é elegível num tier que tenha o contexto mínimo e o tool calling que o Hermes precisa.
 - R10 (parent R10): O estado de cooldown sobrevive a um reinício do proxy. O gasto do dia é do épico de relatório.
 - R11 (parent R11): Cada request gera um log estruturado com modelo, estilo, chave ou tier, status e latência.
+- R16 (parent R16): Quando uma request falha porque nenhum tier a atendeu, o cliente recebe o erro e o Eduardo é avisado por Telegram, uma vez por episódio.
 - R12 (parent R12): A página de status mostra os tiers, com estado e cooldown; as chaves continuam como no épico da página.
 
 ## Constraints
@@ -44,7 +45,8 @@ Para o Eduardo e os agentes Hermes: uma request não falha por cota esgotada enq
 ## Done when
 
 - Com o OpenCode Go esgotado, uma request é atendida pelo próximo tier com modelo mapeado, verificado contra upstreams de teste.
-- 401, 402, 404, 5xx, 429 e erro de conexão antes do primeiro byte põem o tier em cooldown e passam ao próximo; 400 volta ao cliente.
+- 401, 402, 404, 5xx e 429 põem o tier em cooldown e passam ao próximo; erro de conexão e timeout antes do primeiro byte passam ao próximo sem cooldown; 400 volta ao cliente.
+- Quando todos os tiers falham, o cliente recebe a última resposta do upstream (ou o 429 local, se todos estão em cooldown ou pulados) e o Eduardo recebe um aviso no Telegram.
 - Um tier sem mapeamento para o modelo, ou que não fala o estilo do request, é pulado; um modelo sem o contexto mínimo ou sem tool calling não é elegível.
 - Uma config com tier pago (sem `free: true`) é rejeitada na partida, até o épico de relatório entregar o teto.
 - O cooldown dos tiers e das chaves do tier 0 permanece depois de reiniciar o proxy, com o arquivo de estado num volume documentado.
@@ -53,7 +55,7 @@ Para o Eduardo e os agentes Hermes: uma request não falha por cota esgotada enq
 
 ## Boundaries
 
-- Fora: tradução entre estilos, proxy key por agente, tiers pagos e o teto diário (épico de relatório), relatório e catálogo.
+- Fora: tradução entre estilos, outros canais de aviso além de SMTP e Telegram, proxy key por agente, tiers pagos e o teto diário (épico de relatório), relatório e catálogo.
 - Touch point: `KeyManager` e `proxyV1` em `main.go` — owner: este épico
 - Touch point: a página de status — owner: epic-pagina-de-status; este épico acrescenta a seção de tiers
 - Must not change: o URL e a `PROXY_API_KEY` que os agentes Hermes usam, e a config atual de chaves.
@@ -78,6 +80,11 @@ Para o Eduardo e os agentes Hermes: uma request não falha por cota esgotada enq
 - Decision (2026-10-29): o Hermes do Eduardo usa os dois estilos: o provider `opencode-go` em `/v1` (OpenAI) e o provider `switchboard` com `api_mode: anthropic_messages`; os tiers têm que atender os dois. Sem spike.
 - Decision (2026-10-29): R8: `min_context` global na config com padrão 64000 (mínimo documentado do Hermes Agent); cada modelo do mapa declara `context` e `tools`; tool calling só é checado em request com `tools`; o tier 0 é isento.
 - Decision (2026-10-29): toda a config dos tiers fica no YAML: `base_url` e `api_key` por tier (o valor no arquivo, como o `upstream.api_keys` de hoje), mais `cooldown`, `min_context` e `state_file`. Um provedor com dois estilos em URLs diferentes vira dois tiers.
+- Decision (2026-10-29): erro de conexão e timeout fazem failover sem cooldown; cancelamento pelo cliente não conta como falha.
+- Decision (2026-10-29): quando todos os tiers falham, o cliente recebe a última resposta do upstream; o 429 local fica para todos em cooldown ou pulados, com Retry-After do tier que volta primeiro; o Eduardo é avisado por Telegram (R16), além do SMTP.
+- Decision (2026-10-29): sem `state_file` a persistência fica desligada, com aviso na partida; a imagem distroless `nonroot` não tem diretório gravável por padrão.
+- Decision (2026-10-29): 404 só põe o tier em cooldown quando a request tem model mapeado e o corpo não indica modelo inexistente.
+- Decision (2026-10-29): a story de config (id 11) separa-se do tracer e vem antes dele; a story 4 separa o failover por conexão e timeout (id 12); o formato do mapa de modelos é objeto (`id`, `context`, `tools`) desde a story 11; estilos ausentes valem só OpenAI.
 - Decision (2026-10-29): R7 no tier 0: só 429 de cota e 403 de assinatura giram a chave; 401, 402, 404 e 5xx põem o tier inteiro em cooldown.
 - Decision (2026-10-29): fecha com a story "Refactor sweep".
 - Source conflict: R7 — o código só troca de chave em 429 de cota e 403 de assinatura (`isKeyDead`); 401, 402, 404 e 5xx passam ao cliente e erro de conexão vira 502 sem failover. Este épico muda isso.

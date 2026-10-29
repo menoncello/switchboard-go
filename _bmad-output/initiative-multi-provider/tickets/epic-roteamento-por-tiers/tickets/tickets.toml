@@ -1,4 +1,5 @@
-# Stories do épico roteamento-por-tiers, em ordem de construção. Uma trilha só: tudo mexe em KeyManager e proxyV1.
+# Stories do épico roteamento-por-tiers, em ordem de construção (a ordem da tabela, não o id). Uma trilha só: tudo mexe em KeyManager e proxyV1.
+# next_id = 13
 
 [[entry]]
 id = 1
@@ -12,13 +13,24 @@ hitl = false
 risk = "low"
 
 [[entry]]
+id = 11
+type = "story"
+title = "Config de tiers: leitura, validação e documentação"
+description = "Lê tiers: da config YAML (a config atual continua valendo como tier 0 implícito) e valida na partida. Cada tier traz name, base_url, api_key, free e um mapa de modelos cujas entradas são objetos (id, context e tools opcionais); estilos ausentes valem só OpenAI. Um tier sem free: true é rejeitado (o tier 0 implícito é isento). safeConfigSummary e validate-config não imprimem nenhum api_key. Sem comportamento novo no proxy. Documenta tiers: em docs/configuration.md."
+verify = "go test: uma config com dois tiers gratuitos carrega; um tier sem free: true, um sem base_url, um sem api_key e um com modelo repetido no mapa são rejeitados por validateConfig; a saída de safeConfigSummary não contém nenhum api_key; uma config sem tiers: se comporta como hoje."
+covers = ["R4", "R6"]
+after = [1]
+hitl = false
+risk = "medium"
+
+[[entry]]
 id = 2
 type = "story"
 title = "Failover do tier 0 para um tier extra com mapa de modelos"
-description = "Tracer: lista tiers: na config (a config atual vira o tier 0 implícito) e, com todas as chaves do tier 0 esgotadas, a request segue ao tier 1, com o campo model reescrito pelo mapa do tier; o tier sem mapeamento para o modelo é pulado. Cada tier da lista traz name, base_url, api_key, free, estilos e o mapa de modelos, tudo na config YAML; um tier sem free: true é rejeitado na partida (o tier 0 implícito é isento); sem model no corpo (ex.: GET /models) a request fica no tier 0; /admin/* e /status seguem iguais. Documenta tiers: em docs/configuration.md."
-verify = "go test com dois upstreams httptest: com o tier 0 devolvendo 429 de cota em todas as chaves, uma request com modelo mapeado é atendida pelo tier 1 com o modelo reescrito, e uma com modelo sem mapeamento volta o 429 local de todas esgotadas. Uma config sem tiers: se comporta como hoje, e /admin/keys, /admin/status e /status devolvem o mesmo de antes. Com dois upstreams locais e um curl, a request volta do tier 1 com o modelo reescrito."
-covers = ["R1", "R2", "R4", "R6"]
-after = [1]
+description = "Tracer: com todas as chaves do tier 0 esgotadas, a request segue ao tier 1, com o campo model do corpo reescrito pelo mapa do tier; o tier sem mapeamento para o modelo é pulado. Request sem model no corpo (ex.: GET /models) fica no tier 0. /admin/* e /status seguem iguais."
+verify = "go test com dois upstreams httptest: com o tier 0 devolvendo 429 de cota em todas as chaves, uma request com modelo mapeado é atendida pelo tier 1 com o modelo reescrito, e uma com modelo sem mapeamento volta o 429 local de todas esgotadas; /admin/keys, /admin/status e /status devolvem o mesmo de antes. O repositório traz um upstream falso (stub em Go de teste) que devolve 429 de cota sob demanda, e com ele e um curl a request volta do tier 1."
+covers = ["R1", "R2"]
+after = [11]
 hitl = false
 risk = "high"
 
@@ -26,8 +38,8 @@ risk = "high"
 id = 3
 type = "story"
 title = "Log estruturado por request"
-description = "Cada request grava uma linha de log JSON com modelo, estilo de API, chave ou tier, status e latência; o 429 local e o 502 sem tier são gravados com tier vazio; nenhuma linha traz o valor de uma chave."
-verify = "go test cobre uma request atendida pelo tier 0 e outra pelo tier 1 e confere os cinco campos (modelo, estilo, chave ou tier, status e latência) na linha de log e a ausência do valor das chaves."
+description = "Cada request grava uma linha de log JSON com modelo, estilo de API, chave ou tier, status e latência, medidos até o fim da resposta (inclusive do stream); o 429 local e o 502 sem tier são gravados com tier vazio; nenhuma linha traz o valor de uma chave."
+verify = "go test cobre uma request atendida pelo tier 0 e outra pelo tier 1 e confere os cinco campos (modelo, estilo, chave ou tier, status e latência) e a ausência do valor das chaves, e uma resposta em stream com a latência medida até o fim."
 covers = ["R11"]
 after = [2]
 hitl = false
@@ -36,22 +48,33 @@ risk = "low"
 [[entry]]
 id = 4
 type = "story"
-title = "Failover por falha do upstream, com cooldown por tier"
-description = "401, 402, 404, 5xx, 429 e erro de conexão ou timeout antes do primeiro byte colocam o tier em cooldown (campo cooldown por tier, padrão retry_exhausted_after) e a request segue ao próximo tier; 400 volta ao cliente; depois do primeiro byte não há failover. No tier 0, só 429 de cota e 403 de assinatura giram a chave; os demais põem o tier inteiro em cooldown. Documenta cooldown em docs/configuration.md."
-verify = "go test cobre cada status e o erro de conexão com um upstream que falha e outro que atende, 400 voltando ao cliente sem cooldown, um stream já iniciado que não troca de tier."
+title = "Failover por status do upstream, com cooldown por tier"
+description = "401, 402, 404, 5xx e 429 colocam o tier em cooldown (campo cooldown por tier, padrão retry_exhausted_after) e a request segue ao próximo tier; 400 volta ao cliente; depois do primeiro byte não há failover. No tier 0, só 429 de cota e 403 de assinatura giram a chave; os demais põem o tier inteiro em cooldown. Um 404 só põe o tier em cooldown quando a request tem model mapeado e o corpo não indica modelo inexistente. Quando todos os tiers falham, o cliente recebe a última resposta do upstream; o 429 local fica para quando todos estão em cooldown ou pulados, com Retry-After do tier que volta primeiro. Documenta cooldown em docs/configuration.md."
+verify = "go test cobre cada status com um upstream que falha e outro que atende, 400 voltando ao cliente sem cooldown, 404 de modelo inexistente sem cooldown, um stream já iniciado que não troca de tier, um tier que volta elegível depois do cooldown, a última resposta do upstream quando todos falham e o 429 local com Retry-After quando todos estão em cooldown."
 covers = ["R7"]
-after = [2, 3]
+after = [3]
 hitl = false
 risk = "high"
+
+[[entry]]
+id = 12
+type = "story"
+title = "Failover por erro de conexão e timeout"
+description = "Erro de conexão e timeout antes do primeiro byte da resposta passam a request ao próximo tier sem pôr o tier em cooldown; cancelamento pelo cliente não conta como falha do tier."
+verify = "go test: um upstream que recusa a conexão e outro que estoura o response_header_timeout levam a request ao tier seguinte sem cooldown; um cliente que cancela não muda o estado do tier."
+covers = ["R7"]
+after = [4]
+hitl = false
+risk = "medium"
 
 [[entry]]
 id = 5
 type = "story"
 title = "Estilos de API por tier"
-description = "Cada tier declara os estilos que fala (OpenAI, Anthropic); o tier é pulado se não fala o do request, e a autenticação segue o estilo do tier (x-api-key para Anthropic, Bearer para OpenAI). Documenta os estilos em docs/configuration.md."
-verify = "go test: uma request Anthropic com o tier 0 esgotado pula um tier que só fala OpenAI e é atendida por um que fala Anthropic, com x-api-key; sem nenhum tier compatível, volta o 429 local no formato Anthropic."
+description = "Cada tier declara os estilos que fala (OpenAI, Anthropic); o tier é pulado se não fala o do request, e a autenticação segue o estilo da request (x-api-key para Anthropic, Bearer para OpenAI). Documenta os estilos em docs/configuration.md."
+verify = "go test: uma request Anthropic com o tier 0 esgotado pula um tier que só fala OpenAI e é atendida por um que fala Anthropic, com x-api-key; um tier que fala os dois autentica pelo estilo da request; sem nenhum tier compatível, volta o 429 local no formato Anthropic."
 covers = ["R3"]
-after = [4]
+after = [12]
 hitl = false
 risk = "medium"
 
@@ -59,7 +82,7 @@ risk = "medium"
 id = 6
 type = "story"
 title = "Elegibilidade por contexto mínimo e tool calling"
-description = "Cada entrada do mapa de modelos declara contexto e suporte a tool calling; a config tem min_context global (padrão 64000, o mínimo do Hermes) e a checagem de tool calling só vale para request com tools; um modelo sem context declarado ou abaixo do mínimo não é elegível naquele tier; o tier 0 é isento. Documenta min_context, context e tools em docs/configuration.md."
+description = "Cada entrada do mapa de modelos declara contexto e suporte a tool calling; a config tem min_context global (padrão 64000, o mínimo do Hermes) e a checagem de tool calling só vale para request com tools; um modelo sem context declarado ou abaixo do mínimo não é elegível naquele tier; o tier 0 é isento. Atualiza o exemplo e os testes da config e documenta min_context, context e tools em docs/configuration.md."
 verify = "go test: um modelo mapeado com contexto abaixo do mínimo faz o tier ser pulado; uma request com tools é pulada num modelo sem tool calling, e uma sem tools é atendida por ele; um modelo que atinge o mínimo é atendido."
 covers = ["R8"]
 after = [5]
@@ -70,8 +93,8 @@ risk = "medium"
 id = 7
 type = "story"
 title = "Persistir o cooldown dos tiers"
-description = "O cooldown de cada tier e de cada chave do tier 0 é gravado em JSON local com escrita atômica, no caminho de state_file na config, e carregado na partida; as chaves entram por um prefixo do SHA-256, nunca pelo valor nem só pelo índice; um cooldown vencido não é restaurado. Documenta state_file em docs/configuration.md e o volume do Docker para o arquivo em docs/docker.md."
-verify = "go test: um tier em cooldown continua em cooldown depois de recriar o app a partir do arquivo, um vencido volta elegível, e uma falha de escrita não derruba a request. Com o proxy rodando, reiniciar mantém em /status o cooldown das chaves do tier 0."
+description = "O cooldown de cada tier e de cada chave do tier 0 é gravado em JSON local com escrita atômica, no caminho de state_file na config, e carregado na partida; sem state_file a persistência fica desligada, com um aviso na partida; as chaves entram por um prefixo do SHA-256, nunca pelo valor nem só pelo índice; um cooldown vencido não é restaurado. Documenta state_file em docs/configuration.md e o volume do Docker em docs/docker.md, com a permissão de escrita do usuário nonroot."
+verify = "go test: um tier em cooldown continua em cooldown depois de recriar o app a partir do arquivo, um vencido volta elegível, sem state_file nada é gravado e o aviso sai, e uma falha de escrita não derruba a request."
 covers = ["R10"]
 after = [6]
 hitl = false
@@ -89,12 +112,23 @@ hitl = false
 risk = "low"
 
 [[entry]]
+id = 10
+type = "story"
+title = "Aviso no Telegram quando todos os tiers falham"
+description = "Lê telegram: (bot_token, chat_id) da config YAML. Quando uma request falha porque nenhum tier a atendeu, o cliente recebe o erro e o Eduardo recebe uma mensagem no Telegram, uma vez por episódio: o aviso só se arma de novo depois que algum tier atende. Falha de envio não afeta a request e o token nunca vai ao log nem ao resumo da config. Convive com o aviso SMTP. Documenta telegram: em docs/configuration.md."
+verify = "go test com um servidor Telegram falso: uma request sem nenhum tier disponível devolve o erro ao cliente e envia uma mensagem; uma segunda no mesmo episódio não envia; depois que um tier atende, a próxima falha envia de novo; sem telegram: na config nada é enviado; a saída de safeConfigSummary não contém o token."
+covers = ["R16"]
+after = [4]
+hitl = false
+risk = "medium"
+
+[[entry]]
 id = 9
 type = "story"
 title = "Refactor sweep"
 description = "Limpeza do que as stories deixaram para trás, a partir dos planos e achados de revisão que o épico adiou; só cleanup, escopo novo vira story."
 verify = "go build e go test passam, sem comportamento novo, e cada item varrido está nos planos ou achados do épico."
 covers = []
-after = [8]
+after = [8, 10]
 hitl = false
 risk = "low"
