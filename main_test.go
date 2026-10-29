@@ -2098,6 +2098,40 @@ func TestFailoverAllFailServesLastResponseAndLogsItsTier(t *testing.T) {
 	}
 }
 
+func TestFailoverTier0WithoutExtraTiersCooldownAndRetry(t *testing.T) {
+	s0, s1 := newStub(t, 500, `from t0`), newStub(t, 200, `x`)
+	app, now := failoverApp(t, s0, s1, nil, time.Minute)
+	app.config.Tiers = nil
+	rec := chatReq(app, `{"model":"a"}`)
+	if rec.Code != 500 || rec.Body.String() != "from t0" {
+		t.Fatalf("first: %d %q", rec.Code, rec.Body.String())
+	}
+	rec = chatReq(app, `{"model":"a"}`)
+	if rec.Code != 429 || rec.Header().Get("Retry-After") != "60" || s0.hits.Load() != 1 {
+		t.Fatalf("second: %d RA=%q hits=%d", rec.Code, rec.Header().Get("Retry-After"), s0.hits.Load())
+	}
+	*now = now.Add(61 * time.Second)
+	chatReq(app, `{"model":"a"}`)
+	if s0.hits.Load() != 2 {
+		t.Fatalf("tier 0 not retried after cooldown: %d hits", s0.hits.Load())
+	}
+}
+
+func TestFailoverHeldTier0FailureThenUnreachableTierReturns502(t *testing.T) {
+	s0, s1, s2 := newStub(t, 500, `from t0`), newStub(t, 200, `x`), newStub(t, 200, `{"from":"t2"}`)
+	s1.srv.Close() // t1 is unreachable: connection refused
+	app, _ := failoverApp(t, s0, s1, s2, time.Hour)
+	lines := captureLog(app)
+	rec := chatReq(app, `{"model":"a"}`)
+	if rec.Code != 502 || s2.hits.Load() != 0 {
+		t.Fatalf("got %d %q t2 hits=%d", rec.Code, rec.Body.String(), s2.hits.Load())
+	}
+	// the held tier 0 response is discarded on a connection error
+	if l := lines(t); len(l) != 1 || l[0]["status"] != float64(502) || l[0]["tier"] != "" {
+		t.Fatalf("log %v", l)
+	}
+}
+
 func TestFailoverAllInCooldownLocal429WithRetryAfter(t *testing.T) {
 	s0, s1 := newStub(t, 500, `x`), newStub(t, 503, `y`)
 	app, now := failoverApp(t, s0, s1, nil, time.Hour)

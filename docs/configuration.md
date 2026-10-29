@@ -125,7 +125,7 @@ tier and key are the ones in the request log). If no tier was tried at all
 `429` "all upstream keys exhausted", with `Retry-After` set to the shortest time
 left among the tiers that could serve the request (tier 0 counts its tier
 cooldown or, without one, its exhausted keys); the header is left out when that
-time is unknown. The SMTP "all exhausted" alert fires only in that local `429`
+time is unknown. The SMTP "all exhausted" alert fires whenever no tier answers (the local `429`, or the last upstream response being served)
 and only when every tier 0 key is exhausted. To try it by hand, run
 `go run ./cmd/fakeupstream -addr 127.0.0.1:9999` and switch it with
 `POST /__mode/quota` or `POST /__mode/ok`.
