@@ -50,7 +50,7 @@ deferred: []
 
 - `config.go` -- `Config` (campo novo `MinContext int`), `defaultConfig` (64000), `yamlConfig` (`min_context *int`; `loadYAMLConfig` passa -1 quando ausente, como `retry`), `mergeConfig` (`>= 0` sobrescreve), `validateConfig` (< 0 rejeita). `TierModel.Context/Tools` já existem e já são parseados.
 - `proxy.go` -- `tierModelID(t, model, style)` é o ponto único do filtro, chamado por `proxyTiers` e `localRetryAfter`; `serveProxy` já tem `fields` (via `topLevelModel`) de onde sai o `tools`. Reutilizar `tierModelID`, não criar segundo filtro.
-- `main_test.go` -- fixture `tierOK` (~l.1343) e testes de tiers: modelos com `context` ausente passam a ficar inelegíveis; ajustar os fixtures dos testes de failover (`context` >= padrão ou `min_context` explícito) e `tools: true` onde a request leva tools.
+- `main_test.go` -- fixture `tierOK` (~l.1343) e testes de tiers: modelos com `context` ausente passam a ficar inelegíveis; o ajuste dos fixtures dos testes de failover existentes foi rejeitado na revisão (rodam com `MinContext` 0).
 - `docs/configuration.md` -- exemplo YAML (l.~77-87) e tabela de campos do tier (l.~145); seção "Tiers".
 
 ## Tasks & Acceptance

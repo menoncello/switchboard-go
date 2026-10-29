@@ -10,3 +10,9 @@
 
 ## Deferred from: code review of story-estilos-de-api-por-tier-plan (2026-10-29)
 - `proxy.go:352`: `apiStyleForRequest` testa `HasPrefix(path, "/complete")` e classifica `/v1/completions` (OpenAI legado) como anthropic; a request sai com `x-api-key` e pula tiers só OpenAI. Pré-existente.
+
+## Deferred from: code review of story-refactor-sweep-plan (2026-10-29)
+- `deferred-work.md`: referências de linha dos itens de 404 (`proxy.go:213-223`) e `apiStyleForRequest` (`proxy.go:352`, hoje `proxy.go:372`) estão defasadas; atualizar na story que tratar esses itens. Pré-existente.
+
+## Deferred from: code review of story-refactor-sweep-plan (2026-10-29), item SMTP
+- Aviso SMTP na troca de tier: hoje o SMTP só dispara quando todas as chaves do tier 0 esgotam. Citado pelo sweep como fora de escopo; pede story nova.

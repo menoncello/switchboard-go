@@ -3,7 +3,7 @@ title: 'Refactor sweep'
 type: 'refactor'
 ticket: 9
 created: '2026-10-29'
-status: 'built'
+status: 'done'
 baseline_revision: '36eed6dd046a9099534c6fc3d55fcce72e51c0f7'
 route: 'oneshot'
 route_source: 'auto'
@@ -60,3 +60,20 @@ Feito: removidos `AdvanceOnExhaustion` (`keys.go`) e `validateConfigAndPrint` (`
 - `go build ./... && go vet ./...` -- expected: sem erros
 - `go test -race -count=1 ./...` -- expected: todos passam
 - `rg "AdvanceOnExhaustion|validateConfigAndPrint" --glob '*.go'` -- expected: sem resultados
+
+## Code Review
+
+### 2026-10-29
+Review do commit 9f47113: 1 `decision-needed`, 1 `patch`, 1 `defer`, 8 rejeitados.
+
+- [x] [Review][Patch] (decidido: registrar) Item "aviso SMTP na troca de tier" citado como adiado sem entrada em `deferred-work.md` — a Intent e o Risco residual dizem que vira story nova, mas o item não está registrado em nenhum lugar de `_bmad-output`. Options: (a) registrar em `deferred-work.md`; (b) tirar a menção do plano; (c) apontar onde já está registrado. Recommended: (a) — a story nova prometida não pode depender de memória.
+- [x] [Review][Patch] Code Map do plano de elegibilidade ainda manda ajustar os fixtures rejeitados [story-elegibilidade-por-contexto-minimo-e-tool-calling-plan.md:53]
+- [x] [Review][Defer] Referências de linha em `deferred-work.md` defasadas (`proxy.go:213-223`, `proxy.go:352`, hoje 372) [deferred-work.md] — deferred: drift pré-existente, atualizar na story que tratar esses itens
+
+**Rejected**
+- Sem teste do 413 — `TestRequestTooLargeReturns413` e `TestRequestBodyTooLargeStill413` cobrem.
+- `proxyV1` ainda citado em outros planos — `proxyV1` existe em `proxy.go:75` como wrapper; as citações são históricas.
+- Status `built` em vez de `done` — transição de status é do fechamento do ticket.
+- Verification do sweep sem `rg` de `[ ]`/`proxyV1` (low) — mais checagem para ganho raro.
+- Plano de persistir com "8 testes"/frase "última gravação" (2 achados, low) — o "Feito" registra a rejeição com motivo; o fix editaria a intent.
+- `errors.As` sem teste novo — testes existentes cobrem.
