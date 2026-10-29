@@ -47,7 +47,7 @@ Para o Eduardo e os agentes Hermes: uma request não falha por cota esgotada enq
 - 401, 402, 404, 5xx, 429 e erro de conexão antes do primeiro byte põem o tier em cooldown e passam ao próximo; 400 volta ao cliente.
 - Um tier sem mapeamento para o modelo, ou que não fala o estilo do request, é pulado; um modelo sem o contexto mínimo ou sem tool calling não é elegível.
 - Uma config com tier pago (sem `free: true`) é rejeitada na partida, até o épico de relatório entregar o teto.
-- O cooldown dos tiers permanece depois de reiniciar o proxy, com o arquivo de estado num volume documentado.
+- O cooldown dos tiers e das chaves do tier 0 permanece depois de reiniciar o proxy, com o arquivo de estado num volume documentado.
 - `tiers:`, `min_context` e `state_file` estão documentados em `docs/configuration.md`.
 - Cada request grava uma linha de log com modelo, estilo, tier, status e latência, e a página de status mostra os tiers.
 
@@ -68,6 +68,7 @@ Para o Eduardo e os agentes Hermes: uma request não falha por cota esgotada enq
 
 - Decision (2026-10-29): o estado persiste em arquivo JSON local escrito de forma atômica, sem banco.
 - Decision (2026-10-29): a primeira story separa `main.go` em arquivos dentro do `package main`, sem pacotes nem interfaces novas.
+- Decision (2026-10-29): a trilha 2.1 a 2.9 é linear porque todas as stories mexem em `KeyManager` e `proxyV1`; não há trabalho paralelo.
 - Decision (2026-10-29): o tracer é a story 2, o failover do tier 0 para o tier 1 com mapa de modelos.
 - Decision (2026-10-29): o teto diário dos tiers pagos espera o dinheiro: R5 passa ao épico de relatório, que tem a tabela de preços e os tokens. Até lá, config com tier não gratuito é rejeitada na partida. Declinada a alternativa de teto em requests por dia (John: não mede gasto).
 - Decision (2026-10-29): o gasto do dia (parte de R10) passa ao épico de relatório junto com o teto; aqui persiste só o cooldown.
