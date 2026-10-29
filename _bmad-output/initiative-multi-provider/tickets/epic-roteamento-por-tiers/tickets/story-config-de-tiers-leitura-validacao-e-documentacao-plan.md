@@ -3,7 +3,7 @@ title: 'Config de tiers: leitura, validação e documentação'
 type: 'feature'
 ticket: '11'
 created: '2026-10-29'
-status: 'built'
+status: done
 baseline_revision: 'b1dae98dd2a50c39298a87c5775b939595774e00'
 route: 'full'
 route_source: 'auto'
@@ -103,3 +103,23 @@ Rota full: ~150 linhas entre `config.go`, testes e docs. O mapa `models` vira sl
 - Follow-up review recommended: false (1 patch low).
 - Verification: `gofmt -l .` vazio; `go build`, `go vet`, `go test` passam; `proxy.go`, `keys.go` e `adminkeys.go` intactos.
 - Residual risks: `models` que não é mapa falha no parse com erro genérico.
+
+## Code Review
+
+### 2026-10-29
+Code review complete. 0 `decision-needed`, 4 `patch`, 0 `defer`, 22 rejected.
+
+- [x] [Review][Patch] `id` do modelo é opcional (decisão: opção b): usar o nome do modelo como padrão em convertTiers e corrigir a doc em docs/configuration.md [config.go:convertTiers]
+- [x] [Review][Patch] TestLoadConfigTiersRejected não compara `want` com o erro — cada caso pode passar por outro motivo [main_test.go:TestLoadConfigTiersRejected]
+- [x] [Review][Patch] Faltam casos para valor de modelo que não é objeto (`m1: 5`) e `models` que não é mapa — os ramos de erro de convertTiers não são exercitados [main_test.go:TestLoadConfigTiersRejected]
+- [x] [Review][Patch] Nomes de tier "a" e "a " passam como distintos: a checagem de duplicidade usa o nome sem TrimSpace [config.go:validateTiers]
+
+Rejected:
+- R3, R12 (base_url só não vazia): fora de escopo, o plan veta validar a URL além de não vazia.
+- R15 (indentação das fixtures): válida, as linhas anexadas são irmãs de `models`.
+- R16 (`tiers: []` não limpa): só o arquivo YAML define tiers.
+- R21 (testes chamam loadConfig): loadConfig termina em validateConfig.
+- R22 (substring `secret-`): as duas chaves de teste começam com `secret-`.
+- R24 (vazamento de api_key em erro do YAML): erro de tipo do yaml.v3 não imprime o valor de `api_key`, que aceita qualquer escalar.
+- R25 (`tiers=0` no resumo): doc e plan dizem que o resumo mostra a contagem.
+- R4, R5 (null/merge key/estilos), R6, R7, R9, R10, R13, R23, R26: low, raros e a correção acrescenta código; a chave de merge e o `models:` nulo ficam cobertos pelo F1 ou ainda são rejeitados no load.
