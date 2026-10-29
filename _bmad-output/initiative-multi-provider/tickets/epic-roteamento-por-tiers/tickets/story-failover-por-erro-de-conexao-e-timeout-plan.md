@@ -3,7 +3,7 @@ title: "Failover por erro de conexão e timeout"
 type: 'feature'
 ticket: 12
 created: '2026-10-29'
-status: built
+status: done
 baseline_revision: 'f080aef9ed7681432de2f599855d3d407d56ec5a'
 route: 'full'
 route_source: 'auto'
@@ -101,3 +101,19 @@ Distinguir cancelamento de falha olhando `r.Context().Err()` depois do erro, nã
 **Commands:**
 - `go build ./... && go vet ./...` -- expected: sem erros
 - `go test -race -count=1 ./...` -- expected: todos passam, incluindo os novos
+
+## Code Review
+
+### 2026-10-29
+0 `decision-needed`, 4 `patch`, 0 `defer`, 17 rejected.
+
+- [x] [Review][Patch] Nenhum teste conta as tentativas no tier 0 (trocar `break` por `continue` passa); adicionar contador de hits e afirmar 1 tentativa por request com duas chaves [proxy.go:122]
+- [x] [Review][Patch] Timeout sem teste num tier extra e sem passar pela config `response_header_timeout` (o teste ajusta o Transport à mão) [main_test.go]
+- [x] [Review][Patch] 502 do tier 0 devolve o erro cru do `client.Do` (com a URL do tier); tiers extras devolvem texto fixo [proxy.go:163]
+- [x] [Review][Patch] Cancelamento com resposta retida e sem `last.err` serve a resposta retida e loga o status dela, não 499 [proxy.go:150]
+
+#### Rejected
+- Latência sem limite, retry após timeout duplicar trabalho, timeout sem cooldown por request: falsos, são o comportamento pedido pelo ticket.
+- 499 vaza body retido / `hold()` perde `err` / `orig` vs `r.Context()`: falsos (`defer last.release()`, `release` não zera a struct, `orig := r.Context()`).
+- Erro não-rede em `doUpstream` sem cooldown: falso, só ocorre com URL malformada.
+- Falha silenciosa no log, higiene de teste, linha longa na doc, asserção de SMTP no cancelamento, pontas soltas do plan: baixos, correção cria complexidade ou edita o plan.
