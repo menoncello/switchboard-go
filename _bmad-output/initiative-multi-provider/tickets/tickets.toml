@@ -5,7 +5,7 @@
 id = 1
 slug = "epic-pagina-de-status"
 title = "O Eduardo vê o estado das chaves numa página"
-description = "Uma página HTML servida pelo proxy mostra, sobre o /admin/keys atual, o estado, o cooldown e o uso de cada chave, e funciona no servidor onde o proxy roda."
+description = "Uma página HTML renderizada no servidor mostra o estado, o cooldown e o uso de cada chave, sem expor API nova e sem abrir o /admin."
 covers = ["R12"]
 
 [[epic]]

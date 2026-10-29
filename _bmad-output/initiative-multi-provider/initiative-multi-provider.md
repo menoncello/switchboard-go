@@ -81,4 +81,4 @@ Para o Eduardo e seus agentes Hermes: uma request nunca falha por cota esgotada 
 - Source conflict: R7 — o código só troca de chave em 429 de cota (`isQuota429` em `main.go`); 401, 402, 404 e 5xx passam ao cliente e erro de conexão vira 502 sem failover. R7 muda esse comportamento; o épico de roteamento o entrega.
 - Open question: erro de conexão e timeout do upstream também fazem failover (R7 lista só status HTTP)? Espera: o épico de roteamento.
 - Open question: as várias chaves do OpenCode Go continuam girando dentro do tier 0 antes de passar ao tier seguinte? Espera: o épico de roteamento.
-- Decision (2026-10-29): a página de status e os dados que ela lê ficam sem autenticação; uso interno, dados não críticos. Nunca expõem o valor das chaves, só nome, estado, cooldown e uso.
+- Decision (2026-10-29): a página de status é renderizada no servidor e fica sem autenticação; uso interno, dados não críticos. Não há API nova e `/admin/*` segue protegido. Nunca mostra o valor das chaves, só nome, estado, cooldown e uso.
