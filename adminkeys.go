@@ -1,10 +1,12 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"html/template"
 	"io"
 	"log"
 	"net/http"
@@ -184,12 +186,52 @@ func (a *App) fetchUsage(ctx context.Context, key string) (*UsageWindows, string
 	return &u, ""
 }
 
-func (a *App) handleKeysReport(w http.ResponseWriter, r *http.Request) {
+func (a *App) buildKeysReport(ctx context.Context) KeysReportResponse {
 	st := a.keys.Status()
-	usage := a.usageFor(r.Context())
+	usage := a.usageFor(ctx)
 	out := KeysReportResponse{GeneratedAt: time.Now().UTC().Format(time.RFC3339), UsageCachedSeconds: int(a.config.UsageCacheTTL / time.Second), Keys: make([]KeyReport, len(st.Keys))}
 	for i, k := range st.Keys {
 		out.Keys[i] = KeyReport{Index: k.Index, Name: a.config.keyName(i), State: k.State, Current: k.Current, Eligible: k.Eligible, Last429Time: k.Last429Time, RetryAfterSeconds: k.RetryAfterSeconds, Usage: usage[i].usage, UsageError: usage[i].err}
 	}
-	writeJSON(w, http.StatusOK, out)
+	return out
+}
+
+func (a *App) handleKeysReport(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusOK, a.buildKeysReport(r.Context()))
+}
+
+// statusTmpl renders /status. html/template escapes names and usage errors.
+var statusTmpl = template.Must(template.New("status").Funcs(template.FuncMap{
+	"label": func(k KeyReport) string {
+		if k.Name != "" {
+			return k.Name
+		}
+		return fmt.Sprintf("#%d", k.Index+1)
+	},
+	"pct": func(w *UsageWindow) string {
+		if w == nil {
+			return "—"
+		}
+		return fmt.Sprintf("%.1f%%", w.Percent)
+	},
+}).Parse(`<!doctype html>
+<html lang="pt-BR"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Status das chaves</title>
+<style>body{font:14px system-ui,sans-serif;margin:2rem}table{border-collapse:collapse}th,td{padding:.35rem .8rem;border-bottom:1px solid #ddd;text-align:left}</style></head>
+<body><h1>Status das chaves</h1><p>Gerado em {{.GeneratedAt}}; uso em cache por {{.UsageCachedSeconds}}s.</p>
+<table><tr><th>Chave</th><th>Estado</th><th>Cooldown</th><th>Rolling</th><th>Weekly</th><th>Monthly</th></tr>
+{{range .Keys}}<tr><td>{{label .}}{{if .Current}} (atual){{end}}</td><td>{{.State}}</td><td>{{if .RetryAfterSeconds}}{{.RetryAfterSeconds}}s{{else}}—{{end}}</td>
+{{if .UsageError}}<td colspan="3">erro de uso: {{.UsageError}}</td>{{else}}<td>{{pct .Usage.Rolling}}</td><td>{{pct .Usage.Weekly}}</td><td>{{pct .Usage.Monthly}}</td>{{end}}</tr>
+{{end}}</table></body></html>
+`))
+
+func (a *App) handleStatusPage(w http.ResponseWriter, r *http.Request) {
+	var buf bytes.Buffer
+	if err := statusTmpl.Execute(&buf, a.buildKeysReport(r.Context())); err != nil {
+		log.Printf("status page render failed: %v", err)
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-store")
+	_, _ = w.Write(buf.Bytes())
 }

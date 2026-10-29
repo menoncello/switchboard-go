@@ -983,6 +983,51 @@ func TestAdminKeysAuthAndMethod(t *testing.T) {
 	}
 }
 
+func getStatusPage(app *App) *httptest.ResponseRecorder {
+	rec := httptest.NewRecorder()
+	app.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/status", nil))
+	return rec
+}
+
+func TestStatusPageOpenAndNoKeyLeak(t *testing.T) {
+	var hits int32
+	srv := fakeUsageServer(t, &hits)
+	app := newApp(Config{ProxyAPIKey: "p", UpstreamAPIKeys: []string{"sk-good-SEGREDO1", "sk-bad-SEGREDO2"}, KeyNames: []string{"principal"}, UsageURL: srv.URL, UsageCacheTTL: time.Minute, RetryExhaustedAfter: time.Hour})
+	app.keys.MarkExhausted(1)
+	rec := getStatusPage(app)
+	body := rec.Body.String()
+	if rec.Code != http.StatusOK || !strings.HasPrefix(rec.Header().Get("Content-Type"), "text/html") {
+		t.Fatalf("got %d %s", rec.Code, rec.Header().Get("Content-Type"))
+	}
+	for _, want := range []string{"principal", "#2", "exhausted", "12.5%", "40.0%", "7.0%"} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("missing %q in %s", want, body)
+		}
+	}
+	for _, secret := range []string{"SEGREDO1", "SEGREDO2", "sk-good", "sk-bad"} {
+		if strings.Contains(body, secret) {
+			t.Fatalf("leaked %q: %s", secret, body)
+		}
+	}
+	req := httptest.NewRequest(http.MethodGet, "/admin/keys", nil)
+	rec = httptest.NewRecorder()
+	app.ServeHTTP(rec, req)
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("/admin/keys without key: %d", rec.Code)
+	}
+}
+
+func TestStatusPageUsageErrorOnKeyRow(t *testing.T) {
+	var hits int32
+	srv := fakeUsageServer(t, &hits)
+	app := newApp(Config{ProxyAPIKey: "p", UpstreamAPIKeys: []string{"sk-bad-1", "sk-good-2"}, UsageURL: srv.URL})
+	rec := getStatusPage(app)
+	body := rec.Body.String()
+	if rec.Code != http.StatusOK || !strings.Contains(body, "erro de uso: HTTP 401") || !strings.Contains(body, "12.5%") {
+		t.Fatalf("got %d %s", rec.Code, body)
+	}
+}
+
 func TestUsageCacheTTLEnv(t *testing.T) {
 	t.Setenv("USAGE_CACHE_TTL", "5x")
 	cfg := defaultConfig()
