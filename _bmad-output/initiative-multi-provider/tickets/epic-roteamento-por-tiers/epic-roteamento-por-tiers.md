@@ -3,7 +3,7 @@ id: 2
 type: epic
 title: "O proxy troca de provedor quando um falha"
 parent: initiative-multi-provider
-covers: [R1, R2, R3, R4, R6, R7, R8, R10, R11]
+covers: [R1, R2, R3, R4, R6, R7, R8, R10, R11, R12]
 sources: []
 companions: []
 after: []
@@ -32,6 +32,7 @@ Para o Eduardo e os agentes Hermes: uma request não falha por cota esgotada enq
 - R8 (parent R8): Um modelo só é elegível num tier que tenha o contexto mínimo e o tool calling que o Hermes precisa.
 - R10 (parent R10): O estado de cooldown sobrevive a um reinício do proxy. O gasto do dia é do épico de relatório.
 - R11 (parent R11): Cada request gera um log estruturado com modelo, estilo, chave ou tier, status e latência.
+- R12 (parent R12): A página de status mostra os tiers, com estado e cooldown; as chaves continuam como no épico da página.
 
 ## Constraints
 
@@ -75,3 +76,4 @@ Para o Eduardo e os agentes Hermes: uma request não falha por cota esgotada enq
 - Decision (2026-10-29): o estilo real do Hermes se vê no log da story 3; sem spike.
 - Decision (2026-10-29): fecha com a story "Refactor sweep".
 - Source conflict: R7 — o código só troca de chave em 429 de cota e 403 de assinatura (`isKeyDead`); 401, 402, 404 e 5xx passam ao cliente e erro de conexão vira 502 sem failover. Este épico muda isso.
+- Decision (2026-10-29): R7 muda o comportamento atual; 401, 402, 404, 5xx e erro de conexão passam a fazer failover.

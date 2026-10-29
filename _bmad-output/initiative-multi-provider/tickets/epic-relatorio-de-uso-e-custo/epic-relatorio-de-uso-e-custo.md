@@ -3,7 +3,7 @@ id: 3
 type: epic
 title: "O Eduardo sabe quanto cada projeto e modelo usou e custou"
 parent: initiative-multi-provider
-covers: [R5, R13, R14]
+covers: [R5, R10, R13, R14]
 sources: []
 companions: []
 after: []

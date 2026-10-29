@@ -13,7 +13,7 @@ id = 2
 slug = "epic-roteamento-por-tiers"
 title = "O proxy troca de provedor quando um falha"
 description = "Com a cota do OpenCode Go esgotada, uma request do Hermes é atendida pelo próximo tier gratuito com modelo mapeado, sem mudar os agentes; config com tier pago é rejeitada até o teto existir. Entrega ao relatório e ao catálogo: o log por request, o cooldown persistido, a lista de tiers e o formato da config. Entrega à página: a seção de tiers."
-covers = ["R1", "R2", "R3", "R4", "R6", "R7", "R8", "R10", "R11"]
+covers = ["R1", "R2", "R3", "R4", "R6", "R7", "R8", "R10", "R11", "R12"]
 after = [{ epic = 1, needs = "a página de status, que lê KeyManager.Status() (reescrito aqui) e recebe a seção de tiers" }]
 
 [[epic]]
@@ -21,8 +21,8 @@ id = 3
 slug = "epic-relatorio-de-uso-e-custo"
 title = "O Eduardo sabe quanto cada projeto e modelo usou e custou"
 description = "Um relatório agrega uso e custo por dia, projeto, modelo, chave e tier, e a página de status o mostra; o projeto vem do cabeçalho opcional X-Project. Estende o log do roteamento com projeto e tokens e é dono do histórico de uso, da tabela de preços e do teto diário em dinheiro dos tiers pagos, com o gasto do dia persistido e o alerta SMTP no primeiro uso."
-covers = ["R5", "R13", "R14"]
-after = [{ epic = 2, needs = "o log estruturado, a persistência do gasto e a lista de tiers" }]
+covers = ["R5", "R10", "R13", "R14"]
+after = [{ epic = 2, needs = "o log estruturado, o arquivo de estado persistido e a lista de tiers" }]
 
 [[epic]]
 id = 4

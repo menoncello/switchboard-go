@@ -6,7 +6,7 @@ type = "story"
 title = "Separar main.go em arquivos do package main"
 description = "Divide main.go em arquivos por responsabilidade (config, chaves, proxy, notificação SMTP, servidor) dentro do package main, sem pacotes novos, sem interfaces novas e sem mudar comportamento."
 verify = "go build e go test passam sem alterar nenhum teste existente, e main.go fica só com main() e a montagem do servidor."
-covers = ["R4"]
+covers = []
 after = []
 hitl = false
 risk = "low"
@@ -40,7 +40,7 @@ title = "Failover por falha do upstream, com cooldown por tier"
 description = "401, 402, 404, 5xx, 429 e erro de conexão ou timeout antes do primeiro byte colocam o tier em cooldown (campo cooldown por tier, padrão retry_exhausted_after) e a request segue ao próximo tier; 400 volta ao cliente; depois do primeiro byte não há failover. Uma config com tier sem free: true é rejeitada na partida."
 verify = "go test cobre cada status e o erro de conexão com um upstream que falha e outro que atende, 400 voltando ao cliente sem cooldown, um stream já iniciado que não troca de tier, e validate-config rejeitando um tier sem free: true."
 covers = ["R6", "R7"]
-after = [2]
+after = [2, 3]
 hitl = false
 risk = "high"
 
@@ -62,7 +62,7 @@ title = "Elegibilidade por contexto mínimo e tool calling"
 description = "Cada entrada do mapa de modelos declara contexto e suporte a tool calling; a config tem um mínimo global, e um modelo abaixo dele não é elegível naquele tier."
 verify = "go test: um modelo mapeado com contexto abaixo do mínimo, ou sem tool calling, faz o tier ser pulado; um que atinge o mínimo é atendido."
 covers = ["R8"]
-after = [4]
+after = [5]
 hitl = false
 risk = "medium"
 
@@ -73,7 +73,7 @@ title = "Persistir o cooldown dos tiers"
 description = "O cooldown de cada tier e de cada chave do tier 0 é gravado em JSON local com escrita atômica e carregado na partida; um cooldown vencido não é restaurado."
 verify = "go test: um tier em cooldown continua em cooldown depois de recriar o app a partir do arquivo, um vencido volta elegível, e uma falha de escrita não derruba a request. Com o proxy rodando, reiniciar mantém o cooldown visível em /status."
 covers = ["R10"]
-after = [4]
+after = [6]
 hitl = false
 risk = "medium"
 
@@ -83,8 +83,8 @@ type = "story"
 title = "Seção de tiers na página /status"
 description = "A página /status mostra cada tier com estado e cooldown, sem o valor de nenhuma chave; o uso do dia entra com o épico de relatório."
 verify = "go test: /status sem chave devolve a seção de tiers com um tier em cooldown e o tempo restante, e o corpo não contém o valor de nenhuma chave nem de tier. Com o proxy rodando, a seção aparece abaixo das chaves."
-covers = ["R10", "R11"]
-after = [4, 7, "1.1"]
+covers = ["R12"]
+after = [7, "1.1"]
 hitl = false
 risk = "low"
 

@@ -77,7 +77,7 @@ Para o Eduardo e seus agentes Hermes: uma request nunca falha por cota esgotada 
 - Decision (2026-10-29): sem épico de base de plataforma; o projeto já tem binário, CI (`.goreleaser.yaml`, `.github/`) e Docker, e o primeiro épico é um recurso.
 - Decision (2026-10-29): a primeira story do roteamento separa `main.go` em arquivos dentro do `package main`, sem pacotes nem interfaces novas.
 - Parked: R15 (recarga por SIGHUP). Ticket avulso em `backlog/`, por decisão do Eduardo; só depois do épico de roteamento.
-- Source conflict: R7 — o código só troca de chave em 429 de cota (`isQuota429` em `main.go`); 401, 402, 404 e 5xx passam ao cliente e erro de conexão vira 502 sem failover. R7 muda esse comportamento; o épico de roteamento o entrega.
+- Source conflict: R7 — o código só troca de chave em 429 de cota e 403 de assinatura (`isKeyDead` em `main.go`); 401, 402, 404 e 5xx passam ao cliente e erro de conexão vira 502 sem failover. R7 muda esse comportamento; o épico de roteamento o entrega.
 - Decision (2026-10-29): a página de status é renderizada no servidor e fica sem autenticação; uso interno, dados não críticos. Não há API nova e `/admin/*` segue protegido. Nunca mostra o valor das chaves, só nome, estado, cooldown e uso.
 - Decision (2026-10-29): o teto diário dos tiers pagos (R5) e o gasto do dia (parte de R10) passam ao épico de relatório, que tem preços e tokens; o teto é em dinheiro. O roteamento entrega só tiers gratuitos e rejeita config com tier pago.
 - Decision (2026-10-29): erro de conexão e timeout fazem failover só antes do primeiro byte; as chaves do OpenCode Go giram dentro do tier 0; cooldown por tier, padrão `retry_exhausted_after`.

@@ -3,7 +3,7 @@ id: 1
 type: epic
 title: "O Eduardo vê o estado das chaves numa página"
 parent: initiative-multi-provider
-covers: [R, 1, 2]
+covers: [R12]
 sources: []
 companions: []
 after: []
