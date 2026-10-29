@@ -1,0 +1,90 @@
+# Stories do épico relatorio-de-uso-e-custo, em ordem de construção. Uma trilha só: tudo mexe em proxy.go, server.go e /status.
+# next_id = 9
+
+[[entry]]
+id = 1
+type = "story"
+title = "X-Project: ler, validar e não repassar ao upstream"
+description = "O proxy lê o cabeçalho opcional X-Project, aceita até 64 caracteres [A-Za-z0-9._-], trata ausente ou inválido como \"sem projeto\" e nunca o repassa ao upstream; o valor entra na linha de log por request como project. Os campos do log existente não mudam."
+verify = "go test: com X-Project válido o upstream de teste não recebe o cabeçalho e o log traz project; sem o cabeçalho, com valor acima de 64 caracteres ou com caractere fora do conjunto, o log traz \"sem projeto\" e a request segue; os demais campos do log ficam iguais. Com o proxy rodando, um curl com X-Project: teste mostra project=teste no log."
+covers = ["R14"]
+after = ["2.3"]
+hitl = false
+risk = "low"
+
+[[entry]]
+id = 2
+type = "story"
+title = "Tokens por request no log, de JSON e de stream"
+description = "Lê o usage da resposta do upstream (JSON inteiro e SSE, nos estilos OpenAI e Anthropic) sem atrasar o stream nem alterar o request, e grava tokens_in e tokens_out na linha de log; resposta sem usage grava o log sem tokens e marca usage_missing."
+verify = "go test com upstream de teste: JSON OpenAI, JSON Anthropic, stream Anthropic (message_start e message_delta) e stream OpenAI com usage no último chunk gravam os tokens certos; um stream sem usage grava usage_missing; os bytes do stream chegam ao cliente iguais e sem espera até o fim."
+covers = ["R13"]
+after = [1]
+hitl = false
+risk = "high"
+
+[[entry]]
+id = 3
+type = "story"
+title = "Histórico de uso persistido em usage_file"
+description = "Soma cada request, por dia, projeto, modelo, chave e tier, em requests, tokens e requests sem usage, em memória e em usage_file (JSON, escrita atômica com atraso de poucos segundos e na saída); carrega na partida, descarta o que passa de 90 dias, respeita timezone (nome IANA, padrão UTC, tzdata embutido, inválido rejeitado na partida). Sem usage_file o histórico fica só em memória, com aviso na partida. Documenta usage_file e timezone em docs/configuration.md e o volume em docs/docker.md."
+verify = "go test: duas requests de projetos diferentes geram duas linhas agregadas; recriar o app a partir do arquivo mantém os totais; um dia com mais de 90 dias é descartado; o dia vira no fuso configurado; timezone inválido é rejeitado por validateConfig; sem usage_file nada é gravado e o aviso sai; falha de escrita não derruba a request."
+covers = ["R10", "R13"]
+after = [2, "2.7"]
+hitl = false
+risk = "medium"
+
+[[entry]]
+id = 4
+type = "story"
+title = "Seção de relatório de uso em /status"
+description = "Tracer: /status mostra o total do dia no topo, com o fuso, e uma tabela por dimensão (dia, projeto, modelo, chave, tier) dos últimos 7 dias em <details>, em tokens e requests, com projeto vazio como \"sem projeto\"; sem API nova e sem valor de chave."
+verify = "go test: duas requests com X-Project diferentes aparecem em linhas separadas da tabela por projeto, o total do dia traz o fuso, o corpo não contém o valor de nenhuma chave nem de tier. Com o proxy rodando, a seção aparece em /status abaixo dos tiers."
+covers = ["R13"]
+after = [3]
+hitl = false
+risk = "medium"
+
+[[entry]]
+id = 5
+type = "story"
+title = "Tabela de preços e custo no relatório"
+description = "Lê prices: da config (USD por 1M tokens de entrada e de saída, por tier e id do modelo mapeado), valida e calcula o custo de cada request, somado no histórico e mostrado no relatório onde há preço; onde não há, só tokens. O tier 0 fica sem preço. Documenta prices em docs/configuration.md."
+verify = "go test: um modelo com preço mostra o custo em USD certo, um sem preço mostra só tokens, preço negativo ou de tier desconhecido é rejeitado por validateConfig, e o custo permanece depois de recriar o app a partir de usage_file."
+covers = ["R13"]
+after = [4]
+hitl = false
+risk = "medium"
+
+[[entry]]
+id = 6
+type = "story"
+title = "Teto diário em dinheiro para tiers pagos"
+description = "Um tier sem free: true passa a ser aceito com daily_cap em USD, usage_file e preço para todos os seus modelos; sem qualquer um dos três a config é rejeitada na partida. O gasto do dia vem do histórico persistido; ao atingir o teto o tier é pulado, com Retry-After até a virada do dia e o tier marcado na página com gasto e teto. Nos tiers pagos em stream o proxy injeta include_usage; resposta sem usage conta o preço máximo do mapa e entra na coluna \"sem usage\" do relatório. Documenta daily_cap em docs/configuration.md."
+verify = "go test: um tier pago sem daily_cap, sem usage_file ou com modelo sem preço é rejeitado; com o gasto no teto o tier é pulado e a request segue ao próximo, com Retry-After até a virada do dia no fuso; o gasto do dia sobrevive a recriar o app; um stream pago sem usage soma o preço máximo e aparece em \"sem usage\"; o stream OpenAI pago chega ao upstream com include_usage."
+covers = ["R5", "R10"]
+after = [5, "2.11"]
+hitl = false
+risk = "high"
+
+[[entry]]
+id = 7
+type = "story"
+title = "Alerta SMTP no primeiro uso de tier pago do dia"
+description = "O primeiro uso de cada tier pago em cada dia envia um e-mail SMTP e grava o aviso em usage_file para não repetir após reinício; falha de envio não afeta a request."
+verify = "go test com servidor SMTP falso: a primeira request atendida por um tier pago no dia envia um e-mail, a segunda no mesmo dia não, recriar o app não reenvia, o dia seguinte envia de novo, e tier gratuito nunca envia."
+covers = ["R5"]
+after = [6]
+hitl = false
+risk = "low"
+
+[[entry]]
+id = 8
+type = "story"
+title = "Refactor sweep"
+description = "Limpeza do que as stories deixaram para trás, a partir dos planos e achados de revisão que o épico adiou; só cleanup, escopo novo vira story."
+verify = "go build e go test passam, sem comportamento novo, e cada item varrido está nos planos ou achados do épico."
+covers = []
+after = [7]
+hitl = false
+risk = "low"
