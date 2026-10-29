@@ -3,8 +3,10 @@ package main
 import (
 	"errors"
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -478,3 +480,21 @@ func safeConfigSummary(cfg Config) string {
 }
 
 func parseBool(v string) bool { b, _ := strconv.ParseBool(strings.TrimSpace(v)); return b }
+
+// ineligibleTiers returns the names of the tiers with no model declaring at least
+// cfg.MinContext. Tier 0 is not in Tiers, so it is exempt.
+func ineligibleTiers(cfg Config) []string {
+	var names []string
+	for _, t := range cfg.Tiers {
+		if !slices.ContainsFunc(t.Models, func(m TierModel) bool { return m.Context >= cfg.MinContext }) {
+			names = append(names, t.Name)
+		}
+	}
+	return names
+}
+
+func warnIneligibleTiers(cfg Config) {
+	for _, name := range ineligibleTiers(cfg) {
+		log.Printf("warning: tier %q has no model with context >= min_context (%d); it will never serve requests (declare context on its models or set min_context: 0)", name, cfg.MinContext)
+	}
+}

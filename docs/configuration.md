@@ -181,6 +181,16 @@ A mapped model only serves a request on its tier when it is eligible:
 An ineligible tier is skipped like a tier that does not map the model or the
 style, and `Retry-After` does not count it. Tier 0 is exempt from both checks.
 
+A request counts as "with tools" only when the top-level `tools` is a non-empty
+array. The legacy `functions` field and a `tools` that is not an array are not
+treated as tools.
+
+Upgrade note: a tier model that does not declare `context` counts as `0`, so an
+existing config whose tier models omit it becomes ineligible under the default
+`min_context: 64000`. Declare `context` on those models or set `min_context: 0`.
+At startup (and in `validate-config`) the proxy logs a warning for each tier with
+no model that reaches `min_context`.
+
 ## Request log
 
 Every proxied request writes one JSON line to stderr when its response ends

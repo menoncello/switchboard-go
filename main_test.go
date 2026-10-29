@@ -5,6 +5,7 @@ import (
 	"compress/gzip"
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log"
 	"log/slog"
@@ -14,6 +15,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -2555,5 +2557,78 @@ func TestLocalRetryAfterIgnoresIneligibleTier(t *testing.T) {
 	f.app.config.Tiers[0].Models[0].Context = 1000
 	if secs, ok := f.app.localRetryAfter("a", APIStyleOpenAI, false); !ok || secs != 10 {
 		t.Fatalf("eligible tier ignored: %d %v", secs, ok)
+	}
+	// enough context but no tool calling: only counts for requests that do not need tools
+	f.app.config.Tiers[0].Models[0].Tools = false
+	if secs, ok := f.app.localRetryAfter("a", APIStyleOpenAI, true); !ok || secs < 60 {
+		t.Fatalf("tools-less tier counted for a tools request: %d %v", secs, ok)
+	}
+	if secs, ok := f.app.localRetryAfter("a", APIStyleOpenAI, false); !ok || secs != 10 {
+		t.Fatalf("tools-less tier ignored without tools: %d %v", secs, ok)
+	}
+}
+
+func TestIneligibleTiers(t *testing.T) {
+	cfg := Config{MinContext: 64000, Tiers: []TierConfig{
+		{Name: "ok", Models: []TierModel{{Name: "a"}, {Name: "b", Context: 64000}}},
+		{Name: "undeclared", Models: []TierModel{{Name: "a"}}},
+		{Name: "small", Models: []TierModel{{Name: "a", Context: 32000}}},
+	}}
+	if got := ineligibleTiers(cfg); !slices.Equal(got, []string{"undeclared", "small"}) {
+		t.Fatalf("got %v", got)
+	}
+	cfg.MinContext = 0
+	if got := ineligibleTiers(cfg); len(got) != 0 {
+		t.Fatalf("floor off: got %v", got)
+	}
+}
+
+func TestTier0ExemptFromEligibility(t *testing.T) {
+	f := newTierFixture(t, true, false) // tier 0 model declares no context or tools
+	f.app.config.MinContext = 64000
+	rec := tierReq(f.app, http.MethodPost, "/v1/chat/completions", `{"model":"a","tools":[{"type":"function"}]}`, nil)
+	if h := f.hits(); rec.Code != http.StatusOK || h != [3]int32{1, 0, 0} {
+		t.Fatalf("code=%d hits=%v", rec.Code, h)
+	}
+}
+
+func TestLoadedDefaultMinContextThroughProxy(t *testing.T) {
+	s0, small, big := newStub(t, 429, quotaBody), newStub(t, 200, `{"from":"small"}`), newStub(t, 200, `{"from":"big"}`)
+	tier := func(name, url string, ctx int) string {
+		return fmt.Sprintf("  - name: %s\n    base_url: %s\n    api_key: k\n    free: true\n    models:\n      a: {id: id-%s, context: %d, tools: true}\n", name, url, name, ctx)
+	}
+	tiersYAML(t, "tiers:\n"+tier("small", small.srv.URL, 32000)+tier("big", big.srv.URL, 131072))
+	cfg, err := loadConfig()
+	if err != nil || cfg.MinContext != 64000 {
+		t.Fatalf("min_context=%d err=%v", cfg.MinContext, err)
+	}
+	cfg.UpstreamBaseURL = s0.srv.URL
+	rec := chatReq(newApp(cfg), `{"model":"a"}`)
+	if rec.Code != http.StatusOK || rec.Body.String() != `{"from":"big"}` || small.hits.Load() != 0 {
+		t.Fatalf("code=%d body=%q small hits=%d", rec.Code, rec.Body.String(), small.hits.Load())
+	}
+}
+
+func TestToolsWhitespaceArrayIsNoTools(t *testing.T) {
+	f := newTierFixture(t, false, false)
+	f.app.config.Tiers = f.app.config.Tiers[:1]
+	f.app.config.Tiers[0].Models = []TierModel{{Name: "a", ID: "id-a", Tools: false}}
+	rec := tierReq(f.app, http.MethodPost, "/v1/chat/completions", `{"model":"a","tools": [ ]}`, nil)
+	if rec.Code != http.StatusOK || f.hits()[1] != 1 {
+		t.Fatalf("code=%d hits=%v", rec.Code, f.hits())
+	}
+}
+
+func TestAnthropicToolsRequestNeedsToolsModel(t *testing.T) {
+	f := newTierFixture(t, false, false)
+	f.app.config.Tiers = f.app.config.Tiers[1:] // t2 speaks anthropic
+	body := `{"model":"a","tools":[{"name":"x"}]}`
+	f.app.config.Tiers[0].Models = []TierModel{{Name: "a", ID: "id-a2", Tools: false}}
+	if rec := tierReq(f.app, http.MethodPost, "/v1/messages", body, nil); rec.Code != http.StatusTooManyRequests || f.hits()[2] != 0 {
+		t.Fatalf("tools-less model: code=%d hits=%v", rec.Code, f.hits())
+	}
+	f.app.config.Tiers[0].Models[0].Tools = true
+	if rec := tierReq(f.app, http.MethodPost, "/v1/messages", body, nil); rec.Code != http.StatusOK || f.hits()[2] != 1 {
+		t.Fatalf("tools model: code=%d hits=%v", rec.Code, f.hits())
 	}
 }

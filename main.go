@@ -21,12 +21,14 @@ func main() {
 			log.Fatal(err)
 		}
 		log.Println(safeConfigSummary(cfg))
+		warnIneligibleTiers(cfg)
 		return
 	}
 	cfg, err := loadConfig()
 	if err != nil {
 		log.Fatal(err)
 	}
+	warnIneligibleTiers(cfg)
 	a := newApp(cfg)
 	srv := &http.Server{Addr: cfg.ListenAddr, Handler: a, ReadHeaderTimeout: 10 * time.Second, ReadTimeout: 65 * time.Second, WriteTimeout: 0, IdleTimeout: 120 * time.Second}
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
