@@ -3,7 +3,7 @@ id: 4
 type: epic
 title: "O Eduardo recebe propostas de modelos e limites novos"
 parent: initiative-multi-provider
-covers: [R, 9]
+covers: [R9]
 sources: []
 companions: []
 after: []
@@ -15,7 +15,7 @@ risk: medium
 
 ## Description
 
-Uma automação recorrente pesquisa modelos novos, limites novos e quem deixou de ser gratuito, e grava propostas de mudança na config de tiers. Só propõe: nunca altera o roteamento. Auto-adição, começando pelo OpenRouter (preço via API), fica para depois de ver a qualidade das propostas.
+Uma automação recorrente pesquisa modelos novos, limites novos e quem deixou de ser gratuito, e grava propostas de mudança em arquivo próprio. Só propõe: nunca altera o roteamento. Auto-adição, começando pelo OpenRouter (preço via API), fica para depois de ver a qualidade das propostas.
 
 ## Outcome
 

@@ -5,14 +5,20 @@ import (
 	"compress/gzip"
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"net/smtp"
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
+	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -117,7 +123,7 @@ func TestDoUpstreamSetsDefaultUserAgent(t *testing.T) {
 
 	app := newApp(Config{ProxyAPIKey: "p", UpstreamAPIKeys: []string{"u"}, UpstreamBaseURL: upstream.URL})
 	req := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
-	resp, err := app.doUpstream(req.Context(), req, nil, "u", APIStyleOpenAI)
+	resp, err := app.doUpstream(req.Context(), req, nil, upstream.URL, "u", APIStyleOpenAI)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -143,7 +149,7 @@ func TestDoUpstreamAnthropicSetsHeaders(t *testing.T) {
 	req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(`{"model":"minimax-m3","messages":[]}`))
 	req.Header.Set("x-api-key", "p")
 	req.Header.Set("anthropic-version", "2023-06-01")
-	resp, err := app.doUpstream(req.Context(), req, []byte(`{"model":"minimax-m3","messages":[]}`), "u", APIStyleAnthropic)
+	resp, err := app.doUpstream(req.Context(), req, []byte(`{"model":"minimax-m3","messages":[]}`), upstream.URL, "u", APIStyleAnthropic)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1318,5 +1324,1795 @@ func TestUsageCacheTTLEnv(t *testing.T) {
 	}
 	if d := defaultConfig(); d.UsageCacheTTL != 60*time.Second || d.UsageURL != "https://opencode.ai/zen/go/v1/usage" {
 		t.Fatalf("defaults: %+v", d)
+	}
+}
+
+func tiersYAML(t *testing.T, tiers string) {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	body := "server: {proxy_api_key: p}\nupstream: {api_keys: [u]}\n" + tiers
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("SWITCHBOARD_GO_CONFIG", path)
+}
+
+const tierOK = `  - name: a
+    base_url: https://a
+    api_key: secret-a
+    free: true
+    models:
+      m1: {id: x/m1, context: 100, tools: true}
+`
+
+func TestLoadConfigTiers(t *testing.T) {
+	tiersYAML(t, "tiers:\n"+tierOK+`  - name: b
+    base_url: https://b
+    api_key: secret-b
+    free: true
+    styles: [anthropic]
+    models:
+      m2: {id: y/m2}
+`)
+	cfg, err := loadConfig()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cfg.Tiers) != 2 || len(cfg.Tiers[0].Styles) != 1 || cfg.Tiers[0].Styles[0] != APIStyleOpenAI || cfg.Tiers[1].Styles[0] != APIStyleAnthropic {
+		t.Fatalf("unexpected tiers: %+v", cfg.Tiers)
+	}
+	if m := cfg.Tiers[0].Models[0]; m.Name != "m1" || m.ID != "x/m1" || m.Context != 100 || !m.Tools {
+		t.Fatalf("unexpected model: %+v", m)
+	}
+	s := safeConfigSummary(cfg)
+	if !strings.Contains(s, "tiers=2") || strings.Contains(s, "secret-") {
+		t.Fatalf("bad summary: %s", s)
+	}
+}
+
+func TestLoadConfigTierModelIDDefaultsToName(t *testing.T) {
+	tiersYAML(t, "tiers:\n"+strings.Replace(tierOK, "{id: x/m1, context: 100, tools: true}", "{context: 100}", 1))
+	cfg, err := loadConfig()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if m := cfg.Tiers[0].Models[0]; m.ID != "m1" {
+		t.Fatalf("ID = %q, want m1", m.ID)
+	}
+}
+
+func TestLoadConfigWithoutTiers(t *testing.T) {
+	tiersYAML(t, "")
+	cfg, err := loadConfig()
+	if err != nil || len(cfg.Tiers) != 0 {
+		t.Fatalf("cfg=%+v err=%v", cfg, err)
+	}
+}
+
+func TestLoadConfigTiersRejected(t *testing.T) {
+	cases := map[string]struct{ tier, want string }{
+		"paid":             {strings.Replace(tierOK, "free: true", "free: false", 1), "free must be true"},
+		"free absent":      {strings.Replace(tierOK, "    free: true\n", "", 1), "free must be true"},
+		"no base_url":      {strings.Replace(tierOK, "base_url: https://a", "base_url: \"\"", 1), "base_url is required"},
+		"no api_key":       {strings.Replace(tierOK, "api_key: secret-a", "api_key: \"\"", 1), "api_key is required"},
+		"no name":          {strings.Replace(tierOK, "name: a", "name: \"\"", 1), "name is required"},
+		"dup tier name":    {tierOK + tierOK, "duplicate name"},
+		"dup model":        {tierOK + "      m1: {id: x/other}\n", "duplicate model"},
+		"bad style":        {tierOK + "    styles: [grpc]\n", "unknown style"},
+		"no models":        {strings.Replace(tierOK, "    models:\n      m1: {id: x/m1, context: 100, tools: true}\n", "", 1), "at least one model"},
+		"neg context":      {strings.Replace(tierOK, "context: 100", "context: -1", 1), "context must be >= 0"},
+		"scalar model":     {strings.Replace(tierOK, "{id: x/m1, context: 100, tools: true}", "5", 1), "parse tiers[0].models"},
+		"models not map":   {strings.Replace(tierOK, "    models:\n      m1: {id: x/m1, context: 100, tools: true}\n", "    models: [a]\n", 1), "must be a map"},
+		"bad cooldown":     {tierOK + "    cooldown: soon\n", "parse tiers[0].cooldown"},
+		"neg cooldown":     {strings.Replace(tierOK, "    free: true\n", "    free: true\n    cooldown: -1s\n", 1), "cooldown must be >= 0"},
+		"dup name trimmed": {tierOK + strings.Replace(tierOK, "name: a", "name: \"a \"", 1), "duplicate name"},
+	}
+	for name, c := range cases {
+		t.Run(name, func(t *testing.T) {
+			tiersYAML(t, "tiers:\n"+c.tier)
+			_, err := loadConfig()
+			if err == nil {
+				t.Fatal("expected error")
+			}
+			if !strings.Contains(err.Error(), c.want) {
+				t.Fatalf("err = %v, want containing %q", err, c.want)
+			}
+			if strings.Contains(err.Error(), "secret-a") {
+				t.Fatalf("error leaks api_key: %v", err)
+			}
+		})
+	}
+}
+
+const quotaBody = `{"error":{"code":"insufficient_quota","message":"quota exceeded"}}`
+
+type tierFixture struct {
+	app        *App
+	t0, t1, t2 *int32
+	mu         sync.Mutex
+	bodies     []string
+	auths      []string
+}
+
+func (f *tierFixture) seen() ([]string, []string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]string(nil), f.bodies...), append([]string(nil), f.auths...)
+}
+
+// newTierFixture wires a tier 0 that is always quota-exhausted (unless t0OK) and tiers 1 and 2.
+// Tier 1 maps a -> id-a (openai only); tier 2 maps a, speaks anthropic and openai.
+// Tiers 1 and 2 answer 200 with their own name unless t1Quota makes tier 1 answer a quota 429.
+func newTierFixture(t *testing.T, t0OK, t1Quota bool) *tierFixture {
+	t.Helper()
+	f := &tierFixture{t0: new(int32), t1: new(int32), t2: new(int32)}
+	mk := func(name string, hits *int32, quota, record bool) *httptest.Server {
+		s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			atomic.AddInt32(hits, 1)
+			b, _ := io.ReadAll(r.Body)
+			if record {
+				f.mu.Lock()
+				f.bodies = append(f.bodies, string(b))
+				f.auths = append(f.auths, r.Header.Get("Authorization")+"|"+r.Header.Get("x-api-key")+"|"+r.Header.Get("anthropic-version"))
+				f.mu.Unlock()
+			}
+			if quota {
+				w.WriteHeader(http.StatusTooManyRequests)
+				_, _ = w.Write([]byte(quotaBody))
+				return
+			}
+			_, _ = w.Write([]byte(`{"from":"` + name + `"}`))
+		}))
+		t.Cleanup(s.Close)
+		return s
+	}
+	s0, s1, s2 := mk("t0", f.t0, !t0OK, false), mk("t1", f.t1, t1Quota, !t1Quota), mk("t2", f.t2, false, true)
+	f.app = newApp(Config{ProxyAPIKey: "p", UpstreamAPIKeys: []string{"u"}, UpstreamBaseURL: s0.URL, MaxRequestBodyBytes: 1 << 20, RetryExhaustedAfter: time.Hour, Tiers: []TierConfig{
+		{Name: "t1", BaseURL: s1.URL, APIKey: "k1", Free: true, Styles: []APIStyle{APIStyleOpenAI}, Models: []TierModel{{Name: "a", ID: "id-a"}}},
+		{Name: "t2", BaseURL: s2.URL, APIKey: "k2", Free: true, Styles: []APIStyle{APIStyleOpenAI, APIStyleAnthropic}, Models: []TierModel{{Name: "a", ID: "id-a2"}}},
+	}})
+	return f
+}
+
+// hits reads the three upstream counters atomically.
+func (f *tierFixture) hits() [3]int32 {
+	return [3]int32{atomic.LoadInt32(f.t0), atomic.LoadInt32(f.t1), atomic.LoadInt32(f.t2)}
+}
+
+func tierReq(app *App, method, path, body string, hdr map[string]string) *httptest.ResponseRecorder {
+	req := httptest.NewRequest(method, path, strings.NewReader(body))
+	req.Header.Set("Authorization", "Bearer p")
+	for k, v := range hdr {
+		req.Header.Set(k, v)
+	}
+	rec := httptest.NewRecorder()
+	app.ServeHTTP(rec, req)
+	return rec
+}
+
+func TestTierFailoverRewritesModelAndKey(t *testing.T) {
+	f := newTierFixture(t, false, false)
+	rec := tierReq(f.app, http.MethodPost, "/v1/chat/completions", `{"model":"a","n":1.50,"messages":[]}`, nil)
+	bodies, auths := f.seen()
+	if h := f.hits(); rec.Code != http.StatusOK || h[1] != 1 || h[2] != 0 {
+		t.Fatalf("code=%d hits=%v", rec.Code, h)
+	}
+	if rec.Body.String() != `{"from":"t1"}` {
+		t.Fatalf("client body %q", rec.Body.String())
+	}
+	if len(bodies) != 1 || !strings.Contains(bodies[0], `"model":"id-a"`) || !strings.Contains(bodies[0], `"n":1.50`) || auths[0] != "Bearer k1||" {
+		t.Fatalf("body=%v auth=%v", bodies, auths)
+	}
+	if rec.Header().Get("Retry-After") != "" {
+		t.Fatal("unexpected Retry-After on tier-served response")
+	}
+	// the one-shot flag is still armed: tier 0 is exhausted and nothing consumed it
+	if !f.app.keys.ShouldNotifyAllExhausted() {
+		t.Fatal("all-exhausted notification was consumed by a tier-served request")
+	}
+}
+
+func TestTierNoMappingOrNoModelStaysLocal429(t *testing.T) {
+	f := newTierFixture(t, false, false)
+	// exhaust tier 0 first (one hit); the cases below are then all served locally
+	if rec := tierReq(f.app, http.MethodPost, "/v1/chat/completions", `{"model":"z"}`, nil); rec.Code != http.StatusTooManyRequests {
+		t.Fatalf("setup: %d", rec.Code)
+	}
+	for _, c := range []struct{ method, path, body string }{
+		{http.MethodPost, "/v1/chat/completions", `{"model":"z"}`},
+		{http.MethodGet, "/v1/models", ``},
+		{http.MethodPost, "/v1/chat/completions", `{"messages":[]}`},
+		{http.MethodPost, "/v1/chat/completions", `not json`},
+	} {
+		rec := tierReq(f.app, c.method, c.path, c.body, nil)
+		if rec.Code != http.StatusTooManyRequests || !strings.Contains(rec.Body.String(), "all upstream keys exhausted") {
+			t.Fatalf("%v: %d %s", c, rec.Code, rec.Body.String())
+		}
+	}
+	if h := f.hits(); h != [3]int32{1, 0, 0} {
+		t.Fatalf("hits %v", h)
+	}
+	if rec := tierReq(f.app, http.MethodPost, "/v1/chat/completions", `{"model":"z"}`, nil); rec.Header().Get("Retry-After") == "" {
+		t.Fatal("missing Retry-After")
+	}
+}
+
+func TestTierSkippedWhenStyleMissing(t *testing.T) {
+	f := newTierFixture(t, false, false)
+	rec := tierReq(f.app, http.MethodPost, "/v1/messages", `{"model":"a"}`, map[string]string{"anthropic-version": "2023-06-01"})
+	bodies, auths := f.seen()
+	if h := f.hits(); rec.Code != http.StatusOK || h[1] != 0 || h[2] != 1 {
+		t.Fatalf("code=%d hits=%v", rec.Code, h)
+	}
+	if auths[0] != "|k2|2023-06-01" || !strings.Contains(bodies[0], `"id-a2"`) {
+		t.Fatalf("body=%v auth=%v", bodies, auths)
+	}
+	// with only the openai-only tier left, nothing serves the anthropic request
+	f.app.config.Tiers = f.app.config.Tiers[:1]
+	rec = tierReq(f.app, http.MethodPost, "/v1/messages", `{"model":"a"}`, nil)
+	if rec.Code != http.StatusTooManyRequests {
+		t.Fatalf("got %d", rec.Code)
+	}
+}
+
+func TestTierAuthFollowsRequestStyle(t *testing.T) {
+	f := newTierFixture(t, false, false)
+	f.app.config.Tiers = f.app.config.Tiers[1:] // only t2, which speaks both styles
+	tierReq(f.app, http.MethodPost, "/v1/chat/completions", `{"model":"a"}`, nil)
+	tierReq(f.app, http.MethodPost, "/v1/messages", `{"model":"a"}`, map[string]string{"anthropic-version": "2023-06-01"})
+	_, auths := f.seen()
+	if len(auths) != 2 || auths[0] != "Bearer k2||" || auths[1] != "|k2|2023-06-01" {
+		t.Fatalf("auths %q", auths)
+	}
+}
+
+func TestNoCompatibleTierReturnsLocal429InRequestStyle(t *testing.T) {
+	f := newTierFixture(t, false, false)
+	f.app.config.Tiers = f.app.config.Tiers[:1] // only t1, openai only
+	rec := tierReq(f.app, http.MethodPost, "/v1/messages", `{"model":"a"}`, map[string]string{"anthropic-version": "2023-06-01"})
+	var got struct {
+		Type  string `json:"type"`
+		Error struct {
+			Type string `json:"type"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil || rec.Code != http.StatusTooManyRequests || got.Type != "error" || got.Error.Type != "rate_limit_error" || f.hits()[1] != 0 {
+		t.Fatalf("code=%d body=%q hits=%v", rec.Code, rec.Body.String(), f.hits())
+	}
+}
+
+func TestTierExhaustedFallsToNextTier(t *testing.T) {
+	f := newTierFixture(t, false, true)
+	rec := tierReq(f.app, http.MethodPost, "/v1/chat/completions", `{"model":"a"}`, nil)
+	if h := f.hits(); rec.Code != http.StatusOK || h[1] != 1 || h[2] != 1 {
+		t.Fatalf("code=%d hits=%v", rec.Code, h)
+	}
+	f.app.config.Tiers = f.app.config.Tiers[:1]
+	if rec := tierReq(f.app, http.MethodPost, "/v1/chat/completions", `{"model":"a"}`, nil); rec.Code != http.StatusTooManyRequests {
+		t.Fatalf("got %d", rec.Code)
+	}
+}
+
+func TestTierNotCalledWhenTier0Healthy(t *testing.T) {
+	f := newTierFixture(t, true, false)
+	rec := tierReq(f.app, http.MethodPost, "/v1/chat/completions", `{"model":"a"}`, nil)
+	if h := f.hits(); rec.Code != http.StatusOK || h[1] != 0 || h[2] != 0 {
+		t.Fatalf("code=%d hits=%v", rec.Code, h)
+	}
+}
+
+func TestTier400CopiedWithoutFailoverOrCooldown(t *testing.T) {
+	f := newTierFixture(t, false, false)
+	s1 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = w.Write([]byte("tier1 says no"))
+	}))
+	defer s1.Close()
+	f.app.config.Tiers[0].BaseURL = s1.URL
+	for i := 0; i < 2; i++ {
+		rec := tierReq(f.app, http.MethodPost, "/v1/chat/completions", `{"model":"a"}`, nil)
+		if rec.Code != http.StatusBadRequest || rec.Body.String() != "tier1 says no" || f.hits()[2] != 0 {
+			t.Fatalf("got %d %q hits=%v", rec.Code, rec.Body.String(), f.hits())
+		}
+	}
+}
+
+func TestTierPlain429FailsOverToNextTier(t *testing.T) {
+	f := newTierFixture(t, false, false)
+	s1 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusTooManyRequests)
+		_, _ = w.Write([]byte(`{"error":{"code":"rate_limit"}}`))
+	}))
+	defer s1.Close()
+	f.app.config.Tiers[0].BaseURL = s1.URL
+	rec := tierReq(f.app, http.MethodPost, "/v1/chat/completions", `{"model":"a"}`, nil)
+	if rec.Code != http.StatusOK || rec.Body.String() != `{"from":"t2"}` || f.hits()[2] != 1 {
+		t.Fatalf("got %d %q hits=%v", rec.Code, rec.Body.String(), f.hits())
+	}
+}
+
+func TestTierBaseURLWithPathPrefixAndTrailingSlash(t *testing.T) {
+	f := newTierFixture(t, false, false)
+	var path string
+	s1 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		path = r.URL.Path
+		_, _ = w.Write([]byte(`{}`))
+	}))
+	defer s1.Close()
+	f.app.config.Tiers[0].BaseURL = s1.URL + "/api/v1/"
+	rec := tierReq(f.app, http.MethodPost, "/v1/chat/completions", `{"model":"a"}`, nil)
+	if rec.Code != http.StatusOK || path != "/api/v1/chat/completions" {
+		t.Fatalf("code=%d path=%q", rec.Code, path)
+	}
+}
+
+func TestTierEmptyIDForwardsName(t *testing.T) {
+	f := newTierFixture(t, false, false)
+	f.app.config.Tiers[0].Models = []TierModel{{Name: "a"}}
+	rec := tierReq(f.app, http.MethodPost, "/v1/chat/completions", `{"model":"a"}`, nil)
+	bodies, _ := f.seen()
+	if rec.Code != http.StatusOK || len(bodies) != 1 || !strings.Contains(bodies[0], `"model":"a"`) {
+		t.Fatalf("code=%d bodies=%v", rec.Code, bodies)
+	}
+}
+
+func TestTierConnectionErrorFailsOverWithoutCooldown(t *testing.T) {
+	f := newTierFixture(t, false, false)
+	dead := httptest.NewServer(http.NotFoundHandler())
+	f.app.config.Tiers[0].BaseURL = dead.URL
+	dead.Close()
+	rec := tierReq(f.app, http.MethodPost, "/v1/chat/completions", `{"model":"a"}`, nil)
+	if rec.Code != http.StatusOK || f.hits()[2] != 1 || f.app.cooldowns.remaining("t1") != 0 {
+		t.Fatalf("got %d hits=%v", rec.Code, f.hits())
+	}
+	// every extra tier unreachable: 502 that does not leak the tier URL
+	f.app.config.Tiers[1].BaseURL = dead.URL
+	rec = tierReq(f.app, http.MethodPost, "/v1/chat/completions", `{"model":"a"}`, nil)
+	if rec.Code != http.StatusBadGateway || strings.Contains(rec.Body.String(), dead.URL) {
+		t.Fatalf("got %d %q", rec.Code, rec.Body.String())
+	}
+}
+
+// The tiers section of /status is covered by TestStatusPageTiersSection.
+func TestAdminUnchangedWithTiers(t *testing.T) {
+	var hits int32
+	srv := fakeUsageServer(t, &hits)
+	cfg := Config{ProxyAPIKey: "p", UpstreamAPIKeys: []string{"sk-good-1"}, KeyNames: []string{"x"}, UsageURL: srv.URL, RetryExhaustedAfter: time.Hour}
+	plain := newApp(cfg)
+	cfg.Tiers = []TierConfig{{Name: "t", BaseURL: "http://127.0.0.1:1", APIKey: "kt", Free: true, Models: []TierModel{{Name: "a", ID: "a"}}}}
+	tiered := newApp(cfg)
+	for _, path := range []string{"/admin/status", "/admin/keys"} {
+		a, b := tierReq(plain, http.MethodGet, path, "", nil), tierReq(tiered, http.MethodGet, path, "", nil)
+		if a.Code != b.Code || a.Body.String() != b.Body.String() {
+			t.Fatalf("%s differs: %d %q vs %d %q", path, a.Code, a.Body.String(), b.Code, b.Body.String())
+		}
+	}
+	a, b := getStatusPage(plain).Body.String(), getStatusPage(tiered).Body.String()
+	if !strings.Contains(b, "<h2>Tiers</h2>") || a != b[:strings.Index(b, "<h2>Tiers</h2>")]+b[strings.Index(b, "</body>"):] {
+		t.Fatalf("/status keys part differs: %q vs %q", a, b)
+	}
+}
+
+func TestStatusPageTiersSection(t *testing.T) {
+	var hits int32
+	srv := fakeUsageServer(t, &hits)
+	cfg := Config{ProxyAPIKey: "p", UpstreamAPIKeys: []string{"sk-good-SEGREDO1"}, UsageURL: srv.URL, RetryExhaustedAfter: time.Hour}
+	if body := getStatusPage(newApp(cfg)).Body.String(); strings.Contains(body, "<h2>Tiers</h2>") {
+		t.Fatalf("tiers section without extra tiers: %s", body)
+	}
+	cfg.Tiers = []TierConfig{
+		{Name: "gratis-a", BaseURL: "http://segredo-a.invalid", APIKey: "kt-SEGREDO2", Free: true, Models: []TierModel{{Name: "a", ID: "a"}}},
+		{Name: "gratis-b", BaseURL: "http://segredo-b.invalid", APIKey: "kt-SEGREDO3", Free: true, Models: []TierModel{{Name: "a", ID: "a"}}},
+	}
+	app := newApp(cfg)
+	app.cooldowns.set("gratis-a", 90*time.Second)
+	rec := getStatusPage(app) // no Authorization header: the page is open
+	body := rec.Body.String()
+	if rec.Code != http.StatusOK {
+		t.Fatalf("got %d", rec.Code)
+	}
+	rows := strings.Split(body[strings.Index(body, "<h2>Tiers</h2>"):], "<tr>")
+	if len(rows) != 5 || !strings.Contains(rows[1], "<th>Tier</th>") {
+		t.Fatalf("tiers table: %v", rows)
+	}
+	for i, want := range []string{"OpenCode Go (tier 0)</td><td>ok</td><td>—</td>", "", "gratis-b</td><td>ok</td><td>—</td>"} {
+		if want != "" && !strings.Contains(rows[i+2], want) {
+			t.Fatalf("row %d: want %q in %s", i+2, want, rows[i+2])
+		}
+	}
+	if !regexp.MustCompile(`gratis-a</td><td>cooldown</td><td>\d+s</td>`).MatchString(rows[3]) {
+		t.Fatalf("gratis-a row: %s", rows[3])
+	}
+	tier0 := func() string { return strings.Split(getStatusPage(app).Body.String(), "<h2>Tiers</h2>")[1] }
+	// a tier cooldown longer than the keys' own wins
+	app.cooldowns.set(tier0CooldownKey, 2*time.Minute)
+	if row := tier0(); !regexp.MustCompile(`tier 0\)</td><td>cooldown</td><td>(119|120)s</td>`).MatchString(row) {
+		t.Fatalf("tier 0 with tier cooldown: %s", row)
+	}
+	delete(app.cooldowns.until, tier0CooldownKey)
+	// exhausted keys whose cooldown already elapsed (idle proxy) are not a cooldown
+	app.keys.MarkExhausted(0)
+	app.keys.now = func() time.Time { return time.Now().UTC().Add(2 * time.Hour) }
+	if row := tier0(); !strings.Contains(row, "tier 0)</td><td>ok</td>") {
+		t.Fatalf("tier 0 with elapsed key cooldown: %s", row)
+	}
+	app.keys.now = func() time.Time { return time.Now().UTC() }
+	if row := strings.Split(getStatusPage(app).Body.String(), "<h2>Tiers</h2>")[1]; !regexp.MustCompile(`tier 0\)</td><td>cooldown</td><td>\d+s</td>`).MatchString(row) {
+		t.Fatalf("tier 0 with every key exhausted: %s", row)
+	}
+	if i := strings.Index(body, "#1"); i < 0 || i > strings.Index(body, "<h2>Tiers</h2>") {
+		t.Fatal("tiers section must come below the keys")
+	}
+	for _, secret := range []string{"SEGREDO1", "SEGREDO2", "SEGREDO3", "sk-good", "kt-", "segredo-a", "segredo-b"} {
+		if strings.Contains(body, secret) {
+			t.Fatalf("leaked %q: %s", secret, body)
+		}
+	}
+}
+
+type lockedBuf struct {
+	mu sync.Mutex
+	b  bytes.Buffer
+}
+
+func (l *lockedBuf) Write(p []byte) (int, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.b.Write(p)
+}
+
+func (l *lockedBuf) String() string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.b.String()
+}
+
+// captureLog routes the app's request log into a buffer and returns a reader of the parsed lines.
+func captureLog(app *App) func(t *testing.T) []map[string]any {
+	buf := &lockedBuf{}
+	app.logger = slog.New(slog.NewJSONHandler(buf, nil))
+	return func(t *testing.T) []map[string]any {
+		t.Helper()
+		var out []map[string]any
+		for _, ln := range strings.Split(strings.TrimSpace(buf.String()), "\n") {
+			if ln == "" {
+				continue
+			}
+			m := map[string]any{}
+			if err := json.Unmarshal([]byte(ln), &m); err != nil {
+				t.Fatalf("bad log line %q: %v", ln, err)
+			}
+			out = append(out, m)
+		}
+		return out
+	}
+}
+
+func TestRequestLogTier0AndTier1(t *testing.T) {
+	s0 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") == "Bearer secret-key-1" {
+			w.WriteHeader(http.StatusTooManyRequests)
+			_, _ = w.Write([]byte(quotaBody))
+			return
+		}
+		_, _ = w.Write([]byte(`{"ok":true}`))
+	}))
+	defer s0.Close()
+	s1 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"from":"t1"}`))
+	}))
+	defer s1.Close()
+	app := newApp(Config{ProxyAPIKey: "p", UpstreamAPIKeys: []string{"secret-key-1", "secret-key-2"}, KeyNames: []string{"first", "second"}, UpstreamBaseURL: s0.URL, MaxRequestBodyBytes: 1 << 20, RetryExhaustedAfter: time.Hour, Tiers: []TierConfig{
+		{Name: "t1", BaseURL: s1.URL, APIKey: "secret-tier-key", Free: true, Styles: []APIStyle{APIStyleOpenAI}, Models: []TierModel{{Name: "a"}}},
+	}})
+	lines := captureLog(app)
+	if rec := tierReq(app, http.MethodPost, "/v1/chat/completions", `{"model":"glm-5.1"}`, nil); rec.Code != http.StatusOK {
+		t.Fatalf("tier0: %d", rec.Code)
+	}
+	app.keys.MarkExhausted(1) // tier 0 is now fully exhausted
+	if rec := tierReq(app, http.MethodPost, "/v1/chat/completions", `{"model":"a"}`, nil); rec.Code != http.StatusOK {
+		t.Fatalf("tier1: %d", rec.Code)
+	}
+	got := lines(t)
+	if len(got) != 2 {
+		t.Fatalf("lines: %v", got)
+	}
+	l0, l1 := got[0], got[1]
+	if l0["msg"] != "request" || l0["model"] != "glm-5.1" || l0["api_style"] != "openai" || l0["tier"] != "opencode-go" ||
+		l0["key_index"] != float64(1) || l0["key_name"] != "second" || l0["status"] != float64(200) || l0["latency_ms"] == nil {
+		t.Fatalf("tier0 line: %v", l0)
+	}
+	if l1["model"] != "a" || l1["tier"] != "t1" || l1["status"] != float64(200) {
+		t.Fatalf("tier1 line: %v", l1)
+	}
+	if _, ok := l1["key_index"]; ok {
+		t.Fatalf("tier1 line has key_index: %v", l1)
+	}
+	if _, ok := l1["key_name"]; ok {
+		t.Fatalf("tier1 line has key_name: %v", l1)
+	}
+	raw, _ := json.Marshal(got)
+	for _, secret := range []string{"secret-key-1", "secret-key-2", "secret-tier-key"} {
+		if strings.Contains(string(raw), secret) {
+			t.Fatalf("log leaks %q: %s", secret, raw)
+		}
+	}
+}
+
+func TestRequestLogStreamLatencyCoversWholeStream(t *testing.T) {
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("data: 1\n\n"))
+		w.(http.Flusher).Flush()
+		time.Sleep(200 * time.Millisecond)
+		_, _ = w.Write([]byte("data: 2\n\n"))
+	}))
+	defer up.Close()
+	app := newApp(Config{ProxyAPIKey: "p", UpstreamAPIKeys: []string{"k"}, UpstreamBaseURL: up.URL, MaxRequestBodyBytes: 1 << 20, RetryExhaustedAfter: time.Hour})
+	lines := captureLog(app)
+	if rec := doProxyReq(app); rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), "data: 2") || !rec.Flushed {
+		t.Fatalf("code=%d flushed=%v body=%q", rec.Code, rec.Flushed, rec.Body.String())
+	}
+	got := lines(t)
+	if len(got) != 1 || got[0]["latency_ms"].(float64) < 200 {
+		t.Fatalf("lines: %v", got)
+	}
+}
+
+func TestRequestLogLocal429And502HaveNoTier(t *testing.T) {
+	f := newTierFixture(t, false, false)
+	f.app.config.Tiers = nil
+	lines := captureLog(f.app)
+	if rec := tierReq(f.app, http.MethodPost, "/v1/chat/completions", `{"model":"a"}`, nil); rec.Code != http.StatusTooManyRequests {
+		t.Fatalf("setup: %d", rec.Code)
+	}
+	if rec := tierReq(f.app, http.MethodPost, "/v1/chat/completions", `{"model":"a"}`, nil); rec.Code != http.StatusTooManyRequests {
+		t.Fatalf("429: %d", rec.Code)
+	}
+	dead := newApp(Config{ProxyAPIKey: "p", UpstreamAPIKeys: []string{"k"}, UpstreamBaseURL: "http://127.0.0.1:1", MaxRequestBodyBytes: 1 << 20, RetryExhaustedAfter: time.Hour})
+	deadLines := captureLog(dead)
+	if rec := doProxyReq(dead); rec.Code != http.StatusBadGateway {
+		t.Fatalf("502: %d", rec.Code)
+	}
+	// tier 0 quota-exhausted, then the tier upstream is unreachable
+	tierDead := newApp(Config{ProxyAPIKey: "p", UpstreamAPIKeys: []string{"u"}, UpstreamBaseURL: f.app.config.UpstreamBaseURL, MaxRequestBodyBytes: 1 << 20, RetryExhaustedAfter: time.Hour, Tiers: []TierConfig{
+		{Name: "t1", BaseURL: "http://127.0.0.1:1", APIKey: "k1", Free: true, Styles: []APIStyle{APIStyleOpenAI}, Models: []TierModel{{Name: "a"}}},
+	}})
+	tierDeadLines := captureLog(tierDead)
+	if rec := tierReq(tierDead, http.MethodPost, "/v1/chat/completions", `{"model":"a"}`, nil); rec.Code != http.StatusBadGateway {
+		t.Fatalf("tier 502: %d", rec.Code)
+	}
+	for i, got := range [][]map[string]any{lines(t), deadLines(t), tierDeadLines(t)} {
+		l := got[len(got)-1]
+		want := []float64{429, 502, 502}[i]
+		if l["tier"] != "" || l["status"] != want {
+			t.Fatalf("line %d: %v", i, l)
+		}
+		if _, ok := l["key_index"]; ok {
+			t.Fatalf("line %d has key_index: %v", i, l)
+		}
+	}
+}
+
+func TestRequestLogAnthropicStyle(t *testing.T) {
+	s0 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusTooManyRequests)
+		_, _ = w.Write([]byte(quotaBody))
+	}))
+	defer s0.Close()
+	s1 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { _, _ = w.Write([]byte(`{}`)) }))
+	defer s1.Close()
+	app := newApp(Config{ProxyAPIKey: "p", UpstreamAPIKeys: []string{"k"}, UpstreamBaseURL: s0.URL, MaxRequestBodyBytes: 1 << 20, RetryExhaustedAfter: time.Hour, Tiers: []TierConfig{
+		{Name: "t1", BaseURL: s1.URL, APIKey: "tk", Free: true, Styles: []APIStyle{APIStyleAnthropic}, Models: []TierModel{{Name: "m"}}},
+	}})
+	lines := captureLog(app)
+	if rec := tierReq(app, http.MethodPost, "/v1/messages", `{"model":"m"}`, nil); rec.Code != http.StatusOK {
+		t.Fatalf("code %d", rec.Code)
+	}
+	got := lines(t)
+	if len(got) != 1 || got[0]["api_style"] != "anthropic" || got[0]["tier"] != "t1" || got[0]["status"] != float64(200) {
+		t.Fatalf("lines: %v", got)
+	}
+	if _, ok := got[0]["key_index"]; ok {
+		t.Fatalf("tier line has key_index: %v", got[0])
+	}
+}
+
+func TestRequestLogTierNamedLikeTier0HasNoKeyFields(t *testing.T) {
+	s0 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusTooManyRequests)
+		_, _ = w.Write([]byte(quotaBody))
+	}))
+	defer s0.Close()
+	s1 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { _, _ = w.Write([]byte(`{}`)) }))
+	defer s1.Close()
+	app := newApp(Config{ProxyAPIKey: "p", UpstreamAPIKeys: []string{"k"}, KeyNames: []string{"n"}, UpstreamBaseURL: s0.URL, MaxRequestBodyBytes: 1 << 20, RetryExhaustedAfter: time.Hour, Tiers: []TierConfig{
+		{Name: "opencode-go", BaseURL: s1.URL, APIKey: "tk", Free: true, Styles: []APIStyle{APIStyleOpenAI}, Models: []TierModel{{Name: "m"}}},
+	}})
+	lines := captureLog(app)
+	if rec := tierReq(app, http.MethodPost, "/v1/chat/completions", `{"model":"m"}`, nil); rec.Code != http.StatusOK {
+		t.Fatalf("code %d", rec.Code)
+	}
+	got := lines(t)
+	if len(got) != 1 || got[0]["tier"] != "opencode-go" {
+		t.Fatalf("lines: %v", got)
+	}
+	for _, k := range []string{"key_index", "key_name"} {
+		if _, ok := got[0][k]; ok {
+			t.Fatalf("extra tier line has %s: %v", k, got[0])
+		}
+	}
+}
+
+func TestRequestBodyTooLargeStill413(t *testing.T) {
+	app := newApp(Config{ProxyAPIKey: "p", UpstreamAPIKeys: []string{"k"}, UpstreamBaseURL: "http://127.0.0.1:1", MaxRequestBodyBytes: 8, RetryExhaustedAfter: time.Hour})
+	lines := captureLog(app)
+	srv := httptest.NewServer(app)
+	defer srv.Close()
+	req, _ := http.NewRequest(http.MethodPost, srv.URL+"/v1/chat/completions", strings.NewReader(`{"model":"glm-5.1","messages":[]}`))
+	req.Header.Set("Authorization", "Bearer p")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = resp.Body.Close()
+	// The connection is closed after a 413 only when MaxBytesReader wraps the original writer.
+	if resp.StatusCode != http.StatusRequestEntityTooLarge || !resp.Close {
+		t.Fatalf("code=%d close=%v", resp.StatusCode, resp.Close)
+	}
+	// The log line is written after the handler returns, which can be after the client has the response.
+	var got []map[string]any
+	for deadline := time.Now().Add(2 * time.Second); len(got) == 0 && time.Now().Before(deadline); time.Sleep(10 * time.Millisecond) {
+		got = lines(t)
+	}
+	if len(got) != 1 || got[0]["status"] != float64(413) || got[0]["model"] != "" || got[0]["tier"] != "" {
+		t.Fatalf("lines: %v", got)
+	}
+}
+
+func TestRequestLogKeyZeroIsLogged(t *testing.T) {
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { _, _ = w.Write([]byte(`{}`)) }))
+	defer up.Close()
+	app := newApp(Config{ProxyAPIKey: "p", UpstreamAPIKeys: []string{"k"}, KeyNames: []string{"first"}, UpstreamBaseURL: up.URL, MaxRequestBodyBytes: 1 << 20, RetryExhaustedAfter: time.Hour})
+	lines := captureLog(app)
+	if rec := tierReq(app, http.MethodPost, "/v1/chat/completions", `{"model":"m"}`, nil); rec.Code != http.StatusOK {
+		t.Fatalf("code %d", rec.Code)
+	}
+	got := lines(t)
+	if len(got) != 1 || got[0]["key_index"] != float64(0) || got[0]["key_name"] != "first" {
+		t.Fatalf("lines: %v", got)
+	}
+}
+
+func TestRequestLogModelIsTruncated(t *testing.T) {
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { _, _ = w.Write([]byte(`{}`)) }))
+	defer up.Close()
+	app := newApp(Config{ProxyAPIKey: "p", UpstreamAPIKeys: []string{"k"}, UpstreamBaseURL: up.URL, MaxRequestBodyBytes: 1 << 20, RetryExhaustedAfter: time.Hour})
+	lines := captureLog(app)
+	// 127 ASCII bytes then a 2-byte rune straddling the 128-byte cut.
+	long := strings.Repeat("a", 127) + strings.Repeat("é", 500)
+	if rec := tierReq(app, http.MethodPost, "/v1/chat/completions", `{"model":"`+long+`"}`, nil); rec.Code != http.StatusOK {
+		t.Fatalf("code %d", rec.Code)
+	}
+	got := lines(t)
+	if len(got) != 1 || got[0]["model"] != strings.Repeat("a", 127) {
+		t.Fatalf("lines: %v", got)
+	}
+}
+
+// stub is an upstream that answers a fixed status and body and counts its hits.
+type stub struct {
+	srv    *httptest.Server
+	hits   atomic.Int32
+	status atomic.Int32
+	body   atomic.Value
+}
+
+func newStub(t *testing.T, status int, body string) *stub {
+	t.Helper()
+	st := &stub{}
+	st.status.Store(int32(status))
+	st.body.Store(body)
+	st.srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		st.hits.Add(1)
+		w.WriteHeader(int(st.status.Load()))
+		_, _ = w.Write([]byte(st.body.Load().(string)))
+	}))
+	t.Cleanup(st.srv.Close)
+	return st
+}
+
+// failoverApp wires tier 0 (two keys) and extra tiers t1 and t2 (both map "a") to the stubs,
+// with a fake clock shared by the key manager and the tier cooldowns.
+func failoverApp(t *testing.T, s0, s1, s2 *stub, retryAfter time.Duration) (*App, *time.Time) {
+	t.Helper()
+	return failoverAppTimeout(t, s0, s1, s2, retryAfter, 0)
+}
+
+// failoverAppTimeout is failoverApp with the upstream response header timeout set through config.
+func failoverAppTimeout(t *testing.T, s0, s1, s2 *stub, retryAfter, headerTimeout time.Duration) (*App, *time.Time) {
+	t.Helper()
+	cfg := Config{ProxyAPIKey: "p", UpstreamAPIKeys: []string{"u1", "u2"}, UpstreamBaseURL: s0.srv.URL, MaxRequestBodyBytes: 1 << 20, RetryExhaustedAfter: retryAfter, UpstreamResponseHeaderTimeout: headerTimeout}
+	cfg.Tiers = append(cfg.Tiers, TierConfig{Name: "t1", BaseURL: s1.srv.URL, APIKey: "k1", Free: true, Styles: []APIStyle{APIStyleOpenAI}, Models: []TierModel{{Name: "a"}}})
+	if s2 != nil {
+		cfg.Tiers = append(cfg.Tiers, TierConfig{Name: "t2", BaseURL: s2.srv.URL, APIKey: "k2", Free: true, Styles: []APIStyle{APIStyleOpenAI}, Models: []TierModel{{Name: "a"}}})
+	}
+	app := newApp(cfg)
+	now := time.Unix(10000, 0).UTC()
+	app.keys.now = func() time.Time { return now }
+	app.cooldowns.now = func() time.Time { return now }
+	return app, &now
+}
+
+func chatReq(app *App, body string) *httptest.ResponseRecorder {
+	return tierReq(app, http.MethodPost, "/v1/chat/completions", body, nil)
+}
+
+func TestFailoverTier0FailureStatusesGoToNextTier(t *testing.T) {
+	for _, c := range []struct {
+		status int
+		body   string
+	}{
+		{401, `{"error":"bad key"}`}, {402, `{"error":"pay"}`}, {404, `{"error":"route gone"}`},
+		{500, `oops`}, {503, `oops`}, {429, `{"error":{"code":"rate_limit"}}`},
+	} {
+		t.Run(strconv.Itoa(c.status), func(t *testing.T) {
+			s0, s1 := newStub(t, c.status, c.body), newStub(t, 200, `{"from":"t1"}`)
+			app, _ := failoverApp(t, s0, s1, nil, time.Hour)
+			for i := 1; i <= 2; i++ {
+				rec := chatReq(app, `{"model":"a"}`)
+				if rec.Code != 200 || rec.Body.String() != `{"from":"t1"}` || s0.hits.Load() != 1 || s1.hits.Load() != int32(i) {
+					t.Fatalf("req %d: %d %q hits=%d/%d", i, rec.Code, rec.Body.String(), s0.hits.Load(), s1.hits.Load())
+				}
+			}
+			// the failure is tier-wide: no key was marked exhausted
+			for _, k := range app.keys.Status().Keys {
+				if k.State == string(KeyExhausted) {
+					t.Fatalf("key exhausted: %+v", k)
+				}
+			}
+		})
+	}
+}
+
+func TestFailoverExtraTierFailureStatusesGoToNextTier(t *testing.T) {
+	for _, status := range []int{401, 402, 404, 500, 429} {
+		t.Run(strconv.Itoa(status), func(t *testing.T) {
+			s0, s1, s2 := newStub(t, 500, `x`), newStub(t, status, `{"error":"nope"}`), newStub(t, 200, `{"from":"t2"}`)
+			app, _ := failoverApp(t, s0, s1, s2, time.Hour)
+			for i := 1; i <= 2; i++ {
+				rec := chatReq(app, `{"model":"a"}`)
+				if rec.Code != 200 || rec.Body.String() != `{"from":"t2"}` || s1.hits.Load() != 1 || s2.hits.Load() != int32(i) {
+					t.Fatalf("req %d: %d %q hits=%d/%d", i, rec.Code, rec.Body.String(), s1.hits.Load(), s2.hits.Load())
+				}
+			}
+		})
+	}
+}
+
+func TestFailover400And404MissingModelPassThroughWithoutCooldown(t *testing.T) {
+	for _, c := range []struct {
+		status int
+		body   string
+	}{
+		{400, `bad request`}, {403, `forbidden`}, {404, `{"error":{"message":"The model gpt-x does not exist"}}`}, {404, `Model not found`},
+	} {
+		s0, s1 := newStub(t, c.status, c.body), newStub(t, 200, `{"from":"t1"}`)
+		app, _ := failoverApp(t, s0, s1, nil, time.Hour)
+		for i := 1; i <= 2; i++ {
+			rec := chatReq(app, `{"model":"a"}`)
+			if rec.Code != c.status || rec.Body.String() != c.body || s0.hits.Load() != int32(i) || s1.hits.Load() != 0 {
+				t.Fatalf("%d %q req %d: got %d %q hits=%d/%d", c.status, c.body, i, rec.Code, rec.Body.String(), s0.hits.Load(), s1.hits.Load())
+			}
+		}
+	}
+	// a 404 from an extra tier that says the model is missing also goes to the client
+	s0, s1, s2 := newStub(t, 500, `x`), newStub(t, 404, `model not found`), newStub(t, 200, `{"from":"t2"}`)
+	app, _ := failoverApp(t, s0, s1, s2, time.Hour)
+	for i := 1; i <= 2; i++ {
+		rec := chatReq(app, `{"model":"a"}`)
+		if i == 1 && (rec.Code != 404 || s2.hits.Load() != 0) {
+			t.Fatalf("tier 404: %d hits=%d", rec.Code, s2.hits.Load())
+		}
+	}
+	if s1.hits.Load() != 2 {
+		t.Fatalf("tier 1 was put in cooldown by a model 404: %d hits", s1.hits.Load())
+	}
+}
+
+func TestFailover404WithoutRequestModelPassesThrough(t *testing.T) {
+	s0, s1 := newStub(t, 404, `{"error":"route gone"}`), newStub(t, 200, `{"from":"t1"}`)
+	app, _ := failoverApp(t, s0, s1, nil, time.Hour)
+	for i := 1; i <= 2; i++ {
+		rec := chatReq(app, `{"messages":[]}`)
+		if rec.Code != 404 || s0.hits.Load() != int32(i) || s1.hits.Load() != 0 {
+			t.Fatalf("got %d hits=%d/%d", rec.Code, s0.hits.Load(), s1.hits.Load())
+		}
+	}
+}
+
+func TestFailoverStartedStreamKeepsTier(t *testing.T) {
+	s0 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("data: one\n\n"))
+		w.(http.Flusher).Flush()
+		panic(http.ErrAbortHandler) // cut the stream after the first event
+	}))
+	defer s0.Close()
+	s1 := newStub(t, 200, `{"from":"t1"}`)
+	app, _ := failoverApp(t, &stub{srv: s0}, s1, nil, time.Hour)
+	rec := chatReq(app, `{"model":"a"}`)
+	if rec.Code != 200 || !strings.Contains(rec.Body.String(), "data: one") || s1.hits.Load() != 0 {
+		t.Fatalf("got %d %q t1 hits=%d", rec.Code, rec.Body.String(), s1.hits.Load())
+	}
+	if app.cooldowns.remaining(tier0CooldownKey) != 0 {
+		t.Fatal("tier 0 in cooldown after a stream that started")
+	}
+}
+
+func TestFailoverCooldownExpires(t *testing.T) {
+	s0, s1 := newStub(t, 500, `x`), newStub(t, 200, `{"from":"t1"}`)
+	app, now := failoverApp(t, s0, s1, nil, time.Minute)
+	chatReq(app, `{"model":"a"}`)
+	*now = now.Add(30 * time.Second)
+	chatReq(app, `{"model":"a"}`)
+	if s0.hits.Load() != 1 {
+		t.Fatalf("tier 0 called during cooldown: %d", s0.hits.Load())
+	}
+	s0.status.Store(200)
+	s0.body.Store(`{"from":"t0"}`)
+	*now = now.Add(31 * time.Second)
+	rec := chatReq(app, `{"model":"a"}`)
+	if rec.Body.String() != `{"from":"t0"}` || s0.hits.Load() != 2 {
+		t.Fatalf("tier 0 not retried after cooldown: %q hits=%d", rec.Body.String(), s0.hits.Load())
+	}
+}
+
+func TestFailoverAllFailServesLastResponseAndLogsItsTier(t *testing.T) {
+	s0, s1, s2 := newStub(t, 500, `from t0`), newStub(t, 502, `from t1`), newStub(t, 503, `from t2`)
+	app, _ := failoverApp(t, s0, s1, s2, time.Hour)
+	lines := captureLog(app)
+	rec := chatReq(app, `{"model":"a"}`)
+	if rec.Code != 503 || rec.Body.String() != "from t2" {
+		t.Fatalf("got %d %q", rec.Code, rec.Body.String())
+	}
+	for _, name := range []string{tier0CooldownKey, "t1", "t2"} {
+		if app.cooldowns.remaining(name) == 0 {
+			t.Fatalf("%s not in cooldown", name)
+		}
+	}
+	if l := lines(t); l[len(l)-1]["tier"] != "t2" || l[len(l)-1]["status"] != float64(503) {
+		t.Fatalf("log %v", l)
+	}
+	// without a model only tier 0 can answer, so its failure response is the last one
+	s0b, s1b := newStub(t, 500, `from t0`), newStub(t, 200, `x`)
+	app2, _ := failoverApp(t, s0b, s1b, nil, time.Hour)
+	lines2 := captureLog(app2)
+	rec = chatReq(app2, `{"messages":[]}`)
+	if rec.Code != 500 || rec.Body.String() != "from t0" || s1b.hits.Load() != 0 {
+		t.Fatalf("no model: %d %q", rec.Code, rec.Body.String())
+	}
+	if l := lines2(t); l[len(l)-1]["tier"] != tier0Name || l[len(l)-1]["key_index"] != float64(0) {
+		t.Fatalf("log %v", l)
+	}
+}
+
+func TestFailoverTier0WithoutExtraTiersCooldownAndRetry(t *testing.T) {
+	s0, s1 := newStub(t, 500, `from t0`), newStub(t, 200, `x`)
+	app, now := failoverApp(t, s0, s1, nil, time.Minute)
+	app.config.Tiers = nil
+	rec := chatReq(app, `{"model":"a"}`)
+	if rec.Code != 500 || rec.Body.String() != "from t0" {
+		t.Fatalf("first: %d %q", rec.Code, rec.Body.String())
+	}
+	rec = chatReq(app, `{"model":"a"}`)
+	if rec.Code != 429 || rec.Header().Get("Retry-After") != "60" || s0.hits.Load() != 1 {
+		t.Fatalf("second: %d RA=%q hits=%d", rec.Code, rec.Header().Get("Retry-After"), s0.hits.Load())
+	}
+	*now = now.Add(61 * time.Second)
+	chatReq(app, `{"model":"a"}`)
+	if s0.hits.Load() != 2 {
+		t.Fatalf("tier 0 not retried after cooldown: %d hits", s0.hits.Load())
+	}
+}
+
+func TestFailoverHeldTier0FailureThenUnreachableTierGoesOn(t *testing.T) {
+	s0, s1, s2 := newStub(t, 500, `from t0`), newStub(t, 200, `x`), newStub(t, 200, `{"from":"t2"}`)
+	s1.srv.Close() // t1 is unreachable: connection refused
+	app, _ := failoverApp(t, s0, s1, s2, time.Hour)
+	rec := chatReq(app, `{"model":"a"}`)
+	if rec.Code != 200 || rec.Body.String() != `{"from":"t2"}` || app.cooldowns.remaining("t1") != 0 {
+		t.Fatalf("got %d %q", rec.Code, rec.Body.String())
+	}
+	// no tier left after the unreachable one: the held tier 0 response is served
+	s2.srv.Close()
+	app, _ = failoverApp(t, newStub(t, 500, `from t0`), s1, nil, time.Hour)
+	rec = chatReq(app, `{"model":"a"}`)
+	if rec.Code != 500 || rec.Body.String() != "from t0" {
+		t.Fatalf("held: %d %q", rec.Code, rec.Body.String())
+	}
+}
+
+// slowStub is an upstream that counts its hits and never answers until the client gives up.
+func slowStub(t *testing.T) *stub {
+	t.Helper()
+	st := &stub{}
+	st.srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		st.hits.Add(1)
+		_, _ = io.Copy(io.Discard, r.Body) // lets the server notice the client closing
+		select {
+		case <-r.Context().Done():
+		case <-time.After(5 * time.Second):
+		}
+	}))
+	t.Cleanup(st.srv.Close)
+	return st
+}
+
+func TestFailoverConnectionErrorTier0(t *testing.T) {
+	s1 := newStub(t, 200, `{"from":"t1"}`)
+	// s0 accepts the connection and drops it, so the client sees a connection error.
+	s0 := &stub{}
+	s0.srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		s0.hits.Add(1)
+		conn, _, _ := w.(http.Hijacker).Hijack()
+		_ = conn.Close()
+	}))
+	t.Cleanup(s0.srv.Close)
+	app, _ := failoverApp(t, s0, s1, nil, time.Hour)
+	rec := chatReq(app, `{"model":"a"}`)
+	idx, _, ok := app.keys.Current()
+	if rec.Body.String() != `{"from":"t1"}` || app.cooldowns.remaining(tier0CooldownKey) != 0 || !ok || idx != 0 || s0.hits.Load() != 1 {
+		t.Fatalf("got %d %q idx=%d t0 hits=%d", rec.Code, rec.Body.String(), idx, s0.hits.Load())
+	}
+	// the next request tries tier 0 again (still no cooldown, keys intact), once
+	chatReq(app, `{"model":"a"}`)
+	if idx, _, _ := app.keys.Current(); app.cooldowns.remaining(tier0CooldownKey) != 0 || idx != 0 || s1.hits.Load() != 2 || s0.hits.Load() != 2 {
+		t.Fatalf("second request: idx=%d t1 hits=%d t0 hits=%d", idx, s1.hits.Load(), s0.hits.Load())
+	}
+}
+
+func TestFailoverHeaderTimeoutGoesToNextTier(t *testing.T) {
+	slow, s1 := slowStub(t), newStub(t, 200, `{"from":"t1"}`)
+	app, _ := failoverAppTimeout(t, slow, s1, nil, time.Hour, 50*time.Millisecond)
+	rec := chatReq(app, `{"model":"a"}`)
+	if rec.Body.String() != `{"from":"t1"}` || app.cooldowns.remaining(tier0CooldownKey) != 0 || slow.hits.Load() != 1 {
+		t.Fatalf("got %d %q t0 hits=%d", rec.Code, rec.Body.String(), slow.hits.Load())
+	}
+}
+
+func TestFailoverHeaderTimeoutExtraTierGoesToNextTierWithoutCooldown(t *testing.T) {
+	s0, slow, s2 := newStub(t, 500, `from t0`), slowStub(t), newStub(t, 200, `{"from":"t2"}`)
+	app, _ := failoverAppTimeout(t, s0, slow, s2, time.Hour, 50*time.Millisecond)
+	rec := chatReq(app, `{"model":"a"}`)
+	if rec.Body.String() != `{"from":"t2"}` || app.cooldowns.remaining("t1") != 0 || slow.hits.Load() != 1 {
+		t.Fatalf("got %d %q t1 hits=%d", rec.Code, rec.Body.String(), slow.hits.Load())
+	}
+}
+
+func TestFailoverTier0UnreachableWithoutExtraTiersHidesTierURL(t *testing.T) {
+	s0, s1 := newStub(t, 200, `x`), newStub(t, 200, `x`)
+	s0.srv.Close()
+	app, _ := failoverApp(t, s0, s1, nil, time.Hour)
+	rec := tierReq(app, http.MethodGet, "/v1/models", "", nil)
+	if rec.Code != 502 || rec.Body.String() != "upstream unreachable\n" || strings.Contains(rec.Body.String(), s0.srv.URL) {
+		t.Fatalf("got %d %q", rec.Code, rec.Body.String())
+	}
+}
+
+func TestFailoverClientCancelWithHeldResponseLogs499(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	s0, s1 := newStub(t, 500, `from t0`), newStub(t, 200, `x`)
+	app, now := failoverApp(t, s0, s1, nil, time.Hour)
+	// The tier 0 cooldown is set right after its 500 arrives: cancel there, before the final step.
+	app.cooldowns.now = func() time.Time {
+		if s0.hits.Load() > 0 {
+			cancel()
+		}
+		return *now
+	}
+	lines := captureLog(app)
+	// model "b" maps to no extra tier, so the held tier 0 response is the only thing left to serve
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"b"}`)).WithContext(ctx)
+	req.Header.Set("Authorization", "Bearer p")
+	rec := httptest.NewRecorder()
+	app.ServeHTTP(rec, req)
+	if l := lines(t); len(l) != 1 || l[0]["status"] != float64(499) || rec.Body.Len() != 0 || s1.hits.Load() != 0 {
+		t.Fatalf("log=%v body=%q t1 hits=%d", l, rec.Body.String(), s1.hits.Load())
+	}
+}
+
+func TestFailoverConnectionErrorExtraTierAndAllUnreachable(t *testing.T) {
+	s0, s1, s2 := newStub(t, 500, `from t0`), newStub(t, 200, `x`), newStub(t, 200, `{"from":"t2"}`)
+	s1.srv.Close()
+	app, _ := failoverApp(t, s0, s1, s2, time.Hour)
+	rec := chatReq(app, `{"model":"a"}`)
+	if rec.Body.String() != `{"from":"t2"}` || app.cooldowns.remaining("t1") != 0 {
+		t.Fatalf("extra tier: %d %q", rec.Code, rec.Body.String())
+	}
+	d0, d1 := newStub(t, 200, `x`), newStub(t, 200, `x`)
+	d0.srv.Close()
+	d1.srv.Close()
+	app, _ = failoverApp(t, d0, d1, nil, time.Hour)
+	lines := captureLog(app)
+	rec = chatReq(app, `{"model":"a"}`)
+	if l := lines(t); rec.Code != 502 || l[0]["tier"] != "" || l[0]["status"] != float64(502) ||
+		app.cooldowns.remaining(tier0CooldownKey) != 0 || app.cooldowns.remaining("t1") != 0 {
+		t.Fatalf("all unreachable: %d %v", rec.Code, l)
+	}
+}
+
+func TestFailoverNoModelStaysOnTier0(t *testing.T) {
+	s0, s1 := newStub(t, 200, `x`), newStub(t, 200, `x`)
+	s0.srv.Close()
+	app, _ := failoverApp(t, s0, s1, nil, time.Hour)
+	rec := tierReq(app, http.MethodGet, "/v1/models", "", nil)
+	if rec.Code != 502 || s1.hits.Load() != 0 {
+		t.Fatalf("got %d t1 hits=%d", rec.Code, s1.hits.Load())
+	}
+}
+
+func TestFailoverClientCancelStopsWithoutTouchingState(t *testing.T) {
+	for _, slowTier := range []int{0, 1} {
+		ctx, cancel := context.WithCancel(context.Background())
+		slow := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			_, _ = io.Copy(io.Discard, r.Body) // lets the server notice the client closing
+			cancel()
+			select {
+			case <-r.Context().Done():
+			case <-time.After(5 * time.Second):
+			}
+		}))
+		defer slow.Close()
+		next, s2 := newStub(t, 200, `x`), newStub(t, 200, `x`)
+		var app *App
+		if slowTier == 0 {
+			app, _ = failoverApp(t, &stub{srv: slow}, next, s2, time.Hour)
+		} else {
+			app, _ = failoverApp(t, newStub(t, 500, `from t0`), &stub{srv: slow}, s2, time.Hour)
+		}
+		lines := captureLog(app)
+		req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"a"}`)).WithContext(ctx)
+		req.Header.Set("Authorization", "Bearer p")
+		app.ServeHTTP(httptest.NewRecorder(), req)
+		l := lines(t)
+		if len(l) != 1 || l[0]["status"] != float64(499) || l[0]["tier"] != "" || s2.hits.Load() != 0 || next.hits.Load() != 0 || app.cooldowns.remaining("t1") != 0 {
+			t.Fatalf("slow tier %d: log=%v t2 hits=%d next hits=%d", slowTier, l, s2.hits.Load(), next.hits.Load())
+		}
+		if slowTier == 0 && app.cooldowns.remaining(tier0CooldownKey) != 0 {
+			t.Fatal("tier 0 in cooldown after a client cancel")
+		}
+	}
+}
+
+func TestFailoverAllInCooldownLocal429WithRetryAfter(t *testing.T) {
+	s0, s1 := newStub(t, 500, `x`), newStub(t, 503, `y`)
+	app, now := failoverApp(t, s0, s1, nil, time.Hour)
+	d := 10 * time.Minute
+	app.config.Tiers[0].Cooldown = &d
+	if rec := chatReq(app, `{"model":"a"}`); rec.Code != 503 {
+		t.Fatalf("first: %d", rec.Code)
+	}
+	*now = now.Add(time.Minute)
+	rec := chatReq(app, `{"model":"a"}`)
+	if rec.Code != 429 || rec.Header().Get("Retry-After") != "540" || s0.hits.Load() != 1 || s1.hits.Load() != 1 {
+		t.Fatalf("got %d RA=%q hits=%d/%d", rec.Code, rec.Header().Get("Retry-After"), s0.hits.Load(), s1.hits.Load())
+	}
+	// a request that tier 1 cannot serve only waits on tier 0 (the soonest return is tier 0 at 1h)
+	rec = chatReq(app, `{"model":"zzz"}`)
+	if rec.Code != 429 || rec.Header().Get("Retry-After") != "3540" {
+		t.Fatalf("unmapped: %d RA=%q", rec.Code, rec.Header().Get("Retry-After"))
+	}
+	*now = now.Add(10 * time.Minute)
+	if rec := chatReq(app, `{"model":"a"}`); rec.Code != 503 || s1.hits.Load() != 2 || s0.hits.Load() != 1 {
+		t.Fatalf("tier 1 not retried alone: %d hits=%d/%d", rec.Code, s0.hits.Load(), s1.hits.Load())
+	}
+}
+
+func TestFailoverTierCooldownZeroAndDefault(t *testing.T) {
+	s0, s1, s2 := newStub(t, 500, `x`), newStub(t, 500, `y`), newStub(t, 200, `{"from":"t2"}`)
+	app, now := failoverApp(t, s0, s1, s2, 0)
+	// RetryExhaustedAfter 0: no cooldown anywhere, every request walks the tiers again
+	chatReq(app, `{"model":"a"}`)
+	chatReq(app, `{"model":"a"}`)
+	if s0.hits.Load() != 2 || s1.hits.Load() != 2 || s2.hits.Load() != 2 {
+		t.Fatalf("zero cooldown hits=%d/%d/%d", s0.hits.Load(), s1.hits.Load(), s2.hits.Load())
+	}
+	// the default is RetryExhaustedAfter read at use time; a tier value overrides it
+	app.config.RetryExhaustedAfter = time.Hour
+	d := time.Minute
+	app.config.Tiers[0].Cooldown = &d
+	chatReq(app, `{"model":"a"}`)
+	if app.cooldowns.remaining(tier0CooldownKey) != time.Hour || app.cooldowns.remaining("t1") != time.Minute {
+		t.Fatalf("cooldowns %v %v", app.cooldowns.remaining(tier0CooldownKey), app.cooldowns.remaining("t1"))
+	}
+	*now = now.Add(2 * time.Minute)
+	chatReq(app, `{"model":"a"}`)
+	if s0.hits.Load() != 3 || s1.hits.Load() != 4 {
+		t.Fatalf("hits=%d/%d", s0.hits.Load(), s1.hits.Load())
+	}
+}
+
+func TestFailoverQuotaStillRotatesTier0Keys(t *testing.T) {
+	var seen []string
+	s0 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		seen = append(seen, r.Header.Get("Authorization"))
+		if len(seen) == 1 {
+			w.WriteHeader(http.StatusTooManyRequests)
+			_, _ = w.Write([]byte(quotaBody))
+			return
+		}
+		_, _ = w.Write([]byte(`{"from":"t0"}`))
+	}))
+	defer s0.Close()
+	app, _ := failoverApp(t, &stub{srv: s0}, newStub(t, 200, `x`), nil, time.Hour)
+	rec := chatReq(app, `{"model":"a"}`)
+	if rec.Body.String() != `{"from":"t0"}` || len(seen) != 2 || app.cooldowns.remaining(tier0CooldownKey) != 0 {
+		t.Fatalf("got %q seen=%v", rec.Body.String(), seen)
+	}
+}
+
+func TestLoadConfigTierCooldown(t *testing.T) {
+	tiersYAML(t, "tiers:\n"+tierOK+"    cooldown: 90s\n"+strings.Replace(tierOK, "name: a", "name: b", 1)+"    cooldown: 0s\n"+strings.Replace(tierOK, "name: a", "name: c", 1))
+	cfg, err := loadConfig()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c := cfg.Tiers[0].Cooldown; c == nil || *c != 90*time.Second {
+		t.Fatalf("a: %v", c)
+	}
+	if c := cfg.Tiers[1].Cooldown; c == nil || *c != 0 {
+		t.Fatalf("b: %v", c)
+	}
+	if cfg.Tiers[2].Cooldown != nil {
+		t.Fatalf("c: %v", cfg.Tiers[2].Cooldown)
+	}
+}
+
+func TestFailover404LargeBodyReachesClientIntact(t *testing.T) {
+	big := strings.Repeat("x", 10000)
+	for _, body := range []string{big, `{"error":"model not found"}` + big} {
+		for _, model := range []string{`{"model":"a"}`, `{"messages":[]}`} {
+			s0, s1 := newStub(t, 404, body), newStub(t, 200, `{"from":"t1"}`)
+			app, _ := failoverApp(t, s0, s1, nil, time.Hour)
+			rec := chatReq(app, model)
+			got := rec.Body.String()
+			if rec.Code == 404 && got != body {
+				t.Fatalf("%q: 404 body truncated: %d of %d bytes", model, len(got), len(body))
+			}
+			if rec.Code == 200 && s0.hits.Load() != 1 {
+				t.Fatalf("hits %d", s0.hits.Load())
+			}
+		}
+	}
+	// a failure response held as the last one is also served whole
+	s0, s1 := newStub(t, 500, `x`), newStub(t, 429, big)
+	app, _ := failoverApp(t, s0, s1, nil, time.Hour)
+	if rec := chatReq(app, `{"model":"a"}`); rec.Code != 429 || rec.Body.String() != big {
+		t.Fatalf("held 429: %d, %d bytes", rec.Code, rec.Body.Len())
+	}
+}
+
+func TestFailoverExtraTierNamedLikeTier0HasOwnCooldown(t *testing.T) {
+	s0, s1 := newStub(t, 500, `x`), newStub(t, 200, `{"from":"t1"}`)
+	app, _ := failoverApp(t, s0, s1, nil, time.Hour)
+	app.config.Tiers[0].Name = tier0Name
+	app.config.Tiers[0].Cooldown = new(time.Duration) // extra tier: no cooldown
+	for i := 1; i <= 2; i++ {
+		if rec := chatReq(app, `{"model":"a"}`); rec.Code != 200 || s1.hits.Load() != int32(i) {
+			t.Fatalf("req %d: %d hits=%d", i, rec.Code, s1.hits.Load())
+		}
+	}
+	if s0.hits.Load() != 1 || app.cooldowns.remaining(tier0CooldownKey) == 0 || app.cooldowns.remaining(tier0Name) != 0 {
+		t.Fatalf("tier 0 hits=%d, cooldowns %v / %v", s0.hits.Load(), app.cooldowns.remaining(tier0CooldownKey), app.cooldowns.remaining(tier0Name))
+	}
+}
+
+func TestFailoverAllKeysExhaustedAndTiersFailStillAlerts(t *testing.T) {
+	alerts := make(chan string, 4)
+	old := sendMail
+	sendMail = func(addr string, auth smtp.Auth, from string, to []string, msg []byte, useTLS, useStartTLS bool) error {
+		alerts <- string(msg)
+		return nil
+	}
+	t.Cleanup(func() { sendMail = old })
+	s0, s1 := newStub(t, 429, quotaBody), newStub(t, 503, `down`)
+	app, _ := failoverApp(t, s0, s1, nil, time.Hour)
+	app.sender = NewSMTPNotifier(SMTPConfig{Host: "h", Port: 25, From: "f@x", To: "t@x"})
+	rec := chatReq(app, `{"model":"a"}`)
+	if rec.Code != 503 || rec.Body.String() != "down" {
+		t.Fatalf("got %d %q", rec.Code, rec.Body.String())
+	}
+	deadline := time.After(2 * time.Second)
+	for {
+		select {
+		case m := <-alerts:
+			if strings.Contains(m, "exhausted all upstream keys") {
+				return
+			}
+		case <-deadline:
+			t.Fatal("no all-exhausted alert")
+		}
+	}
+}
+
+func TestFailoverRetryAfterFromExhaustedKeysWithoutTierCooldown(t *testing.T) {
+	s0, s1 := newStub(t, 429, quotaBody), newStub(t, 200, `x`)
+	app, now := failoverApp(t, s0, s1, nil, 5*time.Minute)
+	app.config.Tiers = app.config.Tiers[:1]
+	rec := chatReq(app, `{"model":"zzz"}`) // no tier maps it: only tier 0's exhausted keys count
+	if rec.Code != 429 || rec.Header().Get("Retry-After") != "300" {
+		t.Fatalf("got %d RA=%q", rec.Code, rec.Header().Get("Retry-After"))
+	}
+	*now = now.Add(100 * time.Second)
+	if rec := chatReq(app, `{"model":"zzz"}`); rec.Header().Get("Retry-After") != "200" {
+		t.Fatalf("RA=%q", rec.Header().Get("Retry-After"))
+	}
+}
+
+func TestLoadConfigMinContext(t *testing.T) {
+	for name, c := range map[string]struct {
+		yaml string
+		want int
+	}{"omitted": {"", 64000}, "zero": {"min_context: 0\n", 0}, "explicit": {"min_context: 128000\n", 128000}} {
+		t.Run(name, func(t *testing.T) {
+			tiersYAML(t, c.yaml)
+			cfg, err := loadConfig()
+			if err != nil || cfg.MinContext != c.want {
+				t.Fatalf("min_context=%d err=%v, want %d", cfg.MinContext, err, c.want)
+			}
+		})
+	}
+	tiersYAML(t, "min_context: -1\n")
+	if _, err := loadConfig(); err == nil || !strings.Contains(err.Error(), "min_context must be >= 0") {
+		t.Fatalf("err = %v", err)
+	}
+}
+
+func TestTierEligibilityByContextAndTools(t *testing.T) {
+	const plain, withTools = `{"model":"a"}`, `{"model":"a","tools":[{"type":"function"}]}`
+	for name, c := range map[string]struct {
+		minCtx, ctx int
+		tools       bool
+		body        string
+		served      bool
+	}{
+		"context below minimum":       {1000, 999, true, plain, false},
+		"context undeclared":          {1000, 0, true, plain, false},
+		"context at minimum":          {1000, 1000, true, plain, true},
+		"tools needed, model without": {1000, 1000, false, withTools, false},
+		"tools needed, model has":     {1000, 1000, true, withTools, true},
+		"no tools, model without":     {1000, 1000, false, plain, true},
+		"empty tools array":           {1000, 1000, false, `{"model":"a","tools":[]}`, true},
+		"null tools":                  {1000, 1000, false, `{"model":"a","tools":null}`, true},
+		"floor off, context 0":        {0, 0, true, plain, true},
+		"floor off, tools still":      {0, 0, false, withTools, false},
+	} {
+		t.Run(name, func(t *testing.T) {
+			f := newTierFixture(t, false, false)
+			f.app.config.Tiers = f.app.config.Tiers[:1]
+			f.app.config.MinContext = c.minCtx
+			f.app.config.Tiers[0].Models = []TierModel{{Name: "a", ID: "id-a", Context: c.ctx, Tools: c.tools}}
+			rec := tierReq(f.app, http.MethodPost, "/v1/chat/completions", c.body, nil)
+			want, hits := http.StatusTooManyRequests, int32(0)
+			if c.served {
+				want, hits = http.StatusOK, 1
+			}
+			if rec.Code != want || f.hits()[1] != hits {
+				t.Fatalf("code=%d hits=%v", rec.Code, f.hits())
+			}
+		})
+	}
+}
+
+func TestLocalRetryAfterIgnoresIneligibleTier(t *testing.T) {
+	f := newTierFixture(t, false, false)
+	f.app.config.Tiers = f.app.config.Tiers[:1]
+	f.app.config.MinContext = 1000
+	f.app.config.Tiers[0].Models = []TierModel{{Name: "a", ID: "id-a", Context: 10, Tools: true}}
+	tierReq(f.app, http.MethodPost, "/v1/chat/completions", `{"model":"z"}`, nil) // exhaust tier 0
+	f.app.cooldowns.set("t1", 10*time.Second)
+	if secs, ok := f.app.localRetryAfter("a", APIStyleOpenAI, false); !ok || secs < 60 {
+		t.Fatalf("ineligible tier counted: %d %v", secs, ok)
+	}
+	f.app.config.Tiers[0].Models[0].Context = 1000
+	if secs, ok := f.app.localRetryAfter("a", APIStyleOpenAI, false); !ok || secs != 10 {
+		t.Fatalf("eligible tier ignored: %d %v", secs, ok)
+	}
+	// enough context but no tool calling: only counts for requests that do not need tools
+	f.app.config.Tiers[0].Models[0].Tools = false
+	if secs, ok := f.app.localRetryAfter("a", APIStyleOpenAI, true); !ok || secs < 60 {
+		t.Fatalf("tools-less tier counted for a tools request: %d %v", secs, ok)
+	}
+	if secs, ok := f.app.localRetryAfter("a", APIStyleOpenAI, false); !ok || secs != 10 {
+		t.Fatalf("tools-less tier ignored without tools: %d %v", secs, ok)
+	}
+}
+
+func TestIneligibleTiers(t *testing.T) {
+	cfg := Config{MinContext: 64000, Tiers: []TierConfig{
+		{Name: "ok", Models: []TierModel{{Name: "a"}, {Name: "b", Context: 64000}}},
+		{Name: "undeclared", Models: []TierModel{{Name: "a"}}},
+		{Name: "small", Models: []TierModel{{Name: "a", Context: 32000}}},
+	}}
+	if got := ineligibleTiers(cfg); !slices.Equal(got, []string{"undeclared", "small"}) {
+		t.Fatalf("got %v", got)
+	}
+	cfg.MinContext = 0
+	if got := ineligibleTiers(cfg); len(got) != 0 {
+		t.Fatalf("floor off: got %v", got)
+	}
+}
+
+func TestTier0ExemptFromEligibility(t *testing.T) {
+	f := newTierFixture(t, true, false) // tier 0 model declares no context or tools
+	f.app.config.MinContext = 64000
+	rec := tierReq(f.app, http.MethodPost, "/v1/chat/completions", `{"model":"a","tools":[{"type":"function"}]}`, nil)
+	if h := f.hits(); rec.Code != http.StatusOK || h != [3]int32{1, 0, 0} {
+		t.Fatalf("code=%d hits=%v", rec.Code, h)
+	}
+}
+
+func TestLoadedDefaultMinContextThroughProxy(t *testing.T) {
+	s0, small, big := newStub(t, 429, quotaBody), newStub(t, 200, `{"from":"small"}`), newStub(t, 200, `{"from":"big"}`)
+	tier := func(name, url string, ctx int) string {
+		return fmt.Sprintf("  - name: %s\n    base_url: %s\n    api_key: k\n    free: true\n    models:\n      a: {id: id-%s, context: %d, tools: true}\n", name, url, name, ctx)
+	}
+	tiersYAML(t, "tiers:\n"+tier("small", small.srv.URL, 32000)+tier("big", big.srv.URL, 131072))
+	cfg, err := loadConfig()
+	if err != nil || cfg.MinContext != 64000 {
+		t.Fatalf("min_context=%d err=%v", cfg.MinContext, err)
+	}
+	cfg.UpstreamBaseURL = s0.srv.URL
+	rec := chatReq(newApp(cfg), `{"model":"a"}`)
+	if rec.Code != http.StatusOK || rec.Body.String() != `{"from":"big"}` || small.hits.Load() != 0 {
+		t.Fatalf("code=%d body=%q small hits=%d", rec.Code, rec.Body.String(), small.hits.Load())
+	}
+}
+
+func TestToolsWhitespaceArrayIsNoTools(t *testing.T) {
+	f := newTierFixture(t, false, false)
+	f.app.config.Tiers = f.app.config.Tiers[:1]
+	f.app.config.Tiers[0].Models = []TierModel{{Name: "a", ID: "id-a", Tools: false}}
+	rec := tierReq(f.app, http.MethodPost, "/v1/chat/completions", `{"model":"a","tools": [ ]}`, nil)
+	if rec.Code != http.StatusOK || f.hits()[1] != 1 {
+		t.Fatalf("code=%d hits=%v", rec.Code, f.hits())
+	}
+}
+
+func TestAnthropicToolsRequestNeedsToolsModel(t *testing.T) {
+	f := newTierFixture(t, false, false)
+	f.app.config.Tiers = f.app.config.Tiers[1:] // t2 speaks anthropic
+	body := `{"model":"a","tools":[{"name":"x"}]}`
+	f.app.config.Tiers[0].Models = []TierModel{{Name: "a", ID: "id-a2", Tools: false}}
+	if rec := tierReq(f.app, http.MethodPost, "/v1/messages", body, nil); rec.Code != http.StatusTooManyRequests || f.hits()[2] != 0 {
+		t.Fatalf("tools-less model: code=%d hits=%v", rec.Code, f.hits())
+	}
+	f.app.config.Tiers[0].Models[0].Tools = true
+	if rec := tierReq(f.app, http.MethodPost, "/v1/messages", body, nil); rec.Code != http.StatusOK || f.hits()[2] != 1 {
+		t.Fatalf("tools model: code=%d hits=%v", rec.Code, f.hits())
+	}
+}
+
+func stateFileCfg(t *testing.T) Config {
+	t.Helper()
+	return Config{ProxyAPIKey: "p", UpstreamAPIKeys: []string{"sk-secret-1", "sk-secret-2"}, MaxRequestBodyBytes: 1 << 20, RetryExhaustedAfter: time.Hour, StateFile: filepath.Join(t.TempDir(), "state.json")}
+}
+
+func TestStateSurvivesRestart(t *testing.T) {
+	f := newTierFixture(t, false, true)
+	f.app.config.StateFile = filepath.Join(t.TempDir(), "state.json")
+	if rec := tierReq(f.app, http.MethodPost, "/v1/chat/completions", `{"model":"a"}`, nil); rec.Code != http.StatusOK {
+		t.Fatalf("code=%d", rec.Code)
+	}
+	if f.app.cooldowns.remaining("t1") == 0 {
+		t.Fatal("t1 should be in cooldown")
+	}
+	app2 := newApp(f.app.config)
+	if app2.cooldowns.remaining("t1") == 0 || app2.cooldowns.remaining("t2") != 0 {
+		t.Fatal("t1 cooldown not restored (or t2 wrongly set)")
+	}
+	if _, _, ok := app2.keys.Current(); ok {
+		t.Fatal("exhausted tier 0 key not restored")
+	}
+	before := f.hits()
+	if rec := tierReq(app2, http.MethodPost, "/v1/chat/completions", `{"model":"a"}`, nil); rec.Code != http.StatusOK {
+		t.Fatalf("code=%d", rec.Code)
+	}
+	if after := f.hits(); after[0] != before[0] || after[1] != before[1] {
+		t.Fatalf("restored app called a tier in cooldown: before=%v after=%v", before, after)
+	}
+}
+
+func TestStateTier0CooldownSurvivesRestart(t *testing.T) {
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(http.StatusInternalServerError) }))
+	t.Cleanup(up.Close)
+	cfg := stateFileCfg(t)
+	cfg.UpstreamBaseURL = up.URL
+	app := newApp(cfg)
+	tierReq(app, http.MethodPost, "/v1/chat/completions", `{"model":"a"}`, nil)
+	if newApp(cfg).cooldowns.remaining(tier0CooldownKey) == 0 {
+		t.Fatal("tier 0 cooldown not restored")
+	}
+}
+
+func TestStateExpiredNotRestored(t *testing.T) {
+	cfg := stateFileCfg(t)
+	past := time.Now().Add(-2 * time.Hour).UTC().Format(time.RFC3339)
+	body := `{"tier0":"` + past + `","tiers":{"t1":"` + past + `"},"keys":{"` + keyID("sk-secret-1") + `":"` + past + `"}}`
+	if err := os.WriteFile(cfg.StateFile, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	app := newApp(cfg)
+	if app.cooldowns.remaining("t1") != 0 || app.cooldowns.remaining(tier0CooldownKey) != 0 {
+		t.Fatal("expired cooldown restored")
+	}
+	if idx, _, ok := app.keys.Current(); !ok || idx != 0 {
+		t.Fatal("expired exhausted key restored")
+	}
+}
+
+func TestStateKeyFoundByHashNotValue(t *testing.T) {
+	cfg := stateFileCfg(t)
+	app := newApp(cfg)
+	app.keys.MarkExhausted(0) // sk-secret-1 exhausted, 2 takes over
+	app.saveState()
+	b, err := os.ReadFile(cfg.StateFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(b), "sk-secret") {
+		t.Fatalf("state file leaks a key: %s", b)
+	}
+	cfg.UpstreamAPIKeys = []string{"sk-secret-2", "sk-secret-1"} // order changed
+	app2 := newApp(cfg)
+	if idx, key, ok := app2.keys.Current(); !ok || idx != 0 || key != "sk-secret-2" {
+		t.Fatalf("idx=%d key=%q ok=%v", idx, key, ok)
+	}
+	if app2.keys.states[1] != KeyExhausted {
+		t.Fatal("sk-secret-1 should be exhausted at its new position")
+	}
+}
+
+func TestStateNoFileWithoutStateFile(t *testing.T) {
+	dir := t.TempDir()
+	old, _ := os.Getwd()
+	if err := os.Chdir(dir); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chdir(old) })
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(http.StatusInternalServerError) }))
+	t.Cleanup(up.Close)
+	app := newApp(Config{ProxyAPIKey: "p", UpstreamAPIKeys: []string{"u"}, UpstreamBaseURL: up.URL, MaxRequestBodyBytes: 1 << 20, RetryExhaustedAfter: time.Hour})
+	tierReq(app, http.MethodPost, "/v1/chat/completions", `{"model":"a"}`, nil)
+	if entries, _ := os.ReadDir(dir); len(entries) != 0 {
+		t.Fatalf("files written: %v", entries)
+	}
+	var buf bytes.Buffer
+	log.SetOutput(&buf)
+	t.Cleanup(func() { log.SetOutput(os.Stderr) })
+	warnNoStateFile(Config{})
+	warnNoStateFile(Config{StateFile: "x"})
+	if strings.Count(buf.String(), "state_file is not set") != 1 {
+		t.Fatalf("log: %q", buf.String())
+	}
+}
+
+func TestStateWriteFailureDoesNotAffectRequest(t *testing.T) {
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(http.StatusInternalServerError) }))
+	t.Cleanup(up.Close)
+	cfg := stateFileCfg(t)
+	cfg.UpstreamBaseURL = up.URL
+	cfg.StateFile = filepath.Join(t.TempDir(), "missing", "state.json")
+	var logs bytes.Buffer
+	app := newApp(cfg)
+	app.logger = slog.New(slog.NewJSONHandler(&logs, nil))
+	rec := tierReq(app, http.MethodPost, "/v1/chat/completions", `{"model":"a"}`, nil)
+	if rec.Code != http.StatusTooManyRequests && rec.Code != http.StatusInternalServerError {
+		t.Fatalf("code=%d", rec.Code)
+	}
+	if !strings.Contains(logs.String(), "state file not saved") || strings.Contains(logs.String(), "sk-secret") {
+		t.Fatalf("logs: %s", logs.String())
+	}
+}
+
+func TestStateCorruptFileStartsEmpty(t *testing.T) {
+	cfg := stateFileCfg(t)
+	if err := os.WriteFile(cfg.StateFile, []byte("{not json"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	app := newApp(cfg)
+	if _, _, ok := app.keys.Current(); !ok {
+		t.Fatal("keys should be available")
+	}
+	if app.cooldowns.remaining(tier0CooldownKey) != 0 {
+		t.Fatal("unexpected cooldown")
+	}
+}
+
+func TestStateSaveSkipsUnchangedBytes(t *testing.T) {
+	cfg := stateFileCfg(t)
+	app := newApp(cfg)
+	app.saveState()
+	if err := os.Remove(cfg.StateFile); err != nil {
+		t.Fatal(err)
+	}
+	app.saveState() // same bytes as the last good write: no new write
+	if _, err := os.Stat(cfg.StateFile); err == nil {
+		t.Fatal("unchanged state was rewritten")
+	}
+}
+
+func TestStateAllExhaustedNotNotifiedAgainAfterRestart(t *testing.T) {
+	cfg := stateFileCfg(t)
+	app := newApp(cfg)
+	app.keys.MarkExhausted(0)
+	app.keys.MarkExhausted(1)
+	app.saveState()
+	app2 := newApp(cfg)
+	if !app2.keys.AllExhausted() {
+		t.Fatal("exhausted keys not restored")
+	}
+	if app2.keys.ShouldNotifyAllExhausted() {
+		t.Fatal("all-exhausted email would repeat after restart")
+	}
+}
+
+func TestStateSaveRetriedAfterFailedWrite(t *testing.T) {
+	cfg := stateFileCfg(t)
+	cfg.StateFile = filepath.Join(t.TempDir(), "missing", "state.json")
+	app := newApp(cfg)
+	app.keys.MarkExhausted(0)
+	app.saveState()
+	if _, err := os.Stat(cfg.StateFile); err == nil {
+		t.Fatal("write should have failed")
+	}
+	if err := os.Mkdir(filepath.Dir(cfg.StateFile), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	app.saveState() // same bytes as the failed attempt: must still be written
+	if _, err := os.Stat(cfg.StateFile); err != nil {
+		t.Fatalf("state not written on retry: %v", err)
+	}
+}
+
+func TestStateAdminResetSurvivesRestart(t *testing.T) {
+	for _, tc := range []struct {
+		path, body string
+		wantFree   []int
+	}{
+		{"/admin/reset-key", `{"index":0}`, []int{0}},
+		{"/admin/reset-all-keys", "", []int{0, 1}},
+	} {
+		t.Run(tc.path, func(t *testing.T) {
+			cfg := stateFileCfg(t)
+			app := newApp(cfg)
+			app.keys.MarkExhausted(0)
+			app.keys.MarkExhausted(1)
+			app.saveState()
+			req := httptest.NewRequest(http.MethodPost, tc.path, strings.NewReader(tc.body))
+			req.Header.Set("Authorization", "Bearer p")
+			rec := httptest.NewRecorder()
+			app.ServeHTTP(rec, req)
+			if rec.Code != http.StatusOK {
+				t.Fatalf("got %d body %s", rec.Code, rec.Body.String())
+			}
+			app2 := newApp(cfg)
+			for i := range app2.keys.states {
+				if got, want := app2.keys.states[i] == KeyExhausted, !slices.Contains(tc.wantFree, i); got != want {
+					t.Fatalf("key %d exhausted=%v, want %v", i, got, want)
+				}
+			}
+		})
+	}
+}
+
+func TestLoadConfigStateFile(t *testing.T) {
+	tiersYAML(t, "state_file: /data/state.json\n")
+	cfg, err := loadConfig()
+	if err != nil || cfg.StateFile != "/data/state.json" {
+		t.Fatalf("cfg=%q err=%v", cfg.StateFile, err)
+	}
+}
+
+// fakeTelegram records sendMessage calls (path and body) and answers with status.
+func fakeTelegram(t *testing.T, status int) chan [2]string {
+	t.Helper()
+	calls := make(chan [2]string, 8)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		calls <- [2]string{r.URL.Path, string(b)}
+		w.WriteHeader(status)
+	}))
+	old := telegramAPIBase
+	telegramAPIBase = srv.URL
+	t.Cleanup(func() { srv.Close(); telegramAPIBase = old })
+	return calls
+}
+
+func expectTelegram(t *testing.T, calls chan [2]string, want bool) {
+	t.Helper()
+	select {
+	case c := <-calls:
+		if !want {
+			t.Fatalf("unexpected telegram call %v", c)
+		}
+		if c[0] != "/botTOK/sendMessage" || !strings.Contains(c[1], `"chat_id":"42"`) {
+			t.Fatalf("bad telegram call %v", c)
+		}
+	case <-time.After(300 * time.Millisecond):
+		if want {
+			t.Fatal("no telegram call")
+		}
+	}
+}
+
+func TestTelegramOncePerEpisodeAndRearm(t *testing.T) {
+	calls := fakeTelegram(t, 200)
+	s0, s1 := newStub(t, 503, `down`), newStub(t, 503, `down`)
+	app, now := failoverApp(t, s0, s1, nil, time.Hour)
+	app.telegram = NewTelegramNotifier(TelegramConfig{BotToken: "TOK", ChatID: "42"})
+	if rec := chatReq(app, `{"model":"a"}`); rec.Code != 503 || rec.Body.String() != "down" {
+		t.Fatalf("got %d %q", rec.Code, rec.Body.String())
+	}
+	expectTelegram(t, calls, true)
+	if rec := chatReq(app, `{"model":"a"}`); rec.Code != 429 { // local 429: same episode
+		t.Fatalf("got %d", rec.Code)
+	}
+	expectTelegram(t, calls, false)
+	*now = now.Add(2 * time.Hour)
+	s1.status.Store(200)
+	if rec := chatReq(app, `{"model":"a"}`); rec.Code != 200 {
+		t.Fatalf("got %d", rec.Code)
+	}
+	s0.status.Store(503)
+	s1.status.Store(503)
+	*now = now.Add(2 * time.Hour)
+	chatReq(app, `{"model":"a"}`)
+	expectTelegram(t, calls, true)
+}
+
+func TestTelegramRearmsWhenTier0Recovers(t *testing.T) {
+	calls := fakeTelegram(t, 200)
+	s0, s1 := newStub(t, 503, `down`), newStub(t, 503, `down`)
+	app, now := failoverApp(t, s0, s1, nil, time.Hour)
+	app.telegram = NewTelegramNotifier(TelegramConfig{BotToken: "TOK", ChatID: "42"})
+	chatReq(app, `{"model":"a"}`)
+	expectTelegram(t, calls, true)
+	*now = now.Add(2 * time.Hour)
+	s0.status.Store(200)
+	if rec := chatReq(app, `{"model":"a"}`); rec.Code != 200 || s1.hits.Load() != 1 {
+		t.Fatalf("got %d, t1 hits=%d", rec.Code, s1.hits.Load())
+	}
+	expectTelegram(t, calls, false)
+	s0.status.Store(503)
+	*now = now.Add(2 * time.Hour)
+	chatReq(app, `{"model":"a"}`)
+	expectTelegram(t, calls, true)
+}
+
+func TestTelegramClientCancelSendsNothing(t *testing.T) {
+	calls := fakeTelegram(t, 200)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	s0, s1 := newStub(t, 500, `from t0`), newStub(t, 200, `x`)
+	app, now := failoverApp(t, s0, s1, nil, time.Hour)
+	app.telegram = NewTelegramNotifier(TelegramConfig{BotToken: "TOK", ChatID: "42"})
+	// same trick as the 499 test: cancel right after the tier 0 cooldown is set
+	app.cooldowns.now = func() time.Time {
+		if s0.hits.Load() > 0 {
+			cancel()
+		}
+		return *now
+	}
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"b"}`)).WithContext(ctx)
+	req.Header.Set("Authorization", "Bearer p")
+	rec := httptest.NewRecorder()
+	app.ServeHTTP(rec, req)
+	if rec.Code != 499 {
+		t.Fatalf("got %d", rec.Code)
+	}
+	expectTelegram(t, calls, false)
+	chatReq(app, `{"model":"b"}`) // still armed: a normal failing request alerts
+	expectTelegram(t, calls, true)
+}
+
+func TestNewAppBuildsTelegramNotifierFromConfig(t *testing.T) {
+	calls := fakeTelegram(t, 200)
+	s0 := newStub(t, 503, `down`)
+	app := newApp(Config{ProxyAPIKey: "p", UpstreamAPIKeys: []string{"u1"}, UpstreamBaseURL: s0.srv.URL, MaxRequestBodyBytes: 1 << 20, RetryExhaustedAfter: time.Hour, Telegram: TelegramConfig{BotToken: "TOK", ChatID: "42"}})
+	if rec := chatReq(app, `{"model":"a"}`); rec.Code != 503 {
+		t.Fatalf("got %d", rec.Code)
+	}
+	expectTelegram(t, calls, true)
+}
+
+func TestTelegramFailedSendRearms(t *testing.T) {
+	t.Cleanup(func() { log.SetOutput(os.Stderr) })
+	log.SetOutput(io.Discard)
+	calls := fakeTelegram(t, 500)
+	s0, s1 := newStub(t, 503, `down`), newStub(t, 503, `down`)
+	app, _ := failoverApp(t, s0, s1, nil, time.Hour)
+	app.telegram = NewTelegramNotifier(TelegramConfig{BotToken: "TOK", ChatID: "42"})
+	chatReq(app, `{"model":"a"}`)
+	expectTelegram(t, calls, true)
+	time.Sleep(100 * time.Millisecond) // let the goroutine rearm after the failed send
+	chatReq(app, `{"model":"a"}`)      // local 429, same episode, but the alert was lost
+	expectTelegram(t, calls, true)
+}
+
+func TestTelegramNotConfiguredSendsNothing(t *testing.T) {
+	for name, cfg := range map[string]TelegramConfig{"none": {}, "token only": {BotToken: "TOK"}, "chat only": {ChatID: "42"}} {
+		t.Run(name, func(t *testing.T) {
+			calls := fakeTelegram(t, 200)
+			s0, s1 := newStub(t, 503, `down`), newStub(t, 503, `down`)
+			app, _ := failoverApp(t, s0, s1, nil, time.Hour)
+			app.telegram = NewTelegramNotifier(cfg)
+			if rec := chatReq(app, `{"model":"a"}`); rec.Code != 503 {
+				t.Fatalf("got %d", rec.Code)
+			}
+			expectTelegram(t, calls, false)
+		})
+	}
+}
+
+func TestTelegramSendFailureKeepsRequestAndHidesToken(t *testing.T) {
+	t.Cleanup(func() { log.SetOutput(os.Stderr) })
+	for name, down := range map[string]bool{"status 500": false, "request error": true} {
+		t.Run(name, func(t *testing.T) {
+			logs := &lockedBuf{}
+			log.SetOutput(logs)
+			calls := fakeTelegram(t, 500)
+			if down {
+				telegramAPIBase = "http://127.0.0.1:1" // restored by fakeTelegram cleanup
+			}
+			s0, s1 := newStub(t, 503, `down`), newStub(t, 503, `down`)
+			app, _ := failoverApp(t, s0, s1, nil, time.Hour)
+			app.telegram = NewTelegramNotifier(TelegramConfig{BotToken: "TOK", ChatID: "42"})
+			if rec := chatReq(app, `{"model":"a"}`); rec.Code != 503 || rec.Body.String() != "down" {
+				t.Fatalf("got %d %q", rec.Code, rec.Body.String())
+			}
+			if !down {
+				expectTelegram(t, calls, true)
+			}
+			deadline := time.Now().Add(2 * time.Second)
+			for !strings.Contains(logs.String(), "telegram notification failed") && time.Now().Before(deadline) {
+				time.Sleep(10 * time.Millisecond)
+			}
+			if !strings.Contains(logs.String(), "telegram notification failed: "+name) || strings.Contains(logs.String(), "TOK") {
+				t.Fatalf("log = %q", logs.String())
+			}
+		})
+	}
+}
+
+func TestTelegramLongModelIsBounded(t *testing.T) {
+	calls := fakeTelegram(t, 200)
+	s0, s1 := newStub(t, 503, `down`), newStub(t, 503, `down`)
+	app, _ := failoverApp(t, s0, s1, nil, time.Hour)
+	app.telegram = NewTelegramNotifier(TelegramConfig{BotToken: "TOK", ChatID: "42"})
+	chatReq(app, `{"model":"`+strings.Repeat("é", 5000)+`"}`)
+	select {
+	case c := <-calls:
+		if len(c[1]) > 512 {
+			t.Fatalf("telegram body not bounded: %d bytes", len(c[1]))
+		}
+	case <-time.After(time.Second):
+		t.Fatal("no telegram call")
+	}
+}
+
+func TestLoadConfigTelegram(t *testing.T) {
+	tiersYAML(t, "telegram: {bot_token: TOK, chat_id: 42}\n")
+	cfg, err := loadConfig()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Telegram != (TelegramConfig{BotToken: "TOK", ChatID: "42"}) {
+		t.Fatalf("telegram = %+v", cfg.Telegram)
+	}
+	if s := safeConfigSummary(cfg); !strings.Contains(s, "telegram_configured=true") || strings.Contains(s, "TOK") {
+		t.Fatalf("bad summary: %s", s)
 	}
 }

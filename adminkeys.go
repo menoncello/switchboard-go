@@ -9,6 +9,7 @@ import (
 	"html/template"
 	"io"
 	"log"
+	"math"
 	"net/http"
 	"net/url"
 	"strings"
@@ -227,12 +228,56 @@ var statusTmpl = template.Must(template.New("status").Funcs(template.FuncMap{
 <table><tr><th>Chave</th><th>Estado</th><th>Cooldown</th><th>Rolling</th><th>Weekly</th><th>Monthly</th></tr>
 {{range .Keys}}<tr><td>{{label .}}{{if .Current}} (atual){{end}}</td><td>{{.State}}</td><td>{{if .RetryAfterSeconds}}{{.RetryAfterSeconds}}s{{else}}—{{end}}</td>
 {{if .UsageError}}<td colspan="3">erro de uso: {{.UsageError}}</td>{{else}}<td>{{pct .Usage.Rolling}}</td><td>{{pct .Usage.Weekly}}</td><td>{{pct .Usage.Monthly}}</td>{{end}}</tr>
-{{end}}</table></body></html>
+{{end}}</table>
+{{if .Tiers}}<h2>Tiers</h2>
+<table><tr><th>Tier</th><th>Estado</th><th>Cooldown</th></tr>
+{{range .Tiers}}<tr><td>{{.Name}}</td><td>{{.State}}</td><td>{{if .RemainingSeconds}}{{.RemainingSeconds}}s{{else}}—{{end}}</td></tr>
+{{end}}</table>{{end}}</body></html>
 `))
+
+type tierRow struct {
+	Name, State      string
+	RemainingSeconds int
+}
+
+// statusPage is the keys report plus, when the config has extra tiers, one row per
+// tier (tier 0 first). Tiers hold names and cooldowns only, never URLs or keys.
+type statusPage struct {
+	KeysReportResponse
+	Tiers []tierRow
+}
+
+func (a *App) tierRows() []tierRow {
+	if len(a.config.Tiers) == 0 {
+		return nil
+	}
+	names := []string{tier0CooldownKey}
+	for _, t := range a.config.Tiers {
+		names = append(names, t.Name)
+	}
+	rows := make([]tierRow, len(names))
+	for i, n := range names {
+		rows[i] = tierRow{Name: n, State: "ok"}
+		if n == tier0CooldownKey {
+			rows[i].Name = "OpenCode Go (tier 0)"
+		}
+		d := a.cooldowns.remaining(n)
+		if n == tier0CooldownKey {
+			// Tier 0 is also down while every key is exhausted; the longer of the two wins.
+			if kd, ok := a.keys.CooldownRemaining(); ok && kd > d {
+				d = kd
+			}
+		}
+		if d > 0 {
+			rows[i].State, rows[i].RemainingSeconds = "cooldown", int(math.Ceil(d.Seconds()))
+		}
+	}
+	return rows
+}
 
 func (a *App) handleStatusPage(w http.ResponseWriter, r *http.Request) {
 	var buf bytes.Buffer
-	if err := statusTmpl.Execute(&buf, a.buildKeysReport(r.Context())); err != nil {
+	if err := statusTmpl.Execute(&buf, statusPage{a.buildKeysReport(r.Context()), a.tierRows()}); err != nil {
 		log.Printf("status page render failed: %v", err)
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
