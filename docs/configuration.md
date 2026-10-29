@@ -228,7 +228,7 @@ Every proxied request writes one JSON line to stderr when its response ends
 (for a stream, after the last event):
 
 ```json
-{"time":"...","level":"INFO","msg":"request","model":"glm-5.1","api_style":"openai","tier":"opencode-go","key_index":0,"key_name":"main","status":200,"latency_ms":412}
+{"time":"...","level":"INFO","msg":"request","model":"glm-5.1","api_style":"openai","tier":"opencode-go","project":"sem projeto","key_index":0,"key_name":"main","status":200,"latency_ms":412}
 ```
 
 - `model`: top-level `model` of the request body, empty if there is none;
@@ -236,6 +236,9 @@ Every proxied request writes one JSON line to stderr when its response ends
 - `api_style`: `openai` or `anthropic`.
 - `tier`: `opencode-go` for tier 0, the tier `name` for an extra tier, empty when
   no tier answered (local `429`, `502` when no tier was reachable, `499` when the client cancelled).
+- `project`: the optional `X-Project` request header, up to 64 characters of
+  `[A-Za-z0-9._-]`. Absent, longer or with another character it logs `sem projeto`
+  and the request goes on. The proxy never forwards `X-Project` to the upstream.
 - `key_index` and `key_name`: only for tier 0 (`key_name` can be empty).
 - `status`: the status the client received.
 - `latency_ms`: from before the body is read to the last byte sent to the client.
@@ -243,8 +246,9 @@ Every proxied request writes one JSON line to stderr when its response ends
 Requests rejected while reading the body (`413` too large, `400` read failure)
 are logged too, with empty `model` and `tier` and no key fields.
 
-The key value, `Authorization`, `x-api-key` and the request body and headers are
-never logged.
+The key value, `Authorization`, `x-api-key` and the request body are never
+logged. The only request header logged is `X-Project`, and only as `project`
+after validation.
 
 ## Environment variables
 

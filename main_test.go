@@ -2000,6 +2000,59 @@ func TestRequestLogModelIsTruncated(t *testing.T) {
 	}
 }
 
+func TestRequestLogProjectHeader(t *testing.T) {
+	var leaked atomic.Bool
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if len(r.Header.Values("X-Project")) > 0 {
+			leaked.Store(true)
+		}
+		_, _ = w.Write([]byte(`{}`))
+	})
+	s0, s1 := httptest.NewServer(handler), httptest.NewServer(handler)
+	defer s0.Close()
+	defer s1.Close()
+	app := newApp(Config{ProxyAPIKey: "p", UpstreamAPIKeys: []string{"k"}, UpstreamBaseURL: s0.URL, MaxRequestBodyBytes: 1 << 20, RetryExhaustedAfter: time.Hour, Tiers: []TierConfig{
+		{Name: "t1", BaseURL: s1.URL, APIKey: "tk", Free: true, Styles: []APIStyle{APIStyleOpenAI}, Models: []TierModel{{Name: "a"}}},
+	}})
+	lines := captureLog(app)
+	cases := []struct{ model, header, want string }{
+		{"glm-5.1", "teste", "teste"},
+		{"glm-5.1", "", noProject},
+		{"glm-5.1", strings.Repeat("a", 64), strings.Repeat("a", 64)},
+		{"glm-5.1", strings.Repeat("a", 65), noProject},
+		{"glm-5.1", "com espaço", noProject},
+		{"glm-5.1", "a/b", noProject},
+		{"a", "teste", "teste"}, // served by tier 1 after tier 0 is skipped
+	}
+	for i, c := range cases {
+		if c.model == "a" {
+			app.cooldowns.set(tier0CooldownKey, time.Hour)
+		}
+		hdr := map[string]string{}
+		if c.header != "" {
+			hdr["X-Project"] = c.header
+		}
+		if rec := tierReq(app, http.MethodPost, "/v1/chat/completions", `{"model":"`+c.model+`"}`, hdr); rec.Code != http.StatusOK {
+			t.Fatalf("case %d: code %d", i, rec.Code)
+		}
+	}
+	got := lines(t)
+	if len(got) != len(cases) {
+		t.Fatalf("lines: %v", got)
+	}
+	for i, c := range cases {
+		if got[i]["project"] != c.want {
+			t.Fatalf("case %d: project %v, want %q", i, got[i]["project"], c.want)
+		}
+		if got[i]["model"] != c.model || got[i]["status"] != float64(200) {
+			t.Fatalf("case %d: other fields changed: %v", i, got[i])
+		}
+	}
+	if leaked.Load() {
+		t.Fatal("X-Project reached an upstream")
+	}
+}
+
 // stub is an upstream that answers a fixed status and body and counts its hits.
 type stub struct {
 	srv    *httptest.Server

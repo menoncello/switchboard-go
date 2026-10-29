@@ -35,6 +35,29 @@ func truncateModel(model string) string {
 	return model[:cut]
 }
 
+// projectHeader names the project in the request log; the proxy consumes it and never forwards it.
+const projectHeader = "X-Project"
+
+const (
+	maxProjectLen = 64
+	noProject     = "sem projeto"
+)
+
+// requestProject returns the X-Project value when it is 1 to maxProjectLen characters of [A-Za-z0-9._-], else noProject.
+func requestProject(h http.Header) string {
+	v := h.Get(projectHeader)
+	if v == "" || len(v) > maxProjectLen {
+		return noProject
+	}
+	for i := 0; i < len(v); i++ {
+		c := v[i]
+		if !(c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' || c == '.' || c == '_' || c == '-') {
+			return noProject
+		}
+	}
+	return v
+}
+
 type APIStyle int
 
 const (
@@ -86,7 +109,7 @@ func (a *App) proxyV1(w http.ResponseWriter, r *http.Request, style APIStyle) {
 		apiStyle = "anthropic"
 	}
 	model = truncateModel(model)
-	attrs := []any{"model", model, "api_style", apiStyle, "tier", tier}
+	attrs := []any{"model", model, "api_style", apiStyle, "tier", tier, "project", requestProject(r.Header)}
 	if keyIdx >= 0 {
 		attrs = append(attrs, "key_index", keyIdx, "key_name", a.config.keyName(keyIdx))
 	}
@@ -382,7 +405,7 @@ func apiStyleForRequest(r *http.Request) APIStyle {
 
 func copyHeaders(dst, src http.Header) {
 	for k, v := range src {
-		if strings.EqualFold(k, "Authorization") || strings.EqualFold(k, "x-api-key") {
+		if strings.EqualFold(k, "Authorization") || strings.EqualFold(k, "x-api-key") || strings.EqualFold(k, projectHeader) {
 			continue
 		}
 		for _, s := range v {
