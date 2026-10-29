@@ -47,7 +47,8 @@ Para o Eduardo e os agentes Hermes: uma request não falha por cota esgotada enq
 - 401, 402, 404, 5xx, 429 e erro de conexão antes do primeiro byte põem o tier em cooldown e passam ao próximo; 400 volta ao cliente.
 - Um tier sem mapeamento para o modelo, ou que não fala o estilo do request, é pulado; um modelo sem o contexto mínimo ou sem tool calling não é elegível.
 - Uma config com tier pago (sem `free: true`) é rejeitada na partida, até o épico de relatório entregar o teto.
-- O cooldown dos tiers permanece depois de reiniciar o proxy.
+- O cooldown dos tiers permanece depois de reiniciar o proxy, com o arquivo de estado num volume documentado.
+- `tiers:`, `min_context` e `state_file` estão documentados em `docs/configuration.md`.
 - Cada request grava uma linha de log com modelo, estilo, tier, status e latência, e a página de status mostra os tiers.
 
 ## Boundaries
@@ -73,7 +74,10 @@ Para o Eduardo e os agentes Hermes: uma request não falha por cota esgotada enq
 - Decision (2026-10-29): erro de conexão e timeout fazem failover só antes do primeiro byte da resposta; depois o stream já começou.
 - Decision (2026-10-29): as chaves do OpenCode Go continuam girando dentro do tier 0; o tier só falha quando todas estão em cooldown.
 - Decision (2026-10-29): cooldown por tier, campo `cooldown` com padrão `retry_exhausted_after` (5 min); ajustado depois pelo log.
-- Decision (2026-10-29): o estilo real do Hermes se vê no log da story 3; sem spike.
+- Decision (2026-10-29): o Hermes do Eduardo usa os dois estilos: o provider `opencode-go` em `/v1` (OpenAI) e o provider `switchboard` com `api_mode: anthropic_messages`; os tiers têm que atender os dois. Sem spike.
+- Decision (2026-10-29): R8: `min_context` global na config com padrão 64000 (mínimo documentado do Hermes Agent); cada modelo do mapa declara `context` e `tools`; tool calling só é checado em request com `tools`; o tier 0 é isento.
+- Decision (2026-10-29): toda a config dos tiers fica no YAML: `base_url` e `api_key` por tier (o valor no arquivo, como o `upstream.api_keys` de hoje), mais `cooldown`, `min_context` e `state_file`. Um provedor com dois estilos em URLs diferentes vira dois tiers.
+- Decision (2026-10-29): R7 no tier 0: só 429 de cota e 403 de assinatura giram a chave; 401, 402, 404 e 5xx põem o tier inteiro em cooldown.
 - Decision (2026-10-29): fecha com a story "Refactor sweep".
 - Source conflict: R7 — o código só troca de chave em 429 de cota e 403 de assinatura (`isKeyDead`); 401, 402, 404 e 5xx passam ao cliente e erro de conexão vira 502 sem failover. Este épico muda isso.
 - Decision (2026-10-29): R7 muda o comportamento atual; 401, 402, 404, 5xx e erro de conexão passam a fazer failover.

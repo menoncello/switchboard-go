@@ -1,5 +1,5 @@
 # Épicos da iniciativa multi-provider, em ordem de construção.
-# R15 (recarga por SIGHUP) fica fora: ticket avulso em backlog/, decisão do Eduardo.
+# R15 (recarga por SIGHUP) fica fora: ticket avulso a criar em backlog/, decisão do Eduardo.
 
 [[epic]]
 id = 1
