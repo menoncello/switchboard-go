@@ -1680,10 +1680,51 @@ func TestAdminAndStatusUnchangedWithTiers(t *testing.T) {
 	plain := newApp(cfg)
 	cfg.Tiers = []TierConfig{{Name: "t", BaseURL: "http://127.0.0.1:1", APIKey: "kt", Free: true, Models: []TierModel{{Name: "a", ID: "a"}}}}
 	tiered := newApp(cfg)
-	for _, path := range []string{"/admin/status", "/admin/keys", "/status"} {
+	for _, path := range []string{"/admin/status", "/admin/keys"} {
 		a, b := tierReq(plain, http.MethodGet, path, "", nil), tierReq(tiered, http.MethodGet, path, "", nil)
 		if a.Code != b.Code || a.Body.String() != b.Body.String() {
 			t.Fatalf("%s differs: %d %q vs %d %q", path, a.Code, a.Body.String(), b.Code, b.Body.String())
+		}
+	}
+}
+
+func TestStatusPageTiersSection(t *testing.T) {
+	var hits int32
+	srv := fakeUsageServer(t, &hits)
+	cfg := Config{ProxyAPIKey: "p", UpstreamAPIKeys: []string{"sk-good-SEGREDO1"}, UsageURL: srv.URL, RetryExhaustedAfter: time.Hour}
+	if body := getStatusPage(newApp(cfg)).Body.String(); strings.Contains(body, "<h2>Tiers</h2>") {
+		t.Fatalf("tiers section without extra tiers: %s", body)
+	}
+	cfg.Tiers = []TierConfig{
+		{Name: "gratis-a", BaseURL: "http://segredo-a.invalid", APIKey: "kt-SEGREDO2", Free: true, Models: []TierModel{{Name: "a", ID: "a"}}},
+		{Name: "gratis-b", BaseURL: "http://segredo-b.invalid", APIKey: "kt-SEGREDO3", Free: true, Models: []TierModel{{Name: "a", ID: "a"}}},
+	}
+	app := newApp(cfg)
+	app.cooldowns.set("gratis-a", 90*time.Second)
+	rec := getStatusPage(app) // no Authorization header: the page is open
+	body := rec.Body.String()
+	if rec.Code != http.StatusOK {
+		t.Fatalf("got %d", rec.Code)
+	}
+	rows := strings.Split(body[strings.Index(body, "<h2>Tiers</h2>"):], "<tr>")
+	if len(rows) != 5 || !strings.Contains(rows[1], "<th>Tier</th>") {
+		t.Fatalf("tiers table: %v", rows)
+	}
+	for i, want := range []string{"OpenCode Go (tier 0)</td><td>ok</td><td>—</td>", "gratis-a</td><td>cooldown</td><td>90s</td>", "gratis-b</td><td>ok</td><td>—</td>"} {
+		if !strings.Contains(rows[i+2], want) {
+			t.Fatalf("row %d: want %q in %s", i+2, want, rows[i+2])
+		}
+	}
+	app.keys.MarkExhausted(0)
+	if row := strings.Split(getStatusPage(app).Body.String(), "<h2>Tiers</h2>")[1]; !regexp.MustCompile(`tier 0\)</td><td>cooldown</td><td>\d+s</td>`).MatchString(row) {
+		t.Fatalf("tier 0 with every key exhausted: %s", row)
+	}
+	if i := strings.Index(body, "#1"); i < 0 || i > strings.Index(body, "<h2>Tiers</h2>") {
+		t.Fatal("tiers section must come below the keys")
+	}
+	for _, secret := range []string{"SEGREDO1", "SEGREDO2", "SEGREDO3", "sk-good", "kt-", "segredo-a", "segredo-b"} {
+		if strings.Contains(body, secret) {
+			t.Fatalf("leaked %q: %s", secret, body)
 		}
 	}
 }
