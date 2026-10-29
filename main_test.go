@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -117,7 +118,7 @@ func TestDoUpstreamSetsDefaultUserAgent(t *testing.T) {
 
 	app := newApp(Config{ProxyAPIKey: "p", UpstreamAPIKeys: []string{"u"}, UpstreamBaseURL: upstream.URL})
 	req := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
-	resp, err := app.doUpstream(req.Context(), req, nil, "u", APIStyleOpenAI)
+	resp, err := app.doUpstream(req.Context(), req, nil, upstream.URL, "u", APIStyleOpenAI)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -143,7 +144,7 @@ func TestDoUpstreamAnthropicSetsHeaders(t *testing.T) {
 	req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(`{"model":"minimax-m3","messages":[]}`))
 	req.Header.Set("x-api-key", "p")
 	req.Header.Set("anthropic-version", "2023-06-01")
-	resp, err := app.doUpstream(req.Context(), req, []byte(`{"model":"minimax-m3","messages":[]}`), "u", APIStyleAnthropic)
+	resp, err := app.doUpstream(req.Context(), req, []byte(`{"model":"minimax-m3","messages":[]}`), upstream.URL, "u", APIStyleAnthropic)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1413,5 +1414,199 @@ func TestLoadConfigTiersRejected(t *testing.T) {
 				t.Fatalf("error leaks api_key: %v", err)
 			}
 		})
+	}
+}
+
+const quotaBody = `{"error":{"code":"insufficient_quota","message":"quota exceeded"}}`
+
+type tierFixture struct {
+	app        *App
+	t0, t1, t2 *int32
+	mu         sync.Mutex
+	bodies     []string
+	auths      []string
+}
+
+func (f *tierFixture) seen() ([]string, []string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]string(nil), f.bodies...), append([]string(nil), f.auths...)
+}
+
+// newTierFixture wires a tier 0 that is always quota-exhausted (unless t0OK) and tiers 1 and 2.
+// Tier 1 maps a -> id-a (openai only); tier 2 maps a, speaks anthropic and openai.
+// Tiers 1 and 2 answer 200 with their own name unless t1Quota makes tier 1 answer a quota 429.
+func newTierFixture(t *testing.T, t0OK, t1Quota bool) *tierFixture {
+	t.Helper()
+	f := &tierFixture{t0: new(int32), t1: new(int32), t2: new(int32)}
+	mk := func(name string, hits *int32, quota, record bool) *httptest.Server {
+		s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			atomic.AddInt32(hits, 1)
+			b, _ := io.ReadAll(r.Body)
+			if record {
+				f.mu.Lock()
+				f.bodies = append(f.bodies, string(b))
+				f.auths = append(f.auths, r.Header.Get("Authorization")+"|"+r.Header.Get("x-api-key")+"|"+r.Header.Get("anthropic-version"))
+				f.mu.Unlock()
+			}
+			if quota {
+				w.WriteHeader(http.StatusTooManyRequests)
+				_, _ = w.Write([]byte(quotaBody))
+				return
+			}
+			_, _ = w.Write([]byte(`{"from":"` + name + `"}`))
+		}))
+		t.Cleanup(s.Close)
+		return s
+	}
+	s0, s1, s2 := mk("t0", f.t0, !t0OK, false), mk("t1", f.t1, t1Quota, !t1Quota), mk("t2", f.t2, false, true)
+	f.app = newApp(Config{ProxyAPIKey: "p", UpstreamAPIKeys: []string{"u"}, UpstreamBaseURL: s0.URL, MaxRequestBodyBytes: 1 << 20, RetryExhaustedAfter: time.Hour, Tiers: []TierConfig{
+		{Name: "t1", BaseURL: s1.URL, APIKey: "k1", Free: true, Styles: []APIStyle{APIStyleOpenAI}, Models: []TierModel{{Name: "a", ID: "id-a"}}},
+		{Name: "t2", BaseURL: s2.URL, APIKey: "k2", Free: true, Styles: []APIStyle{APIStyleOpenAI, APIStyleAnthropic}, Models: []TierModel{{Name: "a", ID: "id-a2"}}},
+	}})
+	return f
+}
+
+// hits reads the three upstream counters atomically.
+func (f *tierFixture) hits() [3]int32 {
+	return [3]int32{atomic.LoadInt32(f.t0), atomic.LoadInt32(f.t1), atomic.LoadInt32(f.t2)}
+}
+
+func tierReq(app *App, method, path, body string, hdr map[string]string) *httptest.ResponseRecorder {
+	req := httptest.NewRequest(method, path, strings.NewReader(body))
+	req.Header.Set("Authorization", "Bearer p")
+	for k, v := range hdr {
+		req.Header.Set(k, v)
+	}
+	rec := httptest.NewRecorder()
+	app.ServeHTTP(rec, req)
+	return rec
+}
+
+func TestTierFailoverRewritesModelAndKey(t *testing.T) {
+	f := newTierFixture(t, false, false)
+	rec := tierReq(f.app, http.MethodPost, "/v1/chat/completions", `{"model":"a","n":1.50,"messages":[]}`, nil)
+	bodies, auths := f.seen()
+	if h := f.hits(); rec.Code != http.StatusOK || h[1] != 1 || h[2] != 0 {
+		t.Fatalf("code=%d hits=%v", rec.Code, h)
+	}
+	if rec.Body.String() != `{"from":"t1"}` {
+		t.Fatalf("client body %q", rec.Body.String())
+	}
+	if len(bodies) != 1 || !strings.Contains(bodies[0], `"model":"id-a"`) || !strings.Contains(bodies[0], `"n":1.50`) || auths[0] != "Bearer k1||" {
+		t.Fatalf("body=%v auth=%v", bodies, auths)
+	}
+}
+
+func TestTierNoMappingOrNoModelStaysLocal429(t *testing.T) {
+	f := newTierFixture(t, false, false)
+	for _, c := range []struct{ method, path, body string }{
+		{http.MethodPost, "/v1/chat/completions", `{"model":"z"}`},
+		{http.MethodGet, "/v1/models", ``},
+		{http.MethodPost, "/v1/chat/completions", `{"messages":[]}`},
+		{http.MethodPost, "/v1/chat/completions", `not json`},
+	} {
+		rec := tierReq(f.app, c.method, c.path, c.body, nil)
+		if rec.Code != http.StatusTooManyRequests || !strings.Contains(rec.Body.String(), "all upstream keys exhausted") {
+			t.Fatalf("%v: %d %s", c, rec.Code, rec.Body.String())
+		}
+	}
+	// first request exhausts tier 0 (one hit); the rest are served locally
+	if h := f.hits(); h != [3]int32{1, 0, 0} {
+		t.Fatalf("hits %v", h)
+	}
+	if rec := tierReq(f.app, http.MethodPost, "/v1/chat/completions", `{"model":"z"}`, nil); rec.Header().Get("Retry-After") == "" {
+		t.Fatal("missing Retry-After")
+	}
+}
+
+func TestTierSkippedWhenStyleMissing(t *testing.T) {
+	f := newTierFixture(t, false, false)
+	rec := tierReq(f.app, http.MethodPost, "/v1/messages", `{"model":"a"}`, map[string]string{"anthropic-version": "2023-06-01"})
+	bodies, auths := f.seen()
+	if h := f.hits(); rec.Code != http.StatusOK || h[1] != 0 || h[2] != 1 {
+		t.Fatalf("code=%d hits=%v", rec.Code, h)
+	}
+	if auths[0] != "|k2|2023-06-01" || !strings.Contains(bodies[0], `"id-a2"`) {
+		t.Fatalf("body=%v auth=%v", bodies, auths)
+	}
+	// with only the openai-only tier left, nothing serves the anthropic request
+	f.app.config.Tiers = f.app.config.Tiers[:1]
+	rec = tierReq(f.app, http.MethodPost, "/v1/messages", `{"model":"a"}`, nil)
+	if rec.Code != http.StatusTooManyRequests {
+		t.Fatalf("got %d", rec.Code)
+	}
+}
+
+func TestTierExhaustedFallsToNextTier(t *testing.T) {
+	f := newTierFixture(t, false, true)
+	rec := tierReq(f.app, http.MethodPost, "/v1/chat/completions", `{"model":"a"}`, nil)
+	if h := f.hits(); rec.Code != http.StatusOK || h[1] != 1 || h[2] != 1 {
+		t.Fatalf("code=%d hits=%v", rec.Code, h)
+	}
+	f.app.config.Tiers = f.app.config.Tiers[:1]
+	if rec := tierReq(f.app, http.MethodPost, "/v1/chat/completions", `{"model":"a"}`, nil); rec.Code != http.StatusTooManyRequests {
+		t.Fatalf("got %d", rec.Code)
+	}
+}
+
+func TestTierNotCalledWhenTier0Healthy(t *testing.T) {
+	f := newTierFixture(t, true, false)
+	rec := tierReq(f.app, http.MethodPost, "/v1/chat/completions", `{"model":"a"}`, nil)
+	if h := f.hits(); rec.Code != http.StatusOK || h[1] != 0 || h[2] != 0 {
+		t.Fatalf("code=%d hits=%v", rec.Code, h)
+	}
+}
+
+func TestTierNonQuotaResponseCopiedWithoutFurtherFailover(t *testing.T) {
+	f := newTierFixture(t, false, false)
+	for _, status := range []int{http.StatusBadRequest, http.StatusInternalServerError} {
+		s1 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(status)
+			_, _ = w.Write([]byte("tier1 says no"))
+		}))
+		defer s1.Close()
+		f.app.config.Tiers[0].BaseURL = s1.URL
+		before := f.hits()
+		rec := tierReq(f.app, http.MethodPost, "/v1/chat/completions", `{"model":"a"}`, nil)
+		if rec.Code != status || rec.Body.String() != "tier1 says no" || f.hits()[2] != before[2] {
+			t.Fatalf("status %d: got %d %q hits=%v", status, rec.Code, rec.Body.String(), f.hits())
+		}
+	}
+}
+
+func TestTierEmptyIDForwardsName(t *testing.T) {
+	f := newTierFixture(t, false, false)
+	f.app.config.Tiers[0].Models = []TierModel{{Name: "a"}}
+	rec := tierReq(f.app, http.MethodPost, "/v1/chat/completions", `{"model":"a"}`, nil)
+	bodies, _ := f.seen()
+	if rec.Code != http.StatusOK || len(bodies) != 1 || !strings.Contains(bodies[0], `"model":"a"`) {
+		t.Fatalf("code=%d bodies=%v", rec.Code, bodies)
+	}
+}
+
+func TestTierConnectionErrorReturns502(t *testing.T) {
+	f := newTierFixture(t, false, false)
+	dead := httptest.NewServer(http.NotFoundHandler())
+	f.app.config.Tiers[0].BaseURL = dead.URL
+	dead.Close()
+	rec := tierReq(f.app, http.MethodPost, "/v1/chat/completions", `{"model":"a"}`, nil)
+	if rec.Code != http.StatusBadGateway || f.hits()[2] != 0 {
+		t.Fatalf("got %d hits=%v", rec.Code, f.hits())
+	}
+}
+
+func TestAdminAndStatusUnchangedWithTiers(t *testing.T) {
+	var hits int32
+	srv := fakeUsageServer(t, &hits)
+	cfg := Config{ProxyAPIKey: "p", UpstreamAPIKeys: []string{"sk-good-1"}, KeyNames: []string{"x"}, UsageURL: srv.URL, RetryExhaustedAfter: time.Hour}
+	plain := newApp(cfg)
+	cfg.Tiers = []TierConfig{{Name: "t", BaseURL: "http://127.0.0.1:1", APIKey: "kt", Free: true, Models: []TierModel{{Name: "a", ID: "a"}}}}
+	tiered := newApp(cfg)
+	for _, path := range []string{"/admin/status", "/admin/keys", "/status"} {
+		a, b := tierReq(plain, http.MethodGet, path, "", nil), tierReq(tiered, http.MethodGet, path, "", nil)
+		if a.Code != b.Code || a.Body.String() != b.Body.String() {
+			t.Fatalf("%s differs: %d %q vs %d %q", path, a.Code, a.Body.String(), b.Code, b.Body.String())
+		}
 	}
 }

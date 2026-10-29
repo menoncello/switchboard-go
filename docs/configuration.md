@@ -92,8 +92,20 @@ tiers:
 `tiers:` lists extra upstreams used for failover. The `upstream:` block above
 stays as the implicit tier 0 and is not listed here (it is exempt from the
 `free` rule). Without `tiers:` the proxy behaves as before. Tiers are read from
-the YAML file only, not from environment variables. This release only reads and
-validates them; routing comes later.
+the YAML file only, not from environment variables.
+
+When every tier 0 key is exhausted, the proxy tries the tiers in order. It
+rewrites the top-level `model` of the request body to the tier's model `id` (the
+model name when `id` is empty) and sends it with the tier's `api_key`. A tier
+without a mapping for that model, or that does not speak the request's API style,
+is skipped, and so is a tier that answers with a quota 429. A request without a
+`model` in the body stays on tier 0. Any other response from a tier (any status)
+goes to the client without further failover, and a connection error to a tier
+returns `502`. If no tier serves the request, the client gets the local `429`
+"all upstream keys exhausted"; the SMTP "all exhausted" alert and `Retry-After`
+only fire in that case. To try it by hand, run
+`go run ./cmd/fakeupstream -addr 127.0.0.1:9999` and switch it with
+`POST /__mode/quota` or `POST /__mode/ok`.
 
 | Field | Required | Description |
 | --- | --- | --- |

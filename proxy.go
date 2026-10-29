@@ -35,7 +35,7 @@ func (a *App) proxyV1(w http.ResponseWriter, r *http.Request, style APIStyle) {
 		if !ok {
 			break
 		}
-		resp, reqErr := a.doUpstream(orig, r, body, key, style)
+		resp, reqErr := a.doUpstream(orig, r, body, a.config.UpstreamBaseURL, key, style)
 		if reqErr != nil {
 			http.Error(w, reqErr.Error(), http.StatusBadGateway)
 			return
@@ -55,6 +55,9 @@ func (a *App) proxyV1(w http.ResponseWriter, r *http.Request, style APIStyle) {
 		copyResponse(w, resp)
 		return
 	}
+	if a.proxyTiers(orig, w, r, body, style) {
+		return
+	}
 	// No eligible key remains. Fail fast locally instead of hammering upstream,
 	// and hint well-behaved clients at the next probe window via Retry-After.
 	if a.keys.ShouldNotifyAllExhausted() {
@@ -66,12 +69,67 @@ func (a *App) proxyV1(w http.ResponseWriter, r *http.Request, style APIStyle) {
 	writeAPIError(w, style, http.StatusTooManyRequests, "rate_limit_exceeded", "all upstream keys exhausted")
 }
 
-func (a *App) doUpstream(ctx context.Context, r *http.Request, body []byte, key string, apiStyle APIStyle) (*http.Response, error) {
+// proxyTiers tries the configured tiers in order once tier 0 is exhausted and
+// reports whether one answered. A request without a top-level string "model"
+// stays on tier 0.
+func (a *App) proxyTiers(ctx context.Context, w http.ResponseWriter, r *http.Request, body []byte, style APIStyle) bool {
+	var fields map[string]json.RawMessage
+	var model string
+	if json.Unmarshal(body, &fields) != nil || json.Unmarshal(fields["model"], &model) != nil || model == "" {
+		return false
+	}
+	for _, t := range a.config.Tiers {
+		id, ok := tierModelID(t, model, style)
+		if !ok {
+			continue
+		}
+		raw, _ := json.Marshal(id)
+		fields["model"] = raw
+		tierBody, err := json.Marshal(fields)
+		if err != nil {
+			continue
+		}
+		resp, err := a.doUpstream(ctx, r, tierBody, t.BaseURL, t.APIKey, style)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadGateway)
+			return true
+		}
+		if isQuota429(resp) {
+			_ = resp.Body.Close()
+			continue
+		}
+		copyResponse(w, resp)
+		return true
+	}
+	return false
+}
+
+// tierModelID returns the upstream model ID for model when the tier speaks style and maps it.
+func tierModelID(t TierConfig, model string, style APIStyle) (string, bool) {
+	speaks := false
+	for _, s := range t.Styles {
+		speaks = speaks || s == style
+	}
+	if !speaks {
+		return "", false
+	}
+	for _, m := range t.Models {
+		if m.Name == model {
+			if m.ID != "" {
+				return m.ID, true
+			}
+			return m.Name, true
+		}
+	}
+	return "", false
+}
+
+func (a *App) doUpstream(ctx context.Context, r *http.Request, body []byte, baseURL, key string, apiStyle APIStyle) (*http.Response, error) {
 	path := strings.TrimPrefix(r.URL.EscapedPath(), "/v1")
 	if path == "" {
 		path = "/"
 	}
-	u := a.config.UpstreamBaseURL + path
+	u := strings.TrimRight(baseURL, "/") + path
 	if r.URL.RawQuery != "" {
 		u += "?" + r.URL.RawQuery
 	}
