@@ -56,3 +56,5 @@ Para o Eduardo: saber como está o roteador abrindo um endereço no navegador, s
 
 - Decision (2026-10-29): página renderizada no servidor, sem API exposta (sugestão do Eduardo); `/admin/keys` não é aberto.
 - Assumption: o cache de uso existente basta para limitar as consultas ao upstream; sem limitação de taxa.
+- Decision (2026-10-29): com `UsageCacheTTL=0` cada visita a `/status` consulta o upstream de uso; o Eduardo aceitou o risco (uso interno), sem piso de TTL.
+- Decision (2026-10-29): a story 1 (`/status` com estado e uso das chaves) é o tracer bullet: o caminho mais fino por rota, relatório, template e teste; a story 2 (imagem Docker e documentação) vem depois.
