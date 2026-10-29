@@ -39,7 +39,12 @@ func (n *TelegramNotifier) notifyFailure(model string) {
 	n.disarmed = true
 	n.mu.Unlock()
 	if first {
-		go n.send("Switchboard Go: no tier could serve a request (model: " + truncateModel(model) + ")")
+		go func() {
+			// a lost alert must not silence the rest of the episode: retry on the next failing request
+			if !n.send("Switchboard Go: no tier could serve a request (model: " + truncateModel(model) + ")") {
+				n.rearm()
+			}
+		}()
 	}
 }
 
@@ -49,24 +54,26 @@ func (n *TelegramNotifier) rearm() {
 	n.mu.Unlock()
 }
 
-func (n *TelegramNotifier) send(text string) {
+func (n *TelegramNotifier) send(text string) bool {
 	body, _ := json.Marshal(map[string]string{"chat_id": n.cfg.ChatID, "text": text})
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, telegramAPIBase+"/bot"+n.cfg.BotToken+"/sendMessage", bytes.NewReader(body))
 	if err != nil {
 		log.Printf("telegram notification failed: bad request")
-		return
+		return false
 	}
 	req.Header.Set("Content-Type", "application/json")
 	resp, err := (&http.Client{Timeout: 10 * time.Second}).Do(req)
 	if err != nil {
 		// the *url.Error carries the URL with the token, so the raw error is never logged
 		log.Printf("telegram notification failed: request error")
-		return
+		return false
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		log.Printf("telegram notification failed: status %d", resp.StatusCode)
+		return false
 	}
+	return true
 }

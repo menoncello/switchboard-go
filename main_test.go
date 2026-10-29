@@ -2973,6 +2973,75 @@ func TestTelegramOncePerEpisodeAndRearm(t *testing.T) {
 	expectTelegram(t, calls, true)
 }
 
+func TestTelegramRearmsWhenTier0Recovers(t *testing.T) {
+	calls := fakeTelegram(t, 200)
+	s0, s1 := newStub(t, 503, `down`), newStub(t, 503, `down`)
+	app, now := failoverApp(t, s0, s1, nil, time.Hour)
+	app.telegram = NewTelegramNotifier(TelegramConfig{BotToken: "TOK", ChatID: "42"})
+	chatReq(app, `{"model":"a"}`)
+	expectTelegram(t, calls, true)
+	*now = now.Add(2 * time.Hour)
+	s0.status.Store(200)
+	if rec := chatReq(app, `{"model":"a"}`); rec.Code != 200 || s1.hits.Load() != 1 {
+		t.Fatalf("got %d, t1 hits=%d", rec.Code, s1.hits.Load())
+	}
+	expectTelegram(t, calls, false)
+	s0.status.Store(503)
+	*now = now.Add(2 * time.Hour)
+	chatReq(app, `{"model":"a"}`)
+	expectTelegram(t, calls, true)
+}
+
+func TestTelegramClientCancelSendsNothing(t *testing.T) {
+	calls := fakeTelegram(t, 200)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	s0, s1 := newStub(t, 500, `from t0`), newStub(t, 200, `x`)
+	app, now := failoverApp(t, s0, s1, nil, time.Hour)
+	app.telegram = NewTelegramNotifier(TelegramConfig{BotToken: "TOK", ChatID: "42"})
+	// same trick as the 499 test: cancel right after the tier 0 cooldown is set
+	app.cooldowns.now = func() time.Time {
+		if s0.hits.Load() > 0 {
+			cancel()
+		}
+		return *now
+	}
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"b"}`)).WithContext(ctx)
+	req.Header.Set("Authorization", "Bearer p")
+	rec := httptest.NewRecorder()
+	app.ServeHTTP(rec, req)
+	if rec.Code != 499 {
+		t.Fatalf("got %d", rec.Code)
+	}
+	expectTelegram(t, calls, false)
+	chatReq(app, `{"model":"b"}`) // still armed: a normal failing request alerts
+	expectTelegram(t, calls, true)
+}
+
+func TestNewAppBuildsTelegramNotifierFromConfig(t *testing.T) {
+	calls := fakeTelegram(t, 200)
+	s0 := newStub(t, 503, `down`)
+	app := newApp(Config{ProxyAPIKey: "p", UpstreamAPIKeys: []string{"u1"}, UpstreamBaseURL: s0.srv.URL, MaxRequestBodyBytes: 1 << 20, RetryExhaustedAfter: time.Hour, Telegram: TelegramConfig{BotToken: "TOK", ChatID: "42"}})
+	if rec := chatReq(app, `{"model":"a"}`); rec.Code != 503 {
+		t.Fatalf("got %d", rec.Code)
+	}
+	expectTelegram(t, calls, true)
+}
+
+func TestTelegramFailedSendRearms(t *testing.T) {
+	t.Cleanup(func() { log.SetOutput(os.Stderr) })
+	log.SetOutput(io.Discard)
+	calls := fakeTelegram(t, 500)
+	s0, s1 := newStub(t, 503, `down`), newStub(t, 503, `down`)
+	app, _ := failoverApp(t, s0, s1, nil, time.Hour)
+	app.telegram = NewTelegramNotifier(TelegramConfig{BotToken: "TOK", ChatID: "42"})
+	chatReq(app, `{"model":"a"}`)
+	expectTelegram(t, calls, true)
+	time.Sleep(100 * time.Millisecond) // let the goroutine rearm after the failed send
+	chatReq(app, `{"model":"a"}`)      // local 429, same episode, but the alert was lost
+	expectTelegram(t, calls, true)
+}
+
 func TestTelegramNotConfiguredSendsNothing(t *testing.T) {
 	for name, cfg := range map[string]TelegramConfig{"none": {}, "token only": {BotToken: "TOK"}, "chat only": {ChatID: "42"}} {
 		t.Run(name, func(t *testing.T) {

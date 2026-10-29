@@ -162,6 +162,9 @@ and only when every tier 0 key is exhausted. The Telegram alert (`telegram:`)
 fires on the first request that no tier serves and stays quiet until some tier
 serves a request again, so it is sent once per failure episode; it runs next to
 the SMTP alert and sends nothing unless both `bot_token` and `chat_id` are set.
+A restart starts armed, so the first failing request after it alerts. If the
+send itself fails, the next failing request tries again (not the same one). An
+upstream 4xx passed through to the client counts as served and also re-arms.
 To try it by hand, run
 `go run ./cmd/fakeupstream -addr 127.0.0.1:9999` and switch it with
 `POST /__mode/quota` or `POST /__mode/ok`.
