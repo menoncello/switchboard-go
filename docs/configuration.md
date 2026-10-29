@@ -91,19 +91,42 @@ tiers:
 
 `tiers:` lists extra upstreams used for failover. The `upstream:` block above
 stays as the implicit tier 0 and is not listed here (it is exempt from the
-`free` rule). Without `tiers:` the proxy behaves as before. Tiers are read from
+`free` rule). Without `tiers:` there is nothing to fail over to: a tier 0 failure status (see below) still puts tier 0 in cooldown, and until it ends the proxy answers the local `429`. Tiers are read from
 the YAML file only, not from environment variables.
 
-When every tier 0 key is exhausted, the proxy tries the tiers in order. It
-rewrites the top-level `model` of the request body to the tier's model `id` (the
-model name when `id` is empty) and sends it with the tier's `api_key`. A tier
-without a mapping for that model, or that does not speak the request's API style,
-is skipped, and so is a tier that answers with a quota 429. A request without a
-`model` in the body stays on tier 0. Any other response from a tier (any status)
-goes to the client without further failover, and a connection error to a tier
-returns `502`. If no tier serves the request, the client gets the local `429`
-"all upstream keys exhausted"; the SMTP "all exhausted" alert and `Retry-After`
-only fire in that case. To try it by hand, run
+A request goes to tier 0 first, then to the tiers in order. Each tier that fails
+is skipped (put in cooldown) and the next one is tried. A tier fails on `401`,
+`402`, any `5xx`, any `429`, and a `404` that is not about a missing model. A
+`404` fails the tier only when the request body has a non-empty top-level
+`model` and the `404` body does not say the model is missing (it contains "model"
+and one of "not found", "does not exist", "unknown", "invalid", "no such");
+otherwise it goes to the client. Any other status (`400`, a plain `403`, `2xx`,
+`3xx`, other `4xx`) goes to the client without cooldown. Failover happens only
+before the response is copied: once a response starts (a stream included) there
+is no switch, even if it is cut.
+
+On tier 0 only a quota `429` and the `403` "subscription is required" rotate to
+the next key; with every key exhausted tier 0 is skipped as before. Any other
+failure status puts the whole of tier 0 in cooldown for `retry_exhausted_after`.
+A tier in cooldown, tier 0 included, is not called until the cooldown ends; the
+cooldown is kept in memory and is lost on restart. For an extra tier the cooldown
+is its `cooldown` field or, when absent, `retry_exhausted_after`; `0` means no
+cooldown (the next tier is tried only for the request that failed).
+
+For an extra tier the proxy rewrites the top-level `model` of the request body to
+the tier's model `id` (the model name when `id` is empty) and sends it with the
+tier's `api_key`. A tier without a mapping for that model, or that does not speak
+the request's API style, is skipped. A request without a `model` in the body stays
+on tier 0. A connection error or timeout to a tier returns `502` (no failover).
+
+If every tier fails, the client gets the last failure response received (its
+tier and key are the ones in the request log). If no tier was tried at all
+(all in cooldown, skipped or tier 0 keys exhausted) the client gets the local
+`429` "all upstream keys exhausted", with `Retry-After` set to the shortest time
+left among the tiers that could serve the request (tier 0 counts its tier
+cooldown or, without one, its exhausted keys); the header is left out when that
+time is unknown. The SMTP "all exhausted" alert fires only in that local `429`
+and only when every tier 0 key is exhausted. To try it by hand, run
 `go run ./cmd/fakeupstream -addr 127.0.0.1:9999` and switch it with
 `POST /__mode/quota` or `POST /__mode/ok`.
 
@@ -114,6 +137,7 @@ only fire in that case. To try it by hand, run
 | `api_key` | Yes | Tier key. Never printed by `validate-config` or in logs. |
 | `free` | Yes | Must be `true`. A tier without `free: true` is rejected at startup. |
 | `styles` | No | List of `openai` and/or `anthropic`. Absent means OpenAI only. |
+| `cooldown` | No | Duration (`time.ParseDuration`, for example `10m`, >= 0) the tier is skipped after a failure. Absent means `retry_exhausted_after`; `0` means no cooldown. |
 | `models` | Yes | Map of model name to an object with optional `id` (defaults to the model name), `context` (>= 0) and `tools`. At least one; names must be unique. |
 
 `validate-config` shows only the number of tiers (`tiers=N`).

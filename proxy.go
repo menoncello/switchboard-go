@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"io"
+	"math"
 	"net/http"
 	"slices"
 	"strconv"
@@ -14,6 +15,9 @@ import (
 )
 
 const tier0Name = "opencode-go"
+
+// tier0CooldownKey keys tier 0 in tierCooldowns; an extra tier cannot have an empty name.
+const tier0CooldownKey = ""
 
 // maxLoggedModel bounds the model in the request log so a client cannot inflate a log line.
 const maxLoggedModel = 128
@@ -99,57 +103,140 @@ func (a *App) serveProxy(w http.ResponseWriter, r *http.Request, style APIStyle)
 	_ = r.Body.Close()
 	fields, model := topLevelModel(body)
 	orig := r.Context()
-	for attempts := 0; attempts < len(a.config.UpstreamAPIKeys); attempts++ {
-		idx, key, ok := a.keys.Current()
-		if !ok {
-			break
-		}
-		resp, reqErr := a.doUpstream(orig, r, body, a.config.UpstreamBaseURL, key, style)
-		if reqErr != nil {
-			http.Error(w, reqErr.Error(), http.StatusBadGateway)
-			return model, "", -1
-		}
-		if isKeyDead(resp) {
-			_ = resp.Body.Close()
-			a.keys.MarkExhausted(idx)
-			if a.keys.ShouldNotifySwitch(idx) {
-				a.sender.NotifySwitch(idx, a.keys.Status())
+	var last heldResponse
+	defer last.release()
+	if a.cooldowns.remaining(tier0CooldownKey) == 0 {
+		for attempts := 0; attempts < len(a.config.UpstreamAPIKeys); attempts++ {
+			idx, key, ok := a.keys.Current()
+			if !ok {
+				break
 			}
-			continue
+			resp, reqErr := a.doUpstream(orig, r, body, a.config.UpstreamBaseURL, key, style)
+			if reqErr != nil {
+				http.Error(w, reqErr.Error(), http.StatusBadGateway)
+				return model, "", -1
+			}
+			if isKeyDead(resp) {
+				_ = resp.Body.Close()
+				a.keys.MarkExhausted(idx)
+				if a.keys.ShouldNotifySwitch(idx) {
+					a.sender.NotifySwitch(idx, a.keys.Status())
+				}
+				continue
+			}
+			// The key served the request, so it is healthy: mark it available so a
+			// recovered (previously exhausted) key un-sticks and the notification
+			// flags re-arm for the next depletion round.
+			a.keys.MarkAvailable(idx)
+			if isTierFailure(resp, model != "") {
+				// The whole tier is unhealthy, not one key: rotating keys would not help.
+				a.cooldowns.set(tier0CooldownKey, a.config.RetryExhaustedAfter)
+				last.hold(resp, tier0Name, idx)
+				break
+			}
+			copyResponse(w, resp)
+			return model, tier0Name, idx
 		}
-		// The key served the request, so it is healthy: mark it available so a
-		// recovered (previously exhausted) key un-sticks and the notification
-		// flags re-arm for the next depletion round.
-		a.keys.MarkAvailable(idx)
-		copyResponse(w, resp)
-		return model, tier0Name, idx
 	}
-	if name, ok := a.proxyTiers(orig, w, r, fields, model, style); ok {
+	if name, ok := a.proxyTiers(orig, w, r, fields, model, style, &last); ok {
 		return model, name, -1
 	}
-	// No eligible key remains. Fail fast locally instead of hammering upstream,
-	// and hint well-behaved clients at the next probe window via Retry-After.
+	// No tier served it; alert once when every tier 0 key is exhausted.
 	if a.keys.ShouldNotifyAllExhausted() {
 		a.sender.NotifyAllExhausted(a.keys.Status())
 	}
-	if secs, ok := a.keys.RetryAfterSeconds(); ok {
+	if last.resp != nil {
+		copyResponse(w, last.resp)
+		return model, last.tier, last.key
+	}
+	// No eligible tier remains. Fail fast locally instead of hammering upstream,
+	// and hint well-behaved clients at the first window via Retry-After.
+	if secs, ok := a.localRetryAfter(model, style); ok {
 		w.Header().Set("Retry-After", strconv.Itoa(secs))
 	}
 	writeAPIError(w, style, http.StatusTooManyRequests, "rate_limit_exceeded", "all upstream keys exhausted")
 	return model, "", -1
 }
 
-// proxyTiers tries the configured tiers in order once tier 0 is exhausted and
-// returns the name of the tier that answered and whether one did (the name is
-// empty for the 502 on a connection error). A request without a top-level string
+// heldResponse is the last failure response seen, kept so the client can get it
+// when no tier is left. Its body stays readable until released or served.
+type heldResponse struct {
+	resp *http.Response
+	tier string
+	key  int
+}
+
+func (h *heldResponse) hold(resp *http.Response, tier string, key int) {
+	h.release()
+	*h = heldResponse{resp: resp, tier: tier, key: key}
+}
+
+func (h *heldResponse) release() {
+	if h.resp != nil {
+		_ = h.resp.Body.Close()
+	}
+}
+
+// localRetryAfter is the seconds until the first eligible tier is tried again:
+// tier 0 (its tier cooldown or, without one, its exhausted keys) and the extra
+// tiers that map model and style and are in cooldown. False when tier 0 has no
+// known time (nothing to promise).
+func (a *App) localRetryAfter(model string, style APIStyle) (int, bool) {
+	soonest := a.cooldowns.remaining(tier0CooldownKey)
+	if soonest <= 0 {
+		secs, ok := a.keys.RetryAfterSeconds()
+		if !ok {
+			return 0, false
+		}
+		soonest = time.Duration(secs) * time.Second
+	}
+	if model != "" {
+		for _, t := range a.config.Tiers {
+			if _, ok := tierModelID(t, model, style); !ok {
+				continue
+			}
+			if d := a.cooldowns.remaining(t.Name); d > 0 && d < soonest {
+				soonest = d
+			}
+		}
+	}
+	return max(1, int(math.Ceil(soonest.Seconds()))), true
+}
+
+// isTierFailure reports whether resp means the whole tier is unhealthy and the
+// next one should be tried: 401, 402, 429, any 5xx, and a 404 that is not about a
+// missing model (only when the request names a model). Like isKeyDead, it restores resp.Body.
+func isTierFailure(resp *http.Response, hasModel bool) bool {
+	switch {
+	case resp.StatusCode == 401 || resp.StatusCode == 402 || resp.StatusCode == 429 || resp.StatusCode >= 500:
+		return true
+	case resp.StatusCode == 404 && hasModel:
+		low := strings.ToLower(string(peekBody(resp)))
+		if !strings.Contains(low, "model") {
+			return true
+		}
+		for _, p := range []string{"not found", "does not exist", "unknown", "invalid", "no such"} {
+			if strings.Contains(low, p) {
+				return false
+			}
+		}
+		return true
+	}
+	return false
+}
+
+// proxyTiers tries the configured tiers in order after tier 0 failed or was
+// skipped and returns the name of the tier that answered and whether one did (the
+// name is empty for the 502 on a connection error). A tier that fails is put in
+// cooldown and its response kept in last. A request without a top-level string
 // "model" stays on tier 0.
-func (a *App) proxyTiers(ctx context.Context, w http.ResponseWriter, r *http.Request, fields map[string]json.RawMessage, model string, style APIStyle) (string, bool) {
+func (a *App) proxyTiers(ctx context.Context, w http.ResponseWriter, r *http.Request, fields map[string]json.RawMessage, model string, style APIStyle, last *heldResponse) (string, bool) {
 	if model == "" {
 		return "", false
 	}
 	for _, t := range a.config.Tiers {
 		id, ok := tierModelID(t, model, style)
-		if !ok {
+		if !ok || a.cooldowns.remaining(t.Name) > 0 {
 			continue
 		}
 		raw, _ := json.Marshal(id)
@@ -163,8 +250,13 @@ func (a *App) proxyTiers(ctx context.Context, w http.ResponseWriter, r *http.Req
 			http.Error(w, "tier upstream unreachable", http.StatusBadGateway)
 			return "", true
 		}
-		if isQuota429(resp) {
-			_ = resp.Body.Close()
+		if isTierFailure(resp, true) {
+			cooldown := a.config.RetryExhaustedAfter
+			if t.Cooldown != nil {
+				cooldown = *t.Cooldown
+			}
+			a.cooldowns.set(t.Name, cooldown)
+			last.hold(resp, t.Name, -1)
 			continue
 		}
 		copyResponse(w, resp)
@@ -303,6 +395,17 @@ func copyResponse(w http.ResponseWriter, resp *http.Response) {
 	}
 }
 
+// peekBody returns the first 4096 bytes of resp.Body and leaves the whole body
+// readable: the peeked bytes are put back in front of the rest.
+func peekBody(resp *http.Response) []byte {
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+	resp.Body = struct {
+		io.Reader
+		io.Closer
+	}{io.MultiReader(bytes.NewReader(body), resp.Body), resp.Body}
+	return body
+}
+
 // isKeyDead reports whether the upstream response means this key cannot serve
 // requests and the next one should be tried: a quota 429, or the 403 OpenCode Go
 // returns when the key's subscription is gone. Like isQuota429, it restores resp.Body.
@@ -310,19 +413,14 @@ func isKeyDead(resp *http.Response) bool {
 	if resp.StatusCode != http.StatusForbidden {
 		return isQuota429(resp)
 	}
-	body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-	resp.Body.Close()
-	resp.Body = io.NopCloser(bytes.NewReader(body))
-	return strings.Contains(strings.ToLower(string(body)), "subscription is required")
+	return strings.Contains(strings.ToLower(string(peekBody(resp))), "subscription is required")
 }
 
 func isQuota429(resp *http.Response) bool {
 	if resp.StatusCode != 429 {
 		return false
 	}
-	body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-	resp.Body.Close()
-	resp.Body = io.NopCloser(bytes.NewReader(body))
+	body := peekBody(resp)
 	var m map[string]any
 	if json.Unmarshal(body, &m) == nil {
 		if e, ok := m["error"].(map[string]any); ok {

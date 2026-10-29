@@ -10,9 +10,11 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"net/smtp"
 	"os"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -1399,6 +1401,8 @@ func TestLoadConfigTiersRejected(t *testing.T) {
 		"neg context":      {strings.Replace(tierOK, "context: 100", "context: -1", 1), "context must be >= 0"},
 		"scalar model":     {strings.Replace(tierOK, "{id: x/m1, context: 100, tools: true}", "5", 1), "parse tiers[0].models"},
 		"models not map":   {strings.Replace(tierOK, "    models:\n      m1: {id: x/m1, context: 100, tools: true}\n", "    models: [a]\n", 1), "must be a map"},
+		"bad cooldown":     {tierOK + "    cooldown: soon\n", "parse tiers[0].cooldown"},
+		"neg cooldown":     {strings.Replace(tierOK, "    free: true\n", "    free: true\n    cooldown: -1s\n", 1), "cooldown must be >= 0"},
 		"dup name trimmed": {tierOK + strings.Replace(tierOK, "name: a", "name: \"a \"", 1), "duplicate name"},
 	}
 	for name, c := range cases {
@@ -1569,24 +1573,23 @@ func TestTierNotCalledWhenTier0Healthy(t *testing.T) {
 	}
 }
 
-func TestTierNonQuotaResponseCopiedWithoutFurtherFailover(t *testing.T) {
+func TestTier400CopiedWithoutFailoverOrCooldown(t *testing.T) {
 	f := newTierFixture(t, false, false)
-	for _, status := range []int{http.StatusBadRequest, http.StatusInternalServerError} {
-		s1 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			w.WriteHeader(status)
-			_, _ = w.Write([]byte("tier1 says no"))
-		}))
-		defer s1.Close()
-		f.app.config.Tiers[0].BaseURL = s1.URL
-		before := f.hits()
+	s1 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = w.Write([]byte("tier1 says no"))
+	}))
+	defer s1.Close()
+	f.app.config.Tiers[0].BaseURL = s1.URL
+	for i := 0; i < 2; i++ {
 		rec := tierReq(f.app, http.MethodPost, "/v1/chat/completions", `{"model":"a"}`, nil)
-		if rec.Code != status || rec.Body.String() != "tier1 says no" || f.hits()[2] != before[2] {
-			t.Fatalf("status %d: got %d %q hits=%v", status, rec.Code, rec.Body.String(), f.hits())
+		if rec.Code != http.StatusBadRequest || rec.Body.String() != "tier1 says no" || f.hits()[2] != 0 {
+			t.Fatalf("got %d %q hits=%v", rec.Code, rec.Body.String(), f.hits())
 		}
 	}
 }
 
-func TestTierNonQuota429CopiedWithoutFurtherFailover(t *testing.T) {
+func TestTierPlain429FailsOverToNextTier(t *testing.T) {
 	f := newTierFixture(t, false, false)
 	s1 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusTooManyRequests)
@@ -1595,7 +1598,7 @@ func TestTierNonQuota429CopiedWithoutFurtherFailover(t *testing.T) {
 	defer s1.Close()
 	f.app.config.Tiers[0].BaseURL = s1.URL
 	rec := tierReq(f.app, http.MethodPost, "/v1/chat/completions", `{"model":"a"}`, nil)
-	if rec.Code != http.StatusTooManyRequests || rec.Body.String() != `{"error":{"code":"rate_limit"}}` || f.hits()[2] != 0 {
+	if rec.Code != http.StatusOK || rec.Body.String() != `{"from":"t2"}` || f.hits()[2] != 1 {
 		t.Fatalf("got %d %q hits=%v", rec.Code, rec.Body.String(), f.hits())
 	}
 }
@@ -1901,5 +1904,361 @@ func TestRequestLogModelIsTruncated(t *testing.T) {
 	got := lines(t)
 	if len(got) != 1 || got[0]["model"] != strings.Repeat("a", 127) {
 		t.Fatalf("lines: %v", got)
+	}
+}
+
+// stub is an upstream that answers a fixed status and body and counts its hits.
+type stub struct {
+	srv    *httptest.Server
+	hits   atomic.Int32
+	status atomic.Int32
+	body   atomic.Value
+}
+
+func newStub(t *testing.T, status int, body string) *stub {
+	t.Helper()
+	st := &stub{}
+	st.status.Store(int32(status))
+	st.body.Store(body)
+	st.srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		st.hits.Add(1)
+		w.WriteHeader(int(st.status.Load()))
+		_, _ = w.Write([]byte(st.body.Load().(string)))
+	}))
+	t.Cleanup(st.srv.Close)
+	return st
+}
+
+// failoverApp wires tier 0 (two keys) and extra tiers t1 and t2 (both map "a") to the stubs,
+// with a fake clock shared by the key manager and the tier cooldowns.
+func failoverApp(t *testing.T, s0, s1, s2 *stub, retryAfter time.Duration) (*App, *time.Time) {
+	t.Helper()
+	cfg := Config{ProxyAPIKey: "p", UpstreamAPIKeys: []string{"u1", "u2"}, UpstreamBaseURL: s0.srv.URL, MaxRequestBodyBytes: 1 << 20, RetryExhaustedAfter: retryAfter}
+	cfg.Tiers = append(cfg.Tiers, TierConfig{Name: "t1", BaseURL: s1.srv.URL, APIKey: "k1", Free: true, Styles: []APIStyle{APIStyleOpenAI}, Models: []TierModel{{Name: "a"}}})
+	if s2 != nil {
+		cfg.Tiers = append(cfg.Tiers, TierConfig{Name: "t2", BaseURL: s2.srv.URL, APIKey: "k2", Free: true, Styles: []APIStyle{APIStyleOpenAI}, Models: []TierModel{{Name: "a"}}})
+	}
+	app := newApp(cfg)
+	now := time.Unix(10000, 0).UTC()
+	app.keys.now = func() time.Time { return now }
+	app.cooldowns.now = func() time.Time { return now }
+	return app, &now
+}
+
+func chatReq(app *App, body string) *httptest.ResponseRecorder {
+	return tierReq(app, http.MethodPost, "/v1/chat/completions", body, nil)
+}
+
+func TestFailoverTier0FailureStatusesGoToNextTier(t *testing.T) {
+	for _, c := range []struct {
+		status int
+		body   string
+	}{
+		{401, `{"error":"bad key"}`}, {402, `{"error":"pay"}`}, {404, `{"error":"route gone"}`},
+		{500, `oops`}, {503, `oops`}, {429, `{"error":{"code":"rate_limit"}}`},
+	} {
+		t.Run(strconv.Itoa(c.status), func(t *testing.T) {
+			s0, s1 := newStub(t, c.status, c.body), newStub(t, 200, `{"from":"t1"}`)
+			app, _ := failoverApp(t, s0, s1, nil, time.Hour)
+			for i := 1; i <= 2; i++ {
+				rec := chatReq(app, `{"model":"a"}`)
+				if rec.Code != 200 || rec.Body.String() != `{"from":"t1"}` || s0.hits.Load() != 1 || s1.hits.Load() != int32(i) {
+					t.Fatalf("req %d: %d %q hits=%d/%d", i, rec.Code, rec.Body.String(), s0.hits.Load(), s1.hits.Load())
+				}
+			}
+			// the failure is tier-wide: no key was marked exhausted
+			for _, k := range app.keys.Status().Keys {
+				if k.State == string(KeyExhausted) {
+					t.Fatalf("key exhausted: %+v", k)
+				}
+			}
+		})
+	}
+}
+
+func TestFailoverExtraTierFailureStatusesGoToNextTier(t *testing.T) {
+	for _, status := range []int{401, 402, 404, 500, 429} {
+		t.Run(strconv.Itoa(status), func(t *testing.T) {
+			s0, s1, s2 := newStub(t, 500, `x`), newStub(t, status, `{"error":"nope"}`), newStub(t, 200, `{"from":"t2"}`)
+			app, _ := failoverApp(t, s0, s1, s2, time.Hour)
+			for i := 1; i <= 2; i++ {
+				rec := chatReq(app, `{"model":"a"}`)
+				if rec.Code != 200 || rec.Body.String() != `{"from":"t2"}` || s1.hits.Load() != 1 || s2.hits.Load() != int32(i) {
+					t.Fatalf("req %d: %d %q hits=%d/%d", i, rec.Code, rec.Body.String(), s1.hits.Load(), s2.hits.Load())
+				}
+			}
+		})
+	}
+}
+
+func TestFailover400And404MissingModelPassThroughWithoutCooldown(t *testing.T) {
+	for _, c := range []struct {
+		status int
+		body   string
+	}{
+		{400, `bad request`}, {403, `forbidden`}, {404, `{"error":{"message":"The model gpt-x does not exist"}}`}, {404, `Model not found`},
+	} {
+		s0, s1 := newStub(t, c.status, c.body), newStub(t, 200, `{"from":"t1"}`)
+		app, _ := failoverApp(t, s0, s1, nil, time.Hour)
+		for i := 1; i <= 2; i++ {
+			rec := chatReq(app, `{"model":"a"}`)
+			if rec.Code != c.status || rec.Body.String() != c.body || s0.hits.Load() != int32(i) || s1.hits.Load() != 0 {
+				t.Fatalf("%d %q req %d: got %d %q hits=%d/%d", c.status, c.body, i, rec.Code, rec.Body.String(), s0.hits.Load(), s1.hits.Load())
+			}
+		}
+	}
+	// a 404 from an extra tier that says the model is missing also goes to the client
+	s0, s1, s2 := newStub(t, 500, `x`), newStub(t, 404, `model not found`), newStub(t, 200, `{"from":"t2"}`)
+	app, _ := failoverApp(t, s0, s1, s2, time.Hour)
+	for i := 1; i <= 2; i++ {
+		rec := chatReq(app, `{"model":"a"}`)
+		if i == 1 && (rec.Code != 404 || s2.hits.Load() != 0) {
+			t.Fatalf("tier 404: %d hits=%d", rec.Code, s2.hits.Load())
+		}
+	}
+	if s1.hits.Load() != 2 {
+		t.Fatalf("tier 1 was put in cooldown by a model 404: %d hits", s1.hits.Load())
+	}
+}
+
+func TestFailover404WithoutRequestModelPassesThrough(t *testing.T) {
+	s0, s1 := newStub(t, 404, `{"error":"route gone"}`), newStub(t, 200, `{"from":"t1"}`)
+	app, _ := failoverApp(t, s0, s1, nil, time.Hour)
+	for i := 1; i <= 2; i++ {
+		rec := chatReq(app, `{"messages":[]}`)
+		if rec.Code != 404 || s0.hits.Load() != int32(i) || s1.hits.Load() != 0 {
+			t.Fatalf("got %d hits=%d/%d", rec.Code, s0.hits.Load(), s1.hits.Load())
+		}
+	}
+}
+
+func TestFailoverStartedStreamKeepsTier(t *testing.T) {
+	s0 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("data: one\n\n"))
+		w.(http.Flusher).Flush()
+		panic(http.ErrAbortHandler) // cut the stream after the first event
+	}))
+	defer s0.Close()
+	s1 := newStub(t, 200, `{"from":"t1"}`)
+	app, _ := failoverApp(t, &stub{srv: s0}, s1, nil, time.Hour)
+	rec := chatReq(app, `{"model":"a"}`)
+	if rec.Code != 200 || !strings.Contains(rec.Body.String(), "data: one") || s1.hits.Load() != 0 {
+		t.Fatalf("got %d %q t1 hits=%d", rec.Code, rec.Body.String(), s1.hits.Load())
+	}
+	if app.cooldowns.remaining(tier0CooldownKey) != 0 {
+		t.Fatal("tier 0 in cooldown after a stream that started")
+	}
+}
+
+func TestFailoverCooldownExpires(t *testing.T) {
+	s0, s1 := newStub(t, 500, `x`), newStub(t, 200, `{"from":"t1"}`)
+	app, now := failoverApp(t, s0, s1, nil, time.Minute)
+	chatReq(app, `{"model":"a"}`)
+	*now = now.Add(30 * time.Second)
+	chatReq(app, `{"model":"a"}`)
+	if s0.hits.Load() != 1 {
+		t.Fatalf("tier 0 called during cooldown: %d", s0.hits.Load())
+	}
+	s0.status.Store(200)
+	s0.body.Store(`{"from":"t0"}`)
+	*now = now.Add(31 * time.Second)
+	rec := chatReq(app, `{"model":"a"}`)
+	if rec.Body.String() != `{"from":"t0"}` || s0.hits.Load() != 2 {
+		t.Fatalf("tier 0 not retried after cooldown: %q hits=%d", rec.Body.String(), s0.hits.Load())
+	}
+}
+
+func TestFailoverAllFailServesLastResponseAndLogsItsTier(t *testing.T) {
+	s0, s1, s2 := newStub(t, 500, `from t0`), newStub(t, 502, `from t1`), newStub(t, 503, `from t2`)
+	app, _ := failoverApp(t, s0, s1, s2, time.Hour)
+	lines := captureLog(app)
+	rec := chatReq(app, `{"model":"a"}`)
+	if rec.Code != 503 || rec.Body.String() != "from t2" {
+		t.Fatalf("got %d %q", rec.Code, rec.Body.String())
+	}
+	for _, name := range []string{tier0CooldownKey, "t1", "t2"} {
+		if app.cooldowns.remaining(name) == 0 {
+			t.Fatalf("%s not in cooldown", name)
+		}
+	}
+	if l := lines(t); l[len(l)-1]["tier"] != "t2" || l[len(l)-1]["status"] != float64(503) {
+		t.Fatalf("log %v", l)
+	}
+	// without a model only tier 0 can answer, so its failure response is the last one
+	s0b, s1b := newStub(t, 500, `from t0`), newStub(t, 200, `x`)
+	app2, _ := failoverApp(t, s0b, s1b, nil, time.Hour)
+	lines2 := captureLog(app2)
+	rec = chatReq(app2, `{"messages":[]}`)
+	if rec.Code != 500 || rec.Body.String() != "from t0" || s1b.hits.Load() != 0 {
+		t.Fatalf("no model: %d %q", rec.Code, rec.Body.String())
+	}
+	if l := lines2(t); l[len(l)-1]["tier"] != tier0Name || l[len(l)-1]["key_index"] != float64(0) {
+		t.Fatalf("log %v", l)
+	}
+}
+
+func TestFailoverAllInCooldownLocal429WithRetryAfter(t *testing.T) {
+	s0, s1 := newStub(t, 500, `x`), newStub(t, 503, `y`)
+	app, now := failoverApp(t, s0, s1, nil, time.Hour)
+	d := 10 * time.Minute
+	app.config.Tiers[0].Cooldown = &d
+	if rec := chatReq(app, `{"model":"a"}`); rec.Code != 503 {
+		t.Fatalf("first: %d", rec.Code)
+	}
+	*now = now.Add(time.Minute)
+	rec := chatReq(app, `{"model":"a"}`)
+	if rec.Code != 429 || rec.Header().Get("Retry-After") != "540" || s0.hits.Load() != 1 || s1.hits.Load() != 1 {
+		t.Fatalf("got %d RA=%q hits=%d/%d", rec.Code, rec.Header().Get("Retry-After"), s0.hits.Load(), s1.hits.Load())
+	}
+	// a request that tier 1 cannot serve only waits on tier 0 (the soonest return is tier 0 at 1h)
+	rec = chatReq(app, `{"model":"zzz"}`)
+	if rec.Code != 429 || rec.Header().Get("Retry-After") != "3540" {
+		t.Fatalf("unmapped: %d RA=%q", rec.Code, rec.Header().Get("Retry-After"))
+	}
+	*now = now.Add(10 * time.Minute)
+	if rec := chatReq(app, `{"model":"a"}`); rec.Code != 503 || s1.hits.Load() != 2 || s0.hits.Load() != 1 {
+		t.Fatalf("tier 1 not retried alone: %d hits=%d/%d", rec.Code, s0.hits.Load(), s1.hits.Load())
+	}
+}
+
+func TestFailoverTierCooldownZeroAndDefault(t *testing.T) {
+	s0, s1, s2 := newStub(t, 500, `x`), newStub(t, 500, `y`), newStub(t, 200, `{"from":"t2"}`)
+	app, now := failoverApp(t, s0, s1, s2, 0)
+	// RetryExhaustedAfter 0: no cooldown anywhere, every request walks the tiers again
+	chatReq(app, `{"model":"a"}`)
+	chatReq(app, `{"model":"a"}`)
+	if s0.hits.Load() != 2 || s1.hits.Load() != 2 || s2.hits.Load() != 2 {
+		t.Fatalf("zero cooldown hits=%d/%d/%d", s0.hits.Load(), s1.hits.Load(), s2.hits.Load())
+	}
+	// the default is RetryExhaustedAfter read at use time; a tier value overrides it
+	app.config.RetryExhaustedAfter = time.Hour
+	d := time.Minute
+	app.config.Tiers[0].Cooldown = &d
+	chatReq(app, `{"model":"a"}`)
+	if app.cooldowns.remaining(tier0CooldownKey) != time.Hour || app.cooldowns.remaining("t1") != time.Minute {
+		t.Fatalf("cooldowns %v %v", app.cooldowns.remaining(tier0CooldownKey), app.cooldowns.remaining("t1"))
+	}
+	*now = now.Add(2 * time.Minute)
+	chatReq(app, `{"model":"a"}`)
+	if s0.hits.Load() != 3 || s1.hits.Load() != 4 {
+		t.Fatalf("hits=%d/%d", s0.hits.Load(), s1.hits.Load())
+	}
+}
+
+func TestFailoverQuotaStillRotatesTier0Keys(t *testing.T) {
+	var seen []string
+	s0 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		seen = append(seen, r.Header.Get("Authorization"))
+		if len(seen) == 1 {
+			w.WriteHeader(http.StatusTooManyRequests)
+			_, _ = w.Write([]byte(quotaBody))
+			return
+		}
+		_, _ = w.Write([]byte(`{"from":"t0"}`))
+	}))
+	defer s0.Close()
+	app, _ := failoverApp(t, &stub{srv: s0}, newStub(t, 200, `x`), nil, time.Hour)
+	rec := chatReq(app, `{"model":"a"}`)
+	if rec.Body.String() != `{"from":"t0"}` || len(seen) != 2 || app.cooldowns.remaining(tier0CooldownKey) != 0 {
+		t.Fatalf("got %q seen=%v", rec.Body.String(), seen)
+	}
+}
+
+func TestLoadConfigTierCooldown(t *testing.T) {
+	tiersYAML(t, "tiers:\n"+tierOK+"    cooldown: 90s\n"+strings.Replace(tierOK, "name: a", "name: b", 1)+"    cooldown: 0s\n"+strings.Replace(tierOK, "name: a", "name: c", 1))
+	cfg, err := loadConfig()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c := cfg.Tiers[0].Cooldown; c == nil || *c != 90*time.Second {
+		t.Fatalf("a: %v", c)
+	}
+	if c := cfg.Tiers[1].Cooldown; c == nil || *c != 0 {
+		t.Fatalf("b: %v", c)
+	}
+	if cfg.Tiers[2].Cooldown != nil {
+		t.Fatalf("c: %v", cfg.Tiers[2].Cooldown)
+	}
+}
+
+func TestFailover404LargeBodyReachesClientIntact(t *testing.T) {
+	big := strings.Repeat("x", 10000)
+	for _, body := range []string{big, `{"error":"model not found"}` + big} {
+		for _, model := range []string{`{"model":"a"}`, `{"messages":[]}`} {
+			s0, s1 := newStub(t, 404, body), newStub(t, 200, `{"from":"t1"}`)
+			app, _ := failoverApp(t, s0, s1, nil, time.Hour)
+			rec := chatReq(app, model)
+			got := rec.Body.String()
+			if rec.Code == 404 && got != body {
+				t.Fatalf("%q: 404 body truncated: %d of %d bytes", model, len(got), len(body))
+			}
+			if rec.Code == 200 && s0.hits.Load() != 1 {
+				t.Fatalf("hits %d", s0.hits.Load())
+			}
+		}
+	}
+	// a failure response held as the last one is also served whole
+	s0, s1 := newStub(t, 500, `x`), newStub(t, 429, big)
+	app, _ := failoverApp(t, s0, s1, nil, time.Hour)
+	if rec := chatReq(app, `{"model":"a"}`); rec.Code != 429 || rec.Body.String() != big {
+		t.Fatalf("held 429: %d, %d bytes", rec.Code, rec.Body.Len())
+	}
+}
+
+func TestFailoverExtraTierNamedLikeTier0HasOwnCooldown(t *testing.T) {
+	s0, s1 := newStub(t, 500, `x`), newStub(t, 200, `{"from":"t1"}`)
+	app, _ := failoverApp(t, s0, s1, nil, time.Hour)
+	app.config.Tiers[0].Name = tier0Name
+	app.config.Tiers[0].Cooldown = new(time.Duration) // extra tier: no cooldown
+	for i := 1; i <= 2; i++ {
+		if rec := chatReq(app, `{"model":"a"}`); rec.Code != 200 || s1.hits.Load() != int32(i) {
+			t.Fatalf("req %d: %d hits=%d", i, rec.Code, s1.hits.Load())
+		}
+	}
+	if s0.hits.Load() != 1 || app.cooldowns.remaining(tier0CooldownKey) == 0 || app.cooldowns.remaining(tier0Name) != 0 {
+		t.Fatalf("tier 0 hits=%d, cooldowns %v / %v", s0.hits.Load(), app.cooldowns.remaining(tier0CooldownKey), app.cooldowns.remaining(tier0Name))
+	}
+}
+
+func TestFailoverAllKeysExhaustedAndTiersFailStillAlerts(t *testing.T) {
+	alerts := make(chan string, 4)
+	old := sendMail
+	sendMail = func(addr string, auth smtp.Auth, from string, to []string, msg []byte, useTLS, useStartTLS bool) error {
+		alerts <- string(msg)
+		return nil
+	}
+	t.Cleanup(func() { sendMail = old })
+	s0, s1 := newStub(t, 429, quotaBody), newStub(t, 503, `down`)
+	app, _ := failoverApp(t, s0, s1, nil, time.Hour)
+	app.sender = NewSMTPNotifier(SMTPConfig{Host: "h", Port: 25, From: "f@x", To: "t@x"})
+	rec := chatReq(app, `{"model":"a"}`)
+	if rec.Code != 503 || rec.Body.String() != "down" {
+		t.Fatalf("got %d %q", rec.Code, rec.Body.String())
+	}
+	deadline := time.After(2 * time.Second)
+	for {
+		select {
+		case m := <-alerts:
+			if strings.Contains(m, "exhausted all upstream keys") {
+				return
+			}
+		case <-deadline:
+			t.Fatal("no all-exhausted alert")
+		}
+	}
+}
+
+func TestFailoverRetryAfterFromExhaustedKeysWithoutTierCooldown(t *testing.T) {
+	s0, s1 := newStub(t, 429, quotaBody), newStub(t, 200, `x`)
+	app, now := failoverApp(t, s0, s1, nil, 5*time.Minute)
+	app.config.Tiers = app.config.Tiers[:1]
+	rec := chatReq(app, `{"model":"zzz"}`) // no tier maps it: only tier 0's exhausted keys count
+	if rec.Code != 429 || rec.Header().Get("Retry-After") != "300" {
+		t.Fatalf("got %d RA=%q", rec.Code, rec.Header().Get("Retry-After"))
+	}
+	*now = now.Add(100 * time.Second)
+	if rec := chatReq(app, `{"model":"zzz"}`); rec.Header().Get("Retry-After") != "200" {
+		t.Fatalf("RA=%q", rec.Header().Get("Retry-After"))
 	}
 }

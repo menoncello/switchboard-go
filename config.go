@@ -48,8 +48,11 @@ type Config struct {
 type TierConfig struct {
 	Name, BaseURL, APIKey string
 	Free                  bool
-	Styles                []APIStyle
-	Models                []TierModel
+	// Cooldown is how long the tier is skipped after a failure status; nil means
+	// RetryExhaustedAfter, 0 means failover only for the request that failed.
+	Cooldown *time.Duration
+	Styles   []APIStyle
+	Models   []TierModel
 }
 
 // TierModel is kept in a slice (file order) so a repeated key survives to validateConfig.
@@ -139,18 +142,29 @@ type yamlConfig struct {
 }
 
 type yamlTier struct {
-	Name    string    `yaml:"name"`
-	BaseURL string    `yaml:"base_url"`
-	APIKey  string    `yaml:"api_key"`
-	Free    bool      `yaml:"free"`
-	Styles  []string  `yaml:"styles"`
-	Models  yaml.Node `yaml:"models"`
+	Name     string    `yaml:"name"`
+	BaseURL  string    `yaml:"base_url"`
+	APIKey   string    `yaml:"api_key"`
+	Free     bool      `yaml:"free"`
+	Cooldown string    `yaml:"cooldown"`
+	Styles   []string  `yaml:"styles"`
+	Models   yaml.Node `yaml:"models"`
 }
 
 func convertTiers(in []yamlTier) ([]TierConfig, error) {
 	var out []TierConfig
 	for i, yt := range in {
 		t := TierConfig{Name: yt.Name, BaseURL: yt.BaseURL, APIKey: yt.APIKey, Free: yt.Free}
+		if s := strings.TrimSpace(yt.Cooldown); s != "" {
+			d, err := time.ParseDuration(s)
+			if err != nil {
+				return nil, fmt.Errorf("parse tiers[%d].cooldown: %w", i, err)
+			}
+			if d < 0 {
+				return nil, fmt.Errorf("tiers[%d].cooldown must be >= 0", i)
+			}
+			t.Cooldown = &d
+		}
 		for _, s := range yt.Styles {
 			switch s {
 			case "openai":
@@ -412,6 +426,9 @@ func validateTiers(tiers []TierConfig) error {
 		}
 		if !t.Free {
 			return fmt.Errorf("tier %q: free must be true (only free tiers are allowed)", t.Name)
+		}
+		if t.Cooldown != nil && *t.Cooldown < 0 {
+			return fmt.Errorf("tier %q: cooldown must be >= 0", t.Name)
 		}
 		for _, s := range t.Styles {
 			if s != APIStyleOpenAI && s != APIStyleAnthropic {

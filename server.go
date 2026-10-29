@@ -22,10 +22,12 @@ type App struct {
 	sender *SMTPNotifier
 	usage  *usageCache
 	logger *slog.Logger
+	// cooldowns holds the per-tier cooldown (tier 0 under tier0Name), in memory only.
+	cooldowns *tierCooldowns
 }
 
 func newApp(cfg Config) *App {
-	return &App{config: cfg, keys: NewKeyManager(cfg.UpstreamAPIKeys, cfg.RetryExhaustedAfter), client: &http.Client{Transport: &http.Transport{Proxy: http.ProxyFromEnvironment, DialContext: (&net.Dialer{Timeout: 10 * time.Second, KeepAlive: 30 * time.Second}).DialContext, TLSHandshakeTimeout: 10 * time.Second, ResponseHeaderTimeout: cfg.UpstreamResponseHeaderTimeout, ExpectContinueTimeout: 2 * time.Second}}, sender: NewSMTPNotifier(cfg.SMTP), usage: newUsageCache(), logger: slog.New(slog.NewJSONHandler(os.Stderr, nil))}
+	return &App{config: cfg, keys: NewKeyManager(cfg.UpstreamAPIKeys, cfg.RetryExhaustedAfter), client: &http.Client{Transport: &http.Transport{Proxy: http.ProxyFromEnvironment, DialContext: (&net.Dialer{Timeout: 10 * time.Second, KeepAlive: 30 * time.Second}).DialContext, TLSHandshakeTimeout: 10 * time.Second, ResponseHeaderTimeout: cfg.UpstreamResponseHeaderTimeout, ExpectContinueTimeout: 2 * time.Second}}, sender: NewSMTPNotifier(cfg.SMTP), usage: newUsageCache(), logger: slog.New(slog.NewJSONHandler(os.Stderr, nil)), cooldowns: newTierCooldowns()}
 }
 
 func (a *App) ServeHTTP(w http.ResponseWriter, r *http.Request) {
