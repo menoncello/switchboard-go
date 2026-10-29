@@ -3,7 +3,7 @@ title: 'Aviso no Telegram quando todos os tiers falham'
 type: 'feature'
 ticket: 10
 created: '2026-10-29'
-status: 'built'
+status: 'done'
 baseline_revision: '5ab66f8a517b4dd61ae220348053a7751a535bb5'
 route: 'full'
 route_source: 'auto'
@@ -96,3 +96,43 @@ Episódio = intervalo entre dois sucessos de qualquer tier. Resposta 400 devolvi
 - Follow-up recomendado: não.
 - Verificação: `go build`, `go vet` e `go test -race -count=1 ./...` passam, antes e depois dos patches.
 - Risco residual: não testado contra a API real do Telegram (formato de erro); aviso perdido se o envio falhar, sem retry, como definido no plano.
+
+## Code Review
+
+### 2026-10-29 — 0 decision-needed, 6 patch, 0 defer, 15 rejected
+
+- [ ] [Review][Patch] Teste: rearme quando o tier 0 atende após uma falha [proxy.go:153]
+- [ ] [Review][Patch] Teste: cancelamento do cliente não envia aviso nem consome o episódio [proxy.go:159]
+- [ ] [Review][Patch] Teste: `newApp` com `Telegram` na config envia sem sobrescrever `app.telegram` [server.go:46]
+- [ ] [Review][Patch] Teste: `telegram_configured=false` com só um dos dois campos [config.go:499]
+- [ ] [Review][Patch] Teste: resposta 4xx de upstream que não é falha de tier rearma; gatilho do SMTP segue igual com Telegram ligado [proxy.go:150]
+- [ ] [Review][Patch] `bot_token` e `chat_id` sem `strings.TrimSpace` (`state_file` já é aparado) [config.go:268]
+
+#### Rejected
+- Aviso perdido se o envio falha (2 achados): o plano aceita sem retry; rearmar na falha dispararia um envio por request.
+- Ponteiro nil em `App.telegram`: falso, nenhum `App{}` literal fora de `newApp`.
+- Mutex a cada sucesso: custo desprezível.
+- Telegram pela metade sem aviso: `telegram_configured=false` já aparece no resumo.
+- Mensagem pobre, sem aviso de recuperação nem /status: fora do escopo.
+- `truncateModel` com pânico: falso, o modelo vem de JSON decodificado (UTF-8 válido).
+- Detalhes de `send` (client novo, globais nos testes): low sem impacto.
+- Checkboxes do plano e dica de `chat_id` na doc: low.
+- Episódio global rearmado por outro modelo: é o contrato ("algum tier atende").
+- Token com `/`, `?` na URL: falso, tokens do Telegram são `[0-9]+:[A-Za-z0-9_-]+`.
+- Espera fixa de 300ms em assertivas negativas: inerente a checar ausência.
+
+### 2026-10-29 (2ª rodada) — 0 decision-needed, 5 patch, 0 defer, 14 rejected
+
+- [x] [Review][Patch] Envio falho rearma o episódio: `send` devolve bool e `notifyFailure` chama `rearm()` quando falha (decidido: opção 2) [telegram.go:notifyFailure]
+- [x] [Review][Patch] Teste: rearme quando o tier 0 atende após uma falha [proxy.go:153]
+- [x] [Review][Patch] Teste: cancelamento do cliente não envia aviso nem consome o episódio [proxy.go:159]
+- [x] [Review][Patch] Teste: `newApp` com `Telegram` na config liga `app.telegram` sem sobrescrever [server.go:46]
+- [x] [Review][Patch] Docs: reinício começa armado, envio falho não é repetido, resposta 4xx do upstream também rearma [docs/configuration.md]
+
+#### Rejected
+- Ponteiro nil em `App.telegram`: falso, único `App{}` literal é `newApp` (server.go:46).
+- Flapping/rearme por sucesso de outro modelo (2 achados): é o contrato do ticket; intervalo mínimo exige estado novo.
+- Token/chat_id sem trim (2 achados): scalars YAML já vêm aparados, só aspas explícitas escapam; rara.
+- Mensagem sem contexto, log global vs slog, startup sem `telegram_configured`: low/cosmético.
+- Aviso perdido no shutdown: rara, exigiria WaitGroup.
+- Espera de 300ms em assertivas negativas, teste -race concorrente, chat_id negativo: low.
