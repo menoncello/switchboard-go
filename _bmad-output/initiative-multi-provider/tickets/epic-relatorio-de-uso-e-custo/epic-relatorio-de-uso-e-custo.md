@@ -3,7 +3,7 @@ id: 3
 type: epic
 title: "O Eduardo sabe quanto cada projeto e modelo usou e custou"
 parent: initiative-multi-provider
-covers: [R, 1, 3, ,,  , R, 1, 4]
+covers: [R5, R13, R14]
 sources: []
 companions: []
 after: []
@@ -15,7 +15,7 @@ risk: medium
 
 ## Description
 
-Um relatório agrega uso e custo por dia, projeto, modelo, chave e tier, e a página de status o mostra. O projeto vem do cabeçalho opcional `X-Project`, que o proxy consome e não repassa ao upstream. O custo vem de uma tabela de preços na config, preenchida à mão; sem preço, o relatório mostra só tokens. Estende o log do roteamento com projeto e tokens e é dono do histórico de uso e da tabela de preços.
+Um relatório agrega uso e custo por dia, projeto, modelo, chave e tier, e a página de status o mostra. O projeto vem do cabeçalho opcional `X-Project`, que o proxy consome e não repassa ao upstream. O custo vem de uma tabela de preços na config, preenchida à mão; sem preço, o relatório mostra só tokens. Estende o log do roteamento com projeto e tokens e é dono do histórico de uso, da tabela de preços e do teto diário em dinheiro dos tiers pagos: config de tier pago sem teto é rejeitada na partida, o tier é pulado ao atingir o teto e o primeiro uso dispara o alerta SMTP. O gasto do dia sobrevive a reinício.
 
 ## Outcome
 
@@ -27,6 +27,7 @@ Para o Eduardo: saber o uso e o gasto por projeto e modelo; o sinal é o relató
 - O custo em dinheiro aparece onde a tabela tem preço; onde não tem, só tokens.
 - Uma request sem `X-Project` entra como "sem projeto"; o cabeçalho não chega ao upstream e o valor respeita o limite de tamanho e caracteres.
 - O histórico de uso permanece depois de reiniciar o proxy.
+- Um tier pago só é aceito com teto diário em dinheiro; o tier é pulado ao atingir o teto, o gasto do dia sobrevive a reinício e o primeiro uso dispara o alerta SMTP.
 - A página de status mostra o relatório.
 
 ## Boundaries
@@ -43,3 +44,4 @@ Para o Eduardo: saber o uso e o gasto por projeto e modelo; o sinal é o relató
 ## Notes
 
 - Open question: o Hermes consegue mandar o cabeçalho `X-Project`? Sem isso o relatório por projeto fica vazio.
+- Decision (2026-10-29): R5 (teto diário) e a parte de R10 sobre o gasto do dia vieram do épico de roteamento; o teto é em dinheiro, não em requests, e tiers pagos só entram depois dele.

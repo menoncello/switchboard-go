@@ -3,7 +3,7 @@ id: 4
 type: epic
 title: "O Eduardo recebe propostas de modelos e limites novos"
 parent: initiative-multi-provider
-covers: [R, 9]
+covers: [R9]
 sources: []
 companions: []
 after: []

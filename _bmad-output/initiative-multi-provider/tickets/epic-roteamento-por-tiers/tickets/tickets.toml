@@ -1,0 +1,100 @@
+# Stories do épico roteamento-por-tiers, em ordem de construção. Uma trilha só: tudo mexe em KeyManager e proxyV1.
+
+[[entry]]
+id = 1
+type = "story"
+title = "Separar main.go em arquivos do package main"
+description = "Divide main.go em arquivos por responsabilidade (config, chaves, proxy, notificação SMTP, servidor) dentro do package main, sem pacotes novos, sem interfaces novas e sem mudar comportamento."
+verify = "go build e go test passam sem alterar nenhum teste existente, e main.go fica só com main() e a montagem do servidor."
+covers = ["R4"]
+after = []
+hitl = false
+risk = "low"
+
+[[entry]]
+id = 2
+type = "story"
+title = "Failover do tier 0 para um tier extra com mapa de modelos"
+description = "Tracer: lista tiers: na config (a config atual vira o tier 0 implícito) e, com todas as chaves do tier 0 esgotadas, a request segue ao tier 1, com o campo model reescrito pelo mapa do tier; o tier sem mapeamento para o modelo é pulado. Só tiers com free: true."
+verify = "go test com dois upstreams httptest: com o tier 0 devolvendo 429 de cota em todas as chaves, uma request com modelo mapeado é atendida pelo tier 1 com o modelo reescrito, e uma com modelo sem mapeamento volta o 429 local de todas esgotadas. Uma config sem tiers: se comporta como hoje."
+covers = ["R1", "R2", "R4", "R6"]
+after = [1]
+hitl = false
+risk = "high"
+
+[[entry]]
+id = 3
+type = "story"
+title = "Log estruturado por request"
+description = "Cada request grava uma linha de log com modelo, estilo de API, chave ou tier, status e latência, sem o valor de nenhuma chave."
+verify = "go test cobre uma request atendida pelo tier 0 e outra pelo tier 1 e confere os cinco campos na linha de log e a ausência do valor das chaves. Com o proxy rodando, uma request do Hermes mostra seu estilo real no log."
+covers = ["R11"]
+after = [2]
+hitl = false
+risk = "low"
+
+[[entry]]
+id = 4
+type = "story"
+title = "Failover por falha do upstream, com cooldown por tier"
+description = "401, 402, 404, 5xx, 429 e erro de conexão ou timeout antes do primeiro byte colocam o tier em cooldown (campo cooldown por tier, padrão retry_exhausted_after) e a request segue ao próximo tier; 400 volta ao cliente; depois do primeiro byte não há failover. Uma config com tier sem free: true é rejeitada na partida."
+verify = "go test cobre cada status e o erro de conexão com um upstream que falha e outro que atende, 400 voltando ao cliente sem cooldown, um stream já iniciado que não troca de tier, e validate-config rejeitando um tier sem free: true."
+covers = ["R6", "R7"]
+after = [2]
+hitl = false
+risk = "high"
+
+[[entry]]
+id = 5
+type = "story"
+title = "Estilos de API por tier"
+description = "Cada tier declara os estilos que fala (OpenAI, Anthropic); o tier é pulado se não fala o do request, e a autenticação segue o estilo do tier (x-api-key para Anthropic, Bearer para OpenAI)."
+verify = "go test: uma request Anthropic com o tier 0 esgotado pula um tier que só fala OpenAI e é atendida por um que fala Anthropic, com x-api-key; sem nenhum tier compatível, volta o 429 local no formato Anthropic."
+covers = ["R3"]
+after = [4]
+hitl = false
+risk = "medium"
+
+[[entry]]
+id = 6
+type = "story"
+title = "Elegibilidade por contexto mínimo e tool calling"
+description = "Cada entrada do mapa de modelos declara contexto e suporte a tool calling; a config tem um mínimo global, e um modelo abaixo dele não é elegível naquele tier."
+verify = "go test: um modelo mapeado com contexto abaixo do mínimo, ou sem tool calling, faz o tier ser pulado; um que atinge o mínimo é atendido."
+covers = ["R8"]
+after = [4]
+hitl = false
+risk = "medium"
+
+[[entry]]
+id = 7
+type = "story"
+title = "Persistir o cooldown dos tiers"
+description = "O cooldown de cada tier e de cada chave do tier 0 é gravado em JSON local com escrita atômica e carregado na partida; um cooldown vencido não é restaurado."
+verify = "go test: um tier em cooldown continua em cooldown depois de recriar o app a partir do arquivo, um vencido volta elegível, e uma falha de escrita não derruba a request. Com o proxy rodando, reiniciar mantém o cooldown visível em /status."
+covers = ["R10"]
+after = [4]
+hitl = false
+risk = "medium"
+
+[[entry]]
+id = 8
+type = "story"
+title = "Seção de tiers na página /status"
+description = "A página /status mostra cada tier com estado e cooldown, sem o valor de nenhuma chave; o uso do dia entra com o épico de relatório."
+verify = "go test: /status sem chave devolve a seção de tiers com um tier em cooldown e o tempo restante, e o corpo não contém o valor de nenhuma chave nem de tier. Com o proxy rodando, a seção aparece abaixo das chaves."
+covers = ["R10", "R11"]
+after = [4, 7, "1.1"]
+hitl = false
+risk = "low"
+
+[[entry]]
+id = 9
+type = "story"
+title = "Refactor sweep"
+description = "Limpeza do que as stories deixaram para trás, a partir dos planos e achados de revisão que o épico adiou; só cleanup, escopo novo vira story."
+verify = "go build e go test passam, sem comportamento novo, e cada item varrido está nos planos ou achados do épico."
+covers = []
+after = [3, 5, 6, 8]
+hitl = false
+risk = "low"
