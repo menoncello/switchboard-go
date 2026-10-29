@@ -176,6 +176,9 @@ func convertTiers(in []yamlTier) ([]TierConfig, error) {
 				if err := n.Content[j+1].Decode(&v); err != nil {
 					return nil, fmt.Errorf("parse tiers[%d].models: %w", i, err)
 				}
+				if v.ID == "" {
+					v.ID = n.Content[j].Value
+				}
 				t.Models = append(t.Models, TierModel{Name: n.Content[j].Value, ID: v.ID, Context: v.Context, Tools: v.Tools})
 			}
 		default:
@@ -393,13 +396,14 @@ func validateConfig(cfg Config) error {
 func validateTiers(tiers []TierConfig) error {
 	names := map[string]bool{}
 	for i, t := range tiers {
-		if strings.TrimSpace(t.Name) == "" {
+		name := strings.TrimSpace(t.Name)
+		if name == "" {
 			return fmt.Errorf("tiers[%d]: name is required", i)
 		}
-		if names[t.Name] {
+		if names[name] {
 			return fmt.Errorf("tier %q: duplicate name", t.Name)
 		}
-		names[t.Name] = true
+		names[name] = true
 		if strings.TrimSpace(t.BaseURL) == "" {
 			return fmt.Errorf("tier %q: base_url is required", t.Name)
 		}

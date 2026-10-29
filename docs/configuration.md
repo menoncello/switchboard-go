@@ -102,7 +102,7 @@ validates them; routing comes later.
 | `api_key` | Yes | Tier key. Never printed by `validate-config` or in logs. |
 | `free` | Yes | Must be `true`. A tier without `free: true` is rejected at startup. |
 | `styles` | No | List of `openai` and/or `anthropic`. Absent means OpenAI only. |
-| `models` | Yes | Map of model name to an object with `id`, and optional `context` (>= 0) and `tools`. At least one; names must be unique. |
+| `models` | Yes | Map of model name to an object with optional `id` (defaults to the model name), `context` (>= 0) and `tools`. At least one; names must be unique. |
 
 `validate-config` shows only the number of tiers (`tiers=N`).
 

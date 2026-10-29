@@ -1364,6 +1364,17 @@ func TestLoadConfigTiers(t *testing.T) {
 	}
 }
 
+func TestLoadConfigTierModelIDDefaultsToName(t *testing.T) {
+	tiersYAML(t, "tiers:\n"+strings.Replace(tierOK, "{id: x/m1, context: 100, tools: true}", "{context: 100}", 1))
+	cfg, err := loadConfig()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if m := cfg.Tiers[0].Models[0]; m.ID != "m1" {
+		t.Fatalf("ID = %q, want m1", m.ID)
+	}
+}
+
 func TestLoadConfigWithoutTiers(t *testing.T) {
 	tiersYAML(t, "")
 	cfg, err := loadConfig()
@@ -1374,16 +1385,19 @@ func TestLoadConfigWithoutTiers(t *testing.T) {
 
 func TestLoadConfigTiersRejected(t *testing.T) {
 	cases := map[string]struct{ tier, want string }{
-		"paid":          {strings.Replace(tierOK, "free: true", "free: false", 1), "free must be true"},
-		"free absent":   {strings.Replace(tierOK, "    free: true\n", "", 1), "free must be true"},
-		"no base_url":   {strings.Replace(tierOK, "base_url: https://a", "base_url: \"\"", 1), "base_url is required"},
-		"no api_key":    {strings.Replace(tierOK, "api_key: secret-a", "api_key: \"\"", 1), "api_key is required"},
-		"no name":       {strings.Replace(tierOK, "name: a", "name: \"\"", 1), "name is required"},
-		"dup tier name": {tierOK + tierOK, "duplicate name"},
-		"dup model":     {tierOK + "      m1: {id: x/other}\n", "duplicate model"},
-		"bad style":     {tierOK + "    styles: [grpc]\n", "unknown style"},
-		"no models":     {strings.Replace(tierOK, "    models:\n      m1: {id: x/m1, context: 100, tools: true}\n", "", 1), "at least one model"},
-		"neg context":   {strings.Replace(tierOK, "context: 100", "context: -1", 1), "context must be >= 0"},
+		"paid":             {strings.Replace(tierOK, "free: true", "free: false", 1), "free must be true"},
+		"free absent":      {strings.Replace(tierOK, "    free: true\n", "", 1), "free must be true"},
+		"no base_url":      {strings.Replace(tierOK, "base_url: https://a", "base_url: \"\"", 1), "base_url is required"},
+		"no api_key":       {strings.Replace(tierOK, "api_key: secret-a", "api_key: \"\"", 1), "api_key is required"},
+		"no name":          {strings.Replace(tierOK, "name: a", "name: \"\"", 1), "name is required"},
+		"dup tier name":    {tierOK + tierOK, "duplicate name"},
+		"dup model":        {tierOK + "      m1: {id: x/other}\n", "duplicate model"},
+		"bad style":        {tierOK + "    styles: [grpc]\n", "unknown style"},
+		"no models":        {strings.Replace(tierOK, "    models:\n      m1: {id: x/m1, context: 100, tools: true}\n", "", 1), "at least one model"},
+		"neg context":      {strings.Replace(tierOK, "context: 100", "context: -1", 1), "context must be >= 0"},
+		"scalar model":     {strings.Replace(tierOK, "{id: x/m1, context: 100, tools: true}", "5", 1), "parse tiers[0].models"},
+		"models not map":   {strings.Replace(tierOK, "    models:\n      m1: {id: x/m1, context: 100, tools: true}\n", "    models: [a]\n", 1), "must be a map"},
+		"dup name trimmed": {tierOK + strings.Replace(tierOK, "name: a", "name: \"a \"", 1), "duplicate name"},
 	}
 	for name, c := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -1391,6 +1405,9 @@ func TestLoadConfigTiersRejected(t *testing.T) {
 			_, err := loadConfig()
 			if err == nil {
 				t.Fatal("expected error")
+			}
+			if !strings.Contains(err.Error(), c.want) {
+				t.Fatalf("err = %v, want containing %q", err, c.want)
 			}
 			if strings.Contains(err.Error(), "secret-a") {
 				t.Fatalf("error leaks api_key: %v", err)
