@@ -103,6 +103,10 @@ func (a *App) serveProxy(w http.ResponseWriter, r *http.Request, style APIStyle)
 	}
 	_ = r.Body.Close()
 	fields, model := topLevelModel(body)
+	// A key with null or an empty array is not asking for tools.
+	var tools []json.RawMessage
+	_ = json.Unmarshal(fields["tools"], &tools)
+	needTools := len(tools) > 0
 	orig := r.Context()
 	var last heldResponse
 	defer last.release()
@@ -144,7 +148,7 @@ func (a *App) serveProxy(w http.ResponseWriter, r *http.Request, style APIStyle)
 			return model, tier0Name, idx
 		}
 	}
-	if name, ok := a.proxyTiers(orig, w, r, fields, model, style, &last); ok {
+	if name, ok := a.proxyTiers(orig, w, r, fields, model, style, needTools, &last); ok {
 		return model, name, -1
 	}
 	if orig.Err() != nil {
@@ -165,7 +169,7 @@ func (a *App) serveProxy(w http.ResponseWriter, r *http.Request, style APIStyle)
 	}
 	// No eligible tier remains. Fail fast locally instead of hammering upstream,
 	// and hint well-behaved clients at the first window via Retry-After.
-	if secs, ok := a.localRetryAfter(model, style); ok {
+	if secs, ok := a.localRetryAfter(model, style, needTools); ok {
 		w.Header().Set("Retry-After", strconv.Itoa(secs))
 	}
 	writeAPIError(w, style, http.StatusTooManyRequests, "rate_limit_exceeded", "all upstream keys exhausted")
@@ -197,9 +201,9 @@ func (h *heldResponse) release() {
 
 // localRetryAfter is the seconds until the first eligible tier is tried again:
 // tier 0 (its tier cooldown or, without one, its exhausted keys) and the extra
-// tiers that map model and style and are in cooldown. False when tier 0 has no
+// tiers that are eligible for model, style, context and tools and are in cooldown. False when tier 0 has no
 // known time (nothing to promise).
-func (a *App) localRetryAfter(model string, style APIStyle) (int, bool) {
+func (a *App) localRetryAfter(model string, style APIStyle, needTools bool) (int, bool) {
 	soonest := a.cooldowns.remaining(tier0CooldownKey)
 	if soonest <= 0 {
 		secs, ok := a.keys.RetryAfterSeconds()
@@ -210,7 +214,7 @@ func (a *App) localRetryAfter(model string, style APIStyle) (int, bool) {
 	}
 	if model != "" {
 		for _, t := range a.config.Tiers {
-			if _, ok := tierModelID(t, model, style); !ok {
+			if _, ok := tierModelID(t, model, style, a.config.MinContext, needTools); !ok {
 				continue
 			}
 			if d := a.cooldowns.remaining(t.Name); d > 0 && d < soonest {
@@ -243,18 +247,18 @@ func isTierFailure(resp *http.Response, hasModel bool) bool {
 	return false
 }
 
-// proxyTiers tries the configured tiers in order after tier 0 failed or was
+// proxyTiers tries the eligible configured tiers (see tierModelID) in order after tier 0 failed or was
 // skipped and returns the name of the tier that answered and whether one did (the
 // name is empty when none did). A tier that fails with a response is put in
 // cooldown and its response kept in last; a connection error or timeout only
 // records the error in last and moves on, with no cooldown. A request without a top-level string
 // "model" stays on tier 0.
-func (a *App) proxyTiers(ctx context.Context, w http.ResponseWriter, r *http.Request, fields map[string]json.RawMessage, model string, style APIStyle, last *heldResponse) (string, bool) {
+func (a *App) proxyTiers(ctx context.Context, w http.ResponseWriter, r *http.Request, fields map[string]json.RawMessage, model string, style APIStyle, needTools bool, last *heldResponse) (string, bool) {
 	if model == "" {
 		return "", false
 	}
 	for _, t := range a.config.Tiers {
-		id, ok := tierModelID(t, model, style)
+		id, ok := tierModelID(t, model, style, a.config.MinContext, needTools)
 		if !ok || a.cooldowns.remaining(t.Name) > 0 {
 			continue
 		}
@@ -298,13 +302,17 @@ func topLevelModel(body []byte) (map[string]json.RawMessage, string) {
 	return fields, model
 }
 
-// tierModelID returns the upstream model ID for model when the tier speaks style and maps it.
-func tierModelID(t TierConfig, model string, style APIStyle) (string, bool) {
+// tierModelID returns the upstream model ID for model when the tier speaks style,
+// maps it, and the mapped model declares at least minContext and, if needTools, tool calling.
+func tierModelID(t TierConfig, model string, style APIStyle, minContext int, needTools bool) (string, bool) {
 	if !slices.Contains(t.Styles, style) {
 		return "", false
 	}
 	for _, m := range t.Models {
 		if m.Name == model {
+			if m.Context < minContext || (needTools && !m.Tools) {
+				return "", false
+			}
 			if m.ID != "" {
 				return m.ID, true
 			}

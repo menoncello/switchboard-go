@@ -2486,3 +2486,74 @@ func TestFailoverRetryAfterFromExhaustedKeysWithoutTierCooldown(t *testing.T) {
 		t.Fatalf("RA=%q", rec.Header().Get("Retry-After"))
 	}
 }
+
+func TestLoadConfigMinContext(t *testing.T) {
+	for name, c := range map[string]struct {
+		yaml string
+		want int
+	}{"omitted": {"", 64000}, "zero": {"min_context: 0\n", 0}, "explicit": {"min_context: 128000\n", 128000}} {
+		t.Run(name, func(t *testing.T) {
+			tiersYAML(t, c.yaml)
+			cfg, err := loadConfig()
+			if err != nil || cfg.MinContext != c.want {
+				t.Fatalf("min_context=%d err=%v, want %d", cfg.MinContext, err, c.want)
+			}
+		})
+	}
+	tiersYAML(t, "min_context: -1\n")
+	if _, err := loadConfig(); err == nil || !strings.Contains(err.Error(), "min_context must be >= 0") {
+		t.Fatalf("err = %v", err)
+	}
+}
+
+func TestTierEligibilityByContextAndTools(t *testing.T) {
+	const plain, withTools = `{"model":"a"}`, `{"model":"a","tools":[{"type":"function"}]}`
+	for name, c := range map[string]struct {
+		minCtx, ctx int
+		tools       bool
+		body        string
+		served      bool
+	}{
+		"context below minimum":       {1000, 999, true, plain, false},
+		"context undeclared":          {1000, 0, true, plain, false},
+		"context at minimum":          {1000, 1000, true, plain, true},
+		"tools needed, model without": {1000, 1000, false, withTools, false},
+		"tools needed, model has":     {1000, 1000, true, withTools, true},
+		"no tools, model without":     {1000, 1000, false, plain, true},
+		"empty tools array":           {1000, 1000, false, `{"model":"a","tools":[]}`, true},
+		"null tools":                  {1000, 1000, false, `{"model":"a","tools":null}`, true},
+		"floor off, context 0":        {0, 0, true, plain, true},
+		"floor off, tools still":      {0, 0, false, withTools, false},
+	} {
+		t.Run(name, func(t *testing.T) {
+			f := newTierFixture(t, false, false)
+			f.app.config.Tiers = f.app.config.Tiers[:1]
+			f.app.config.MinContext = c.minCtx
+			f.app.config.Tiers[0].Models = []TierModel{{Name: "a", ID: "id-a", Context: c.ctx, Tools: c.tools}}
+			rec := tierReq(f.app, http.MethodPost, "/v1/chat/completions", c.body, nil)
+			want, hits := http.StatusTooManyRequests, int32(0)
+			if c.served {
+				want, hits = http.StatusOK, 1
+			}
+			if rec.Code != want || f.hits()[1] != hits {
+				t.Fatalf("code=%d hits=%v", rec.Code, f.hits())
+			}
+		})
+	}
+}
+
+func TestLocalRetryAfterIgnoresIneligibleTier(t *testing.T) {
+	f := newTierFixture(t, false, false)
+	f.app.config.Tiers = f.app.config.Tiers[:1]
+	f.app.config.MinContext = 1000
+	f.app.config.Tiers[0].Models = []TierModel{{Name: "a", ID: "id-a", Context: 10, Tools: true}}
+	tierReq(f.app, http.MethodPost, "/v1/chat/completions", `{"model":"z"}`, nil) // exhaust tier 0
+	f.app.cooldowns.set("t1", 10*time.Second)
+	if secs, ok := f.app.localRetryAfter("a", APIStyleOpenAI, false); !ok || secs < 60 {
+		t.Fatalf("ineligible tier counted: %d %v", secs, ok)
+	}
+	f.app.config.Tiers[0].Models[0].Context = 1000
+	if secs, ok := f.app.localRetryAfter("a", APIStyleOpenAI, false); !ok || secs != 10 {
+		t.Fatalf("eligible tier ignored: %d %v", secs, ok)
+	}
+}

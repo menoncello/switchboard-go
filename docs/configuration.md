@@ -74,6 +74,10 @@ smtp:
 limits:
   max_request_body_bytes: 20971520
 
+# Smallest declared context a tier model needs to be eligible (default 64000;
+# 0 turns the floor off).
+min_context: 64000
+
 tiers:
   - name: "free-provider"
     base_url: "https://api.example.com/v1"
@@ -142,7 +146,7 @@ and only when every tier 0 key is exhausted. To try it by hand, run
 | `free` | Yes | Must be `true`. A tier without `free: true` is rejected at startup. |
 | `styles` | No | List of `openai` and/or `anthropic`. Absent means OpenAI only. |
 | `cooldown` | No | Duration (`time.ParseDuration`, for example `10m`, >= 0) the tier is skipped after a failure. Absent means `retry_exhausted_after`; `0` means no cooldown. |
-| `models` | Yes | Map of model name to an object with optional `id` (defaults to the model name), `context` (>= 0) and `tools`. At least one; names must be unique. |
+| `models` | Yes | Map of model name to an object with optional `id` (defaults to the model name), `context` (>= 0, the context window in tokens; absent counts as 0) and `tools` (`true` when the model supports tool calling; absent is `false`). At least one; names must be unique. |
 
 `validate-config` shows only the number of tiers (`tiers=N`).
 
@@ -161,6 +165,21 @@ with a connection error or timeout (that case is a `502`), the client gets the
 local `429` (see above), in the request's own error format. A provider that
 serves the two styles at different URLs is two tiers, each with its own
 `base_url`.
+
+### Eligibility
+
+A mapped model only serves a request on its tier when it is eligible:
+
+- `context` must be at least the top-level `min_context` (default `64000`, only
+  from the YAML file, no environment variable). A model with no `context` counts
+  as `0` and is not eligible. `min_context: 0` turns the floor off; a negative
+  value is rejected at startup.
+- When the request body has a non-empty `tools`, the model must have
+  `tools: true`. A request without `tools` (or with `tools: []` or `null`) does
+  not need it. The request is never changed: `tools` is not stripped.
+
+An ineligible tier is skipped like a tier that does not map the model or the
+style, and `Retry-After` does not count it. Tier 0 is exempt from both checks.
 
 ## Request log
 

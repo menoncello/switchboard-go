@@ -40,6 +40,10 @@ type Config struct {
 
 	SMTP SMTPConfig
 
+	// MinContext is the smallest declared context window a tier model needs to be
+	// eligible (tier 0 is exempt); 0 turns the floor off.
+	MinContext int
+
 	// Tiers are extra free upstreams for failover; the upstream above is the
 	// implicit tier 0 and is not listed here.
 	Tiers []TierConfig
@@ -90,7 +94,7 @@ func loadConfig() (Config, error) {
 }
 
 func defaultConfig() Config {
-	return Config{ListenAddr: ":8080", UpstreamBaseURL: "https://opencode.ai/zen/go/v1", MaxRequestBodyBytes: 20 << 20, RetryExhaustedAfter: 5 * time.Minute, UpstreamResponseHeaderTimeout: 30 * time.Second, UsageURL: defaultUsageURL, UsageCacheTTL: defaultUsageCacheTTL, SMTP: SMTPConfig{Port: 25}}
+	return Config{ListenAddr: ":8080", UpstreamBaseURL: "https://opencode.ai/zen/go/v1", MaxRequestBodyBytes: 20 << 20, RetryExhaustedAfter: 5 * time.Minute, MinContext: 64000, UpstreamResponseHeaderTimeout: 30 * time.Second, UsageURL: defaultUsageURL, UsageCacheTTL: defaultUsageCacheTTL, SMTP: SMTPConfig{Port: 25}}
 }
 
 func resolveConfigPath() (string, bool, error) {
@@ -138,7 +142,8 @@ type yamlConfig struct {
 	Limits struct {
 		MaxRequestBodyBytes int64 `yaml:"max_request_body_bytes"`
 	} `yaml:"limits"`
-	Tiers []yamlTier `yaml:"tiers"`
+	MinContext *int       `yaml:"min_context"`
+	Tiers      []yamlTier `yaml:"tiers"`
 }
 
 type yamlTier struct {
@@ -236,11 +241,18 @@ func loadYAMLConfig(path string) (Config, error) {
 		}
 		headerTimeout = d
 	}
+	minContext := -1 // not present in file: keep the default
+	if yc.MinContext != nil {
+		if *yc.MinContext < 0 {
+			return Config{}, fmt.Errorf("min_context must be >= 0")
+		}
+		minContext = *yc.MinContext
+	}
 	tiers, err := convertTiers(yc.Tiers)
 	if err != nil {
 		return Config{}, err
 	}
-	return Config{Tiers: tiers, ListenAddr: yc.Server.ListenAddr, UpstreamBaseURL: yc.Upstream.BaseURL, ProxyAPIKey: yc.Server.ProxyAPIKey, UpstreamAPIKeys: yc.Upstream.APIKeys, MaxRequestBodyBytes: yc.Limits.MaxRequestBodyBytes, RetryExhaustedAfter: retry, UpstreamResponseHeaderTimeout: headerTimeout, SMTP: SMTPConfig{Host: yc.SMTP.Host, Port: yc.SMTP.Port, Username: yc.SMTP.Username, Password: yc.SMTP.Password, From: yc.SMTP.From, To: yc.SMTP.To, TLS: yc.SMTP.TLS, StartTLS: yc.SMTP.StartTLS}}, nil
+	return Config{Tiers: tiers, MinContext: minContext, ListenAddr: yc.Server.ListenAddr, UpstreamBaseURL: yc.Upstream.BaseURL, ProxyAPIKey: yc.Server.ProxyAPIKey, UpstreamAPIKeys: yc.Upstream.APIKeys, MaxRequestBodyBytes: yc.Limits.MaxRequestBodyBytes, RetryExhaustedAfter: retry, UpstreamResponseHeaderTimeout: headerTimeout, SMTP: SMTPConfig{Host: yc.SMTP.Host, Port: yc.SMTP.Port, Username: yc.SMTP.Username, Password: yc.SMTP.Password, From: yc.SMTP.From, To: yc.SMTP.To, TLS: yc.SMTP.TLS, StartTLS: yc.SMTP.StartTLS}}, nil
 }
 
 func mergeConfig(dst *Config, src Config) {
@@ -261,6 +273,9 @@ func mergeConfig(dst *Config, src Config) {
 	}
 	if src.RetryExhaustedAfter >= 0 {
 		dst.RetryExhaustedAfter = src.RetryExhaustedAfter
+	}
+	if src.MinContext >= 0 {
+		dst.MinContext = src.MinContext
 	}
 	if src.UpstreamResponseHeaderTimeout >= 0 {
 		dst.UpstreamResponseHeaderTimeout = src.UpstreamResponseHeaderTimeout
@@ -397,6 +412,9 @@ func validateConfig(cfg Config) error {
 	}
 	if cfg.RetryExhaustedAfter < 0 {
 		return errors.New("RETRY_EXHAUSTED_AFTER must be >= 0")
+	}
+	if cfg.MinContext < 0 {
+		return errors.New("min_context must be >= 0")
 	}
 	if cfg.UpstreamResponseHeaderTimeout < 0 {
 		return errors.New("UPSTREAM_RESPONSE_HEADER_TIMEOUT must be >= 0")
