@@ -3,7 +3,7 @@ title: "Failover por status do upstream, com cooldown por tier"
 type: 'feature'
 ticket: 4
 created: '2026-10-29'
-status: built
+status: done
 baseline_revision: 'c3ac27d8b194518373288a501bab18723a1adbf0'
 route: 'full'
 route_source: 'auto'
@@ -107,3 +107,23 @@ Retenção da última resposta: `last *http.Response` com `lastTier`/`lastKey`; 
 **Commands:**
 - `go build ./... && go vet ./...` -- expected: sem erros
 - `go test -race -count=1 ./...` -- expected: todos passam, incluindo os novos
+
+## Code Review
+
+### 2026-10-29
+0 `decision-needed`, 3 `patch`, 1 `defer`, 24 rejected.
+
+- [x] [Review][Patch] Fixar com teste o tier 0 sem `tiers:` em cooldown: tier 0 responde 500, 1ª request 500, 2ª 429 com Retry-After sem novo hit, depois do cooldown volta a chamar [main_test.go, proxy.go:131-135]
+- [x] [Review][Patch] Fixar com teste o 502 quando um tier extra está inalcançável após falha retida do tier 0 (502, tier seguinte sem hits, log status 502 tier "") [main_test.go, proxy.go:248-252]
+- [x] [Review][Patch] Corrigir a doc do alerta SMTP: dispara quando nenhum tier atende, também quando a última resposta do upstream é entregue [docs/configuration.md:128]
+- [x] [Review][Defer] 404 de modelo inexistente no tier N não segue ao próximo tier (epic R7 diz "segue ao próximo", verify da story diz "sem cooldown") [proxy.go:213-223] — deferred: severidade medium não verificada; decidir com o Eduardo se segue ao próximo tier ou volta ao cliente
+
+#### Rejected
+- Cooldown por tier trava todos os clientes (R2, R11): a spec manda cooldown do tier inteiro.
+- 401/402 deveriam girar chave (R3, R10): a spec põe o tier inteiro em cooldown.
+- localRetryAfter ignora chaves / omite Retry-After (R4, R5, R14): cooldown só é setado com chave viva; RetryAfterSeconds só dá false quando alguma chave está usável.
+- Conexão/timeout sem failover (R7, R13, R23): é a story 12 (plan "Never").
+- Heurística de 404 por substring (R8, R16): a spec exige olhar o corpo; parse JSON é complexidade (low).
+- Mensagem/alerta/doc de cooldown (R6), corpo retido (R15), stampede (R17), validateTiers duplicado (R20), teste não isola (R21): low, raros, correção cria complexidade.
+- Race em teste e `set` sobrescreve (R9): sem race (HTTP sincroniza) e mesma duração.
+- Leituras B/D/E da intenção (R24, R26, R27): implementadas de forma defensável.

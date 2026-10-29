@@ -6,3 +6,6 @@
 - `keys.go:105`, `server.go:226`: `KeyManager.AdvanceOnExhaustion` e `(*App).validateConfigAndPrint` não têm chamadores. Remover quando uma story puder mudar código.
 - `config.go:96`: `yamlConfig` não tem `usage_url` nem `usage_cache_ttl`; só por variável de ambiente.
 - `proxy.go:24`: detecção de body grande por `strings.Contains` no texto do erro; usar `errors.As` com `*http.MaxBytesError`.
+
+## Deferred from: code review of story-failover-por-status-do-upstream-com-cooldown-por-tier-plan (2026-10-29)
+- 404 de modelo inexistente em um tier não segue ao próximo tier (proxy.go:213-223). Epic R7 diz que 404 segue ao próximo; o verify da story só pede "sem cooldown". Severidade medium não verificada; decidir a intenção resolve.
