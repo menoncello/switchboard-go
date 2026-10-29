@@ -165,6 +165,37 @@ func (m *KeyManager) RetryAfterSeconds() (int, bool) {
 	return secs, true
 }
 
+// CooldownRemaining returns the real time until the soonest key becomes eligible,
+// without RetryAfterSeconds' 1s floor, so the status page can tell an idle proxy
+// with already-elapsed cooldowns apart from a live one. ok is false when nothing is waiting.
+func (m *KeyManager) CooldownRemaining() (time.Duration, bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.cooldown <= 0 {
+		return 0, false
+	}
+	var soonest time.Time
+	found := false
+	for i := range m.keys {
+		if m.states[i] != KeyExhausted {
+			return 0, false
+		}
+		t, ok := m.last429[i]
+		if !ok {
+			return 0, false
+		}
+		eligibleAt := t.Add(m.cooldown)
+		if !found || eligibleAt.Before(soonest) {
+			soonest = eligibleAt
+			found = true
+		}
+	}
+	if d := soonest.Sub(m.now()); found && d > 0 {
+		return d, true
+	}
+	return 0, false
+}
+
 func (m *KeyManager) AllExhausted() bool {
 	m.mu.Lock()
 	defer m.mu.Unlock()

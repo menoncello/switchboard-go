@@ -262,10 +262,10 @@ func (a *App) tierRows() []tierRow {
 			rows[i].Name = "OpenCode Go (tier 0)"
 		}
 		d := a.cooldowns.remaining(n)
-		if n == tier0CooldownKey && d <= 0 {
-			// Tier 0 is also down while every key is exhausted, with no tier cooldown set.
-			if secs, ok := a.keys.RetryAfterSeconds(); ok {
-				d = time.Duration(secs) * time.Second
+		if n == tier0CooldownKey {
+			// Tier 0 is also down while every key is exhausted; the longer of the two wins.
+			if kd, ok := a.keys.CooldownRemaining(); ok && kd > d {
+				d = kd
 			}
 		}
 		if d > 0 {

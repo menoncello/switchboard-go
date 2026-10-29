@@ -1673,7 +1673,8 @@ func TestTierConnectionErrorFailsOverWithoutCooldown(t *testing.T) {
 	}
 }
 
-func TestAdminAndStatusUnchangedWithTiers(t *testing.T) {
+// The tiers section of /status is covered by TestStatusPageTiersSection.
+func TestAdminUnchangedWithTiers(t *testing.T) {
 	var hits int32
 	srv := fakeUsageServer(t, &hits)
 	cfg := Config{ProxyAPIKey: "p", UpstreamAPIKeys: []string{"sk-good-1"}, KeyNames: []string{"x"}, UsageURL: srv.URL, RetryExhaustedAfter: time.Hour}
@@ -1685,6 +1686,10 @@ func TestAdminAndStatusUnchangedWithTiers(t *testing.T) {
 		if a.Code != b.Code || a.Body.String() != b.Body.String() {
 			t.Fatalf("%s differs: %d %q vs %d %q", path, a.Code, a.Body.String(), b.Code, b.Body.String())
 		}
+	}
+	a, b := getStatusPage(plain).Body.String(), getStatusPage(tiered).Body.String()
+	if !strings.Contains(b, "<h2>Tiers</h2>") || a != b[:strings.Index(b, "<h2>Tiers</h2>")]+b[strings.Index(b, "</body>"):] {
+		t.Fatalf("/status keys part differs: %q vs %q", a, b)
 	}
 }
 
@@ -1710,12 +1715,28 @@ func TestStatusPageTiersSection(t *testing.T) {
 	if len(rows) != 5 || !strings.Contains(rows[1], "<th>Tier</th>") {
 		t.Fatalf("tiers table: %v", rows)
 	}
-	for i, want := range []string{"OpenCode Go (tier 0)</td><td>ok</td><td>—</td>", "gratis-a</td><td>cooldown</td><td>90s</td>", "gratis-b</td><td>ok</td><td>—</td>"} {
-		if !strings.Contains(rows[i+2], want) {
+	for i, want := range []string{"OpenCode Go (tier 0)</td><td>ok</td><td>—</td>", "", "gratis-b</td><td>ok</td><td>—</td>"} {
+		if want != "" && !strings.Contains(rows[i+2], want) {
 			t.Fatalf("row %d: want %q in %s", i+2, want, rows[i+2])
 		}
 	}
+	if !regexp.MustCompile(`gratis-a</td><td>cooldown</td><td>\d+s</td>`).MatchString(rows[3]) {
+		t.Fatalf("gratis-a row: %s", rows[3])
+	}
+	tier0 := func() string { return strings.Split(getStatusPage(app).Body.String(), "<h2>Tiers</h2>")[1] }
+	// a tier cooldown longer than the keys' own wins
+	app.cooldowns.set(tier0CooldownKey, 2*time.Minute)
+	if row := tier0(); !regexp.MustCompile(`tier 0\)</td><td>cooldown</td><td>(119|120)s</td>`).MatchString(row) {
+		t.Fatalf("tier 0 with tier cooldown: %s", row)
+	}
+	delete(app.cooldowns.until, tier0CooldownKey)
+	// exhausted keys whose cooldown already elapsed (idle proxy) are not a cooldown
 	app.keys.MarkExhausted(0)
+	app.keys.now = func() time.Time { return time.Now().UTC().Add(2 * time.Hour) }
+	if row := tier0(); !strings.Contains(row, "tier 0)</td><td>ok</td>") {
+		t.Fatalf("tier 0 with elapsed key cooldown: %s", row)
+	}
+	app.keys.now = func() time.Time { return time.Now().UTC() }
 	if row := strings.Split(getStatusPage(app).Body.String(), "<h2>Tiers</h2>")[1]; !regexp.MustCompile(`tier 0\)</td><td>cooldown</td><td>\d+s</td>`).MatchString(row) {
 		t.Fatalf("tier 0 with every key exhausted: %s", row)
 	}
