@@ -156,9 +156,11 @@ follows the request's style, not the tier's: `x-api-key` (plus
 `anthropic-version`, `2023-06-01` when the client sent none) for `anthropic`, and
 `Authorization: Bearer` for `openai`, so a tier that lists both authenticates
 each request the way that request expects. Tier 0 is not filtered by style. When
-no tier speaks the request's style and none returned a response, the client gets
-the local `429` (see above), in the request's own error format. A provider that serves the two styles at different
-URLs is two tiers, each with its own `base_url`.
+no tier speaks the request's style and no tier returned a response or failed
+with a connection error or timeout (that case is a `502`), the client gets the
+local `429` (see above), in the request's own error format. A provider that
+serves the two styles at different URLs is two tiers, each with its own
+`base_url`.
 
 ## Request log
 

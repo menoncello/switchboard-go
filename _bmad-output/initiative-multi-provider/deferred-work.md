@@ -9,3 +9,6 @@
 
 ## Deferred from: code review of story-failover-por-status-do-upstream-com-cooldown-por-tier-plan (2026-10-29)
 - 404 de modelo inexistente em um tier não segue ao próximo tier (proxy.go:213-223). Epic R7 diz que 404 segue ao próximo; o verify da story só pede "sem cooldown". Severidade medium não verificada; decidir a intenção resolve.
+
+## Deferred from: code review of story-estilos-de-api-por-tier-plan (2026-10-29)
+- `proxy.go:352`: `apiStyleForRequest` testa `HasPrefix(path, "/complete")` e classifica `/v1/completions` (OpenAI legado) como anthropic; a request sai com `x-api-key` e pula tiers só OpenAI. Pré-existente.

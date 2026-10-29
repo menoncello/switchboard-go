@@ -3,7 +3,7 @@ title: 'Estilos de API por tier'
 type: 'feature'
 ticket: 5
 created: '2026-10-29'
-status: 'built'
+status: 'done'
 baseline_revision: 'efe0c4920e99665090f6484db1076c213ffc9585'
 route: 'oneshot'
 route_source: 'auto'
@@ -65,3 +65,21 @@ Oneshot: o comportamento já existe (estilos em `TierConfig.Styles`, default só
 **Commands:**
 - `go build ./... && go vet ./...` -- expected: sem erros
 - `go test -race -count=1 ./...` -- expected: todos passam, incluindo os novos
+
+## Code Review
+
+### 2026-10-29
+Code review: 0 `decision-needed`, 2 `patch`, 1 `defer`, 19 rejected.
+
+- [x] [Review][Patch] Doc diz que o 429 local sai sempre que nenhum tier fala o estilo; com erro de conexão ou timeout sai 502 [docs/configuration.md:158]
+- [x] [Review][Patch] Linha da doc fora do wrap do parágrafo [docs/configuration.md:160]
+- [x] [Review][Defer] `/v1/completions` (OpenAI legado) cai no estilo anthropic pelo prefixo `/complete` [proxy.go:352] — deferred: pré-existente, já em `deferred`
+
+Rejected:
+- doc sem `styles`/default/valor inválido: falso, a tabela (l.143) e o exemplo (l.82) cobrem; `validateConfig` rejeita valor desconhecido
+- header `anthropic-*` em path OpenAI vira anthropic: falso, é a regra documentada
+- `Tiers[:1]` seria o tier 0: falso, `Tiers` são os extras; `hits()[1]==0` prova o skip
+- skip de tier não asserido: falso, `TestTierSkippedWhenStyleMissing` assere
+- 429 depende do modelo: falso, o 429 local sai também sem modelo
+- commit "feat" só com teste e doc: falso, o plano declara que `proxy.go` não muda
+- lacunas de teste (tier 0 sem filtro, versão default, detecção por header ou `/v1/complete`, Retry-After, status ignorado no teste de auth, strings opacas, ordem do fixture, 429 sem Content-Type): low, fora do verify do ticket e o fix só soma teste
