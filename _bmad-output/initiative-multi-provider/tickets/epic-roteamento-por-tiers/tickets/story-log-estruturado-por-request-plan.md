@@ -3,7 +3,7 @@ title: "Log estruturado por request"
 type: 'feature'
 ticket: 3
 created: '2026-10-29'
-status: built
+status: done
 baseline_revision: 'ff46ba12ab3f4c66d8950527fa5d414b5dff8213'
 route: 'full'
 route_source: 'auto'
@@ -108,3 +108,27 @@ deferred: []
 **Commands:**
 - `go build ./... && go vet ./...` -- expected: sem erros
 - `go test -race ./...` -- expected: todos passam, incluindo os testes novos
+
+## Code Review
+
+### 2026-10-29
+Code review: 0 decision-needed, 4 patch, 0 defer, 17 rejected. Lenses: blind-hunter, edge-case-hunter, verification-gap, intent-alignment.
+
+- [x] [Review][Patch] Teste do 413 não fixa `MaxBytesReader` no writer original (recorder não tem `requestTooLarge`); usar `httptest.NewServer` e afirmar `resp.Close` [main_test.go:TestRequestBodyTooLargeStill413]
+- [x] [Review][Patch] Nenhum teste afirma `key_index:0` e `key_name` na linha de log (trocar `>= 0` por `> 0` passa); servir uma request pela chave 0 com nome [main_test.go:TestRequestLogTier0AndTier1, proxy.go:68]
+- [x] [Review][Patch] `docs/configuration.md` `## Request log` não cita as linhas 413/400, que saem com `model` e `tier` vazios [docs/configuration.md:121]
+- [x] [Review][Patch] `model` é logado sem limite de tamanho (cliente autenticado pode inflar a linha até o limite do corpo); truncar [proxy.go:67]
+
+#### Rejected
+- Stream truncado/abortado e panic: status 200 é o que o cliente recebeu; corrigir exige mudar a assinatura de `copyResponse` (baixo, complexo).
+- Cancelamento do cliente logado como 502: raro, exige ramo extra (baixo).
+- Failover invisível e 502 sem tier/chave: é o contrato do ticket (502 sem tier com `tier` vazio).
+- `App.logger` sem nil guard: só `newApp` constrói `App`.
+- Log em stderr misturado com `log` de texto: sem correção simples, já listado como risco residual.
+- Inconsistências de metadados do plan: artefato do plan, não código.
+- Testes faltando (chave sem nome, caminho 400, 429 local vs upstream): raros; limiar de 200ms não é flaky, pois o sleep garante >= 200ms.
+- 1xx no `statusRecorder` (2 achados): o cliente Go não expõe 1xx em `resp.StatusCode`.
+- Sem request ID: não pedido.
+- `statusRecorder` sempre anuncia `Flusher`: writers do net/http implementam `Flusher`.
+- Índice de log vazio nos testes: só falha em teste já quebrado.
+- Dependência do fixture `tierDead`: especulativo, não verificado.
