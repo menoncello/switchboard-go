@@ -1496,10 +1496,21 @@ func TestTierFailoverRewritesModelAndKey(t *testing.T) {
 	if len(bodies) != 1 || !strings.Contains(bodies[0], `"model":"id-a"`) || !strings.Contains(bodies[0], `"n":1.50`) || auths[0] != "Bearer k1||" {
 		t.Fatalf("body=%v auth=%v", bodies, auths)
 	}
+	if rec.Header().Get("Retry-After") != "" {
+		t.Fatal("unexpected Retry-After on tier-served response")
+	}
+	// the one-shot flag is still armed: tier 0 is exhausted and nothing consumed it
+	if !f.app.keys.ShouldNotifyAllExhausted() {
+		t.Fatal("all-exhausted notification was consumed by a tier-served request")
+	}
 }
 
 func TestTierNoMappingOrNoModelStaysLocal429(t *testing.T) {
 	f := newTierFixture(t, false, false)
+	// exhaust tier 0 first (one hit); the cases below are then all served locally
+	if rec := tierReq(f.app, http.MethodPost, "/v1/chat/completions", `{"model":"z"}`, nil); rec.Code != http.StatusTooManyRequests {
+		t.Fatalf("setup: %d", rec.Code)
+	}
 	for _, c := range []struct{ method, path, body string }{
 		{http.MethodPost, "/v1/chat/completions", `{"model":"z"}`},
 		{http.MethodGet, "/v1/models", ``},
@@ -1511,7 +1522,6 @@ func TestTierNoMappingOrNoModelStaysLocal429(t *testing.T) {
 			t.Fatalf("%v: %d %s", c, rec.Code, rec.Body.String())
 		}
 	}
-	// first request exhausts tier 0 (one hit); the rest are served locally
 	if h := f.hits(); h != [3]int32{1, 0, 0} {
 		t.Fatalf("hits %v", h)
 	}
@@ -1575,6 +1585,35 @@ func TestTierNonQuotaResponseCopiedWithoutFurtherFailover(t *testing.T) {
 	}
 }
 
+func TestTierNonQuota429CopiedWithoutFurtherFailover(t *testing.T) {
+	f := newTierFixture(t, false, false)
+	s1 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusTooManyRequests)
+		_, _ = w.Write([]byte(`{"error":{"code":"rate_limit"}}`))
+	}))
+	defer s1.Close()
+	f.app.config.Tiers[0].BaseURL = s1.URL
+	rec := tierReq(f.app, http.MethodPost, "/v1/chat/completions", `{"model":"a"}`, nil)
+	if rec.Code != http.StatusTooManyRequests || rec.Body.String() != `{"error":{"code":"rate_limit"}}` || f.hits()[2] != 0 {
+		t.Fatalf("got %d %q hits=%v", rec.Code, rec.Body.String(), f.hits())
+	}
+}
+
+func TestTierBaseURLWithPathPrefixAndTrailingSlash(t *testing.T) {
+	f := newTierFixture(t, false, false)
+	var path string
+	s1 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		path = r.URL.Path
+		_, _ = w.Write([]byte(`{}`))
+	}))
+	defer s1.Close()
+	f.app.config.Tiers[0].BaseURL = s1.URL + "/api/v1/"
+	rec := tierReq(f.app, http.MethodPost, "/v1/chat/completions", `{"model":"a"}`, nil)
+	if rec.Code != http.StatusOK || path != "/api/v1/chat/completions" {
+		t.Fatalf("code=%d path=%q", rec.Code, path)
+	}
+}
+
 func TestTierEmptyIDForwardsName(t *testing.T) {
 	f := newTierFixture(t, false, false)
 	f.app.config.Tiers[0].Models = []TierModel{{Name: "a"}}
@@ -1593,6 +1632,9 @@ func TestTierConnectionErrorReturns502(t *testing.T) {
 	rec := tierReq(f.app, http.MethodPost, "/v1/chat/completions", `{"model":"a"}`, nil)
 	if rec.Code != http.StatusBadGateway || f.hits()[2] != 0 {
 		t.Fatalf("got %d hits=%v", rec.Code, f.hits())
+	}
+	if strings.Contains(rec.Body.String(), dead.URL) {
+		t.Fatalf("502 body leaks tier URL: %q", rec.Body.String())
 	}
 }
 

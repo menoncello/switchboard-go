@@ -65,7 +65,7 @@ deferred:
 ## Tasks & Acceptance
 
 **Execution:**
-- [ ] `proxy.go` -- dar a `doUpstream` o `baseURL` como parâmetro (tier 0 passa `a.config.UpstreamBaseURL`); extrair a escolha de modelo (ler `model` do corpo JSON de topo; vazio ⇒ sem failover) e a reescrita do corpo (`map[string]json.RawMessage`, só troca `model`); após o loop do tier 0, antes do 429 local, percorrer `a.config.Tiers` em ordem: pular se não fala o estilo ou sem mapeamento; chamar com `APIKey` do tier; resposta com `isQuota429` fecha e segue; erro de conexão do tier segue ao próximo; qualquer outra resposta é copiada ao cliente -- failover do tier 0
+- [ ] `proxy.go` -- dar a `doUpstream` o `baseURL` como parâmetro (tier 0 passa `a.config.UpstreamBaseURL`); extrair a escolha de modelo (ler `model` do corpo JSON de topo; vazio ⇒ sem failover) e a reescrita do corpo (`map[string]json.RawMessage`, só troca `model`); após o loop do tier 0, antes do 429 local, percorrer `a.config.Tiers` em ordem: pular se não fala o estilo ou sem mapeamento; chamar com `APIKey` do tier; resposta com `isQuota429` fecha e segue; erro de conexão do tier devolve 502 ao cliente, sem seguir ao próximo tier; qualquer outra resposta é copiada ao cliente -- failover do tier 0
 - [ ] `main_test.go` -- testes da matriz: failover com model reescrito e chave do tier, modelo sem mapa, sem model, estilo, tier também esgotado, tier 0 saudável (tier 1 não chamado), tier Anthropic; ajustar chamadas existentes de `doUpstream`; confirmar que `/admin/keys`, `/admin/status` e `/status` seguem iguais com tiers configurados -- cobrir a matriz
 - [ ] `cmd/fakeupstream/main.go` -- servidor HTTP mínimo (`-addr`, padrão `127.0.0.1:9999`): devolve 429 de cota (`{"error":{"code":"insufficient_quota","message":"quota exceeded"}}`) quando em modo quota e 200 JSON com o `model` recebido quando em modo ok; `POST /__mode/quota` e `POST /__mode/ok` alternam; modo inicial `ok` -- upstream falso do critério de verificação
 - [ ] `docs/configuration.md` -- um parágrafo: tier 0 esgotado ⇒ tiers em ordem, reescrita de `model`, tier sem mapeamento ou sem o estilo é pulado, request sem `model` fica no tier 0; como rodar `go run ./cmd/fakeupstream` -- documentação
@@ -111,7 +111,7 @@ deferred:
 
 ## Design Notes
 
-Reescrever só o campo `model` com `map[string]json.RawMessage` preserva os demais campos byte a byte (números, ordem não importa). Corpo que não é objeto JSON, ou sem `model` string não vazia, vale como "sem model".
+Reescrever só o campo `model` com `map[string]json.RawMessage` mantém os valores dos demais campos, mas o corpo é recodificado: espaços compactados, chaves reordenadas e `<>&` escapados (números ficam como estão). Corpo que não é objeto JSON, ou sem `model` string não vazia, vale como "sem model".
 
 ## Verification
 
@@ -128,3 +128,29 @@ Reescrever só o campo `model` com `map[string]json.RawMessage` preserva os dema
 - Follow-up recomendado: sim, porque 1 patch `high` (Dockerfile) e 4 `medium` foram aplicados sem nova revisão do código corrigido, em especial o 502 de erro de conexão no tier.
 - Verificação: `go build`, `go vet`, `go test -race ./...` passam; roteiro manual com dois fakes e o proxy: mapeado 200 do tier 1, não mapeado 429 local.
 - Risco residual: o aviso por e-mail não sai mais enquanto um tier atende.
+
+## Code Review
+
+### 2026-10-29
+Revisão do ticket 2.2 (4 lentes): 1 decision-needed, 9 patch, 0 defer, 15 rejeitados.
+
+- [ ] [Review][Decision] Sem aviso SMTP nem log quando o tier 0 esgota e um tier atende — o failover mascara a exaustão e o operador só sabe quando todos falham. Options: (a) chamar `NotifyAllExhausted` também na troca para um tier; (b) só uma linha de log na troca; (c) manter como está e só documentar. Recommended: (b) — barato e cabe no "sem log estruturado" do plano; o alerta por e-mail na troca é decisão de escopo do Eduardo.
+- [x] [Review][Patch] Sem teste de que `Retry-After` não sai e `ShouldNotifyAllExhausted` segue armado quando um tier atende [main_test.go:TestTierFailoverRewritesModelAndKey]
+- [x] [Review][Patch] Sem teste de que um 429 de tier sem marca de cota é copiado ao cliente, sem tentar o tier seguinte [main_test.go:TestTierNonQuotaResponseCopiedWithoutFurtherFailover]
+- [x] [Review][Patch] Sem teste de `base_url` de tier com barra final e prefixo de path (`/api/v1/`) [main_test.go]
+- [x] [Review][Patch] Erro de conexão do tier devolve `err.Error()` com a URL do tier no corpo do 502 [proxy.go:proxyTiers]
+- [x] [Review][Patch] Seção Tasks do plano ainda diz "erro de conexão do tier segue ao próximo" [plan:Tasks & Acceptance]
+- [x] [Review][Patch] Design Notes promete corpo "byte a byte"; `json.Marshal` compacta e escapa `<>&` [plan:Design Notes]
+- [x] [Review][Patch] `TestTierNoMappingOrNoModelStaysLocal429` depende da ordem dos casos para o `hits == {1,0,0}` [main_test.go:1501]
+- [x] [Review][Patch] `tierModelID`: o laço `speaks` vira `slices.Contains(t.Styles, style)` [proxy.go:tierModelID]
+- [x] [Review][Patch] `fakeupstream`: `GET /__mode/quota` cai no catch-all e devolve 200 como se tivesse funcionado [cmd/fakeupstream/main.go]
+
+**Rejected**
+- Failover em 401/403/5xx de tier, e conexão não seguir ao próximo tier — falso: proibido pela lista Never do plano e documentado.
+- Outros caminhos de build com `./...` — falso: README não usa `-o`, goreleaser usa `main: .`.
+- Nomes de modelo duplicados sem validação — falso: `config.go` rejeita.
+- Match de modelo sem case/trim — falso: casar exato com o `Name` configurado é o desenho.
+- Lacunas de docs — falso: o parágrafo já cobre qualquer status, 502 e SMTP.
+- Caminho curl sem teste automático — falso: verificação manual por desenho, rodada no review.
+- Dockerfile fora do escopo — falso: correção necessária, justificada.
+- Teste admin/status fora de estado de failover; um só tier 0 nos testes; `TestDoUpstream*` com mesma URL — baixo, endpoints não usam tiers, rotação é anterior, tier tests cobrem.

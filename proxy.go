@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"io"
 	"net/http"
+	"slices"
 	"strconv"
 	"strings"
 )
@@ -91,7 +92,7 @@ func (a *App) proxyTiers(ctx context.Context, w http.ResponseWriter, r *http.Req
 		}
 		resp, err := a.doUpstream(ctx, r, tierBody, t.BaseURL, t.APIKey, style)
 		if err != nil {
-			http.Error(w, err.Error(), http.StatusBadGateway)
+			http.Error(w, "tier upstream unreachable", http.StatusBadGateway)
 			return true
 		}
 		if isQuota429(resp) {
@@ -106,11 +107,7 @@ func (a *App) proxyTiers(ctx context.Context, w http.ResponseWriter, r *http.Req
 
 // tierModelID returns the upstream model ID for model when the tier speaks style and maps it.
 func tierModelID(t TierConfig, model string, style APIStyle) (string, bool) {
-	speaks := false
-	for _, s := range t.Styles {
-		speaks = speaks || s == style
-	}
-	if !speaks {
+	if !slices.Contains(t.Styles, style) {
 		return "", false
 	}
 	for _, m := range t.Models {

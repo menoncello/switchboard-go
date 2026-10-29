@@ -16,8 +16,12 @@ func main() {
 	flag.Parse()
 	var quota atomic.Bool
 	mux := http.NewServeMux()
-	mux.HandleFunc("POST /__mode/quota", func(w http.ResponseWriter, r *http.Request) { quota.Store(true) })
-	mux.HandleFunc("POST /__mode/ok", func(w http.ResponseWriter, r *http.Request) { quota.Store(false) })
+	mux.HandleFunc("POST /__mode/quota", func(w http.ResponseWriter, r *http.Request) { quota.Store(true); _, _ = w.Write([]byte("quota\n")) })
+	mux.HandleFunc("POST /__mode/ok", func(w http.ResponseWriter, r *http.Request) { quota.Store(false); _, _ = w.Write([]byte("ok\n")) })
+	mux.HandleFunc("/__mode/", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Allow", http.MethodPost)
+		http.Error(w, "use POST", http.StatusMethodNotAllowed)
+	})
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		if quota.Load() {
