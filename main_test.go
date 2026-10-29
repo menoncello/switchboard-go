@@ -2915,3 +2915,135 @@ func TestLoadConfigStateFile(t *testing.T) {
 		t.Fatalf("cfg=%q err=%v", cfg.StateFile, err)
 	}
 }
+
+// fakeTelegram records sendMessage calls (path and body) and answers with status.
+func fakeTelegram(t *testing.T, status int) chan [2]string {
+	t.Helper()
+	calls := make(chan [2]string, 8)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		calls <- [2]string{r.URL.Path, string(b)}
+		w.WriteHeader(status)
+	}))
+	old := telegramAPIBase
+	telegramAPIBase = srv.URL
+	t.Cleanup(func() { srv.Close(); telegramAPIBase = old })
+	return calls
+}
+
+func expectTelegram(t *testing.T, calls chan [2]string, want bool) {
+	t.Helper()
+	select {
+	case c := <-calls:
+		if !want {
+			t.Fatalf("unexpected telegram call %v", c)
+		}
+		if c[0] != "/botTOK/sendMessage" || !strings.Contains(c[1], `"chat_id":"42"`) {
+			t.Fatalf("bad telegram call %v", c)
+		}
+	case <-time.After(300 * time.Millisecond):
+		if want {
+			t.Fatal("no telegram call")
+		}
+	}
+}
+
+func TestTelegramOncePerEpisodeAndRearm(t *testing.T) {
+	calls := fakeTelegram(t, 200)
+	s0, s1 := newStub(t, 503, `down`), newStub(t, 503, `down`)
+	app, now := failoverApp(t, s0, s1, nil, time.Hour)
+	app.telegram = NewTelegramNotifier(TelegramConfig{BotToken: "TOK", ChatID: "42"})
+	if rec := chatReq(app, `{"model":"a"}`); rec.Code != 503 || rec.Body.String() != "down" {
+		t.Fatalf("got %d %q", rec.Code, rec.Body.String())
+	}
+	expectTelegram(t, calls, true)
+	if rec := chatReq(app, `{"model":"a"}`); rec.Code != 429 { // local 429: same episode
+		t.Fatalf("got %d", rec.Code)
+	}
+	expectTelegram(t, calls, false)
+	*now = now.Add(2 * time.Hour)
+	s1.status.Store(200)
+	if rec := chatReq(app, `{"model":"a"}`); rec.Code != 200 {
+		t.Fatalf("got %d", rec.Code)
+	}
+	s0.status.Store(503)
+	s1.status.Store(503)
+	*now = now.Add(2 * time.Hour)
+	chatReq(app, `{"model":"a"}`)
+	expectTelegram(t, calls, true)
+}
+
+func TestTelegramNotConfiguredSendsNothing(t *testing.T) {
+	for name, cfg := range map[string]TelegramConfig{"none": {}, "token only": {BotToken: "TOK"}, "chat only": {ChatID: "42"}} {
+		t.Run(name, func(t *testing.T) {
+			calls := fakeTelegram(t, 200)
+			s0, s1 := newStub(t, 503, `down`), newStub(t, 503, `down`)
+			app, _ := failoverApp(t, s0, s1, nil, time.Hour)
+			app.telegram = NewTelegramNotifier(cfg)
+			if rec := chatReq(app, `{"model":"a"}`); rec.Code != 503 {
+				t.Fatalf("got %d", rec.Code)
+			}
+			expectTelegram(t, calls, false)
+		})
+	}
+}
+
+func TestTelegramSendFailureKeepsRequestAndHidesToken(t *testing.T) {
+	t.Cleanup(func() { log.SetOutput(os.Stderr) })
+	for name, down := range map[string]bool{"status 500": false, "request error": true} {
+		t.Run(name, func(t *testing.T) {
+			logs := &lockedBuf{}
+			log.SetOutput(logs)
+			calls := fakeTelegram(t, 500)
+			if down {
+				telegramAPIBase = "http://127.0.0.1:1" // restored by fakeTelegram cleanup
+			}
+			s0, s1 := newStub(t, 503, `down`), newStub(t, 503, `down`)
+			app, _ := failoverApp(t, s0, s1, nil, time.Hour)
+			app.telegram = NewTelegramNotifier(TelegramConfig{BotToken: "TOK", ChatID: "42"})
+			if rec := chatReq(app, `{"model":"a"}`); rec.Code != 503 || rec.Body.String() != "down" {
+				t.Fatalf("got %d %q", rec.Code, rec.Body.String())
+			}
+			if !down {
+				expectTelegram(t, calls, true)
+			}
+			deadline := time.Now().Add(2 * time.Second)
+			for !strings.Contains(logs.String(), "telegram notification failed") && time.Now().Before(deadline) {
+				time.Sleep(10 * time.Millisecond)
+			}
+			if !strings.Contains(logs.String(), "telegram notification failed: "+name) || strings.Contains(logs.String(), "TOK") {
+				t.Fatalf("log = %q", logs.String())
+			}
+		})
+	}
+}
+
+func TestTelegramLongModelIsBounded(t *testing.T) {
+	calls := fakeTelegram(t, 200)
+	s0, s1 := newStub(t, 503, `down`), newStub(t, 503, `down`)
+	app, _ := failoverApp(t, s0, s1, nil, time.Hour)
+	app.telegram = NewTelegramNotifier(TelegramConfig{BotToken: "TOK", ChatID: "42"})
+	chatReq(app, `{"model":"`+strings.Repeat("é", 5000)+`"}`)
+	select {
+	case c := <-calls:
+		if len(c[1]) > 512 {
+			t.Fatalf("telegram body not bounded: %d bytes", len(c[1]))
+		}
+	case <-time.After(time.Second):
+		t.Fatal("no telegram call")
+	}
+}
+
+func TestLoadConfigTelegram(t *testing.T) {
+	tiersYAML(t, "telegram: {bot_token: TOK, chat_id: 42}\n")
+	cfg, err := loadConfig()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Telegram != (TelegramConfig{BotToken: "TOK", ChatID: "42"}) {
+		t.Fatalf("telegram = %+v", cfg.Telegram)
+	}
+	if s := safeConfigSummary(cfg); !strings.Contains(s, "telegram_configured=true") || strings.Contains(s, "TOK") {
+		t.Fatalf("bad summary: %s", s)
+	}
+}

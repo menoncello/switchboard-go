@@ -71,6 +71,12 @@ smtp:
   tls: false
   starttls: true
 
+# Telegram alert when no tier can serve a request. Both fields are required.
+# The token sits in the file like the other credentials; there are no env vars.
+telegram:
+  bot_token: "123456:your-bot-token"
+  chat_id: "123456789"
+
 limits:
   max_request_body_bytes: 20971520
 
@@ -152,7 +158,11 @@ and a connection error or timeout happened, the client gets `502`. If no tier wa
 left among the tiers that could serve the request (tier 0 counts its tier
 cooldown or, without one, its exhausted keys); the header is left out when that
 time is unknown. The SMTP "all exhausted" alert fires whenever no tier answers (the local `429`, or the last upstream response being served)
-and only when every tier 0 key is exhausted. To try it by hand, run
+and only when every tier 0 key is exhausted. The Telegram alert (`telegram:`)
+fires on the first request that no tier serves and stays quiet until some tier
+serves a request again, so it is sent once per failure episode; it runs next to
+the SMTP alert and sends nothing unless both `bot_token` and `chat_id` are set.
+To try it by hand, run
 `go run ./cmd/fakeupstream -addr 127.0.0.1:9999` and switch it with
 `POST /__mode/quota` or `POST /__mode/ok`.
 

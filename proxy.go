@@ -23,6 +23,18 @@ const tier0CooldownKey = ""
 // maxLoggedModel bounds the model in the request log so a client cannot inflate a log line.
 const maxLoggedModel = 128
 
+// truncateModel cuts model to maxLoggedModel bytes without splitting a rune.
+func truncateModel(model string) string {
+	if len(model) <= maxLoggedModel {
+		return model
+	}
+	cut := maxLoggedModel
+	for !utf8.RuneStart(model[cut]) {
+		cut--
+	}
+	return model[:cut]
+}
+
 type APIStyle int
 
 const (
@@ -73,13 +85,7 @@ func (a *App) proxyV1(w http.ResponseWriter, r *http.Request, style APIStyle) {
 	if style == APIStyleAnthropic {
 		apiStyle = "anthropic"
 	}
-	if len(model) > maxLoggedModel {
-		cut := maxLoggedModel
-		for !utf8.RuneStart(model[cut]) {
-			cut--
-		}
-		model = model[:cut]
-	}
+	model = truncateModel(model)
 	attrs := []any{"model", model, "api_style", apiStyle, "tier", tier}
 	if keyIdx >= 0 {
 		attrs = append(attrs, "key_index", keyIdx, "key_name", a.config.keyName(keyIdx))
@@ -144,17 +150,20 @@ func (a *App) serveProxy(w http.ResponseWriter, r *http.Request, style APIStyle)
 				last.hold(resp, tier0Name, idx)
 				break
 			}
+			a.telegram.rearm()
 			copyResponse(w, resp)
 			return model, tier0Name, idx
 		}
 	}
 	if name, ok := a.proxyTiers(orig, w, r, fields, model, style, needTools, &last); ok {
+		a.telegram.rearm()
 		return model, name, -1
 	}
 	if orig.Err() != nil {
 		w.WriteHeader(statusClientClosed)
 		return model, "", -1
 	}
+	a.telegram.notifyFailure(model)
 	// No tier served it; alert once when every tier 0 key is exhausted.
 	if a.keys.ShouldNotifyAllExhausted() {
 		a.sender.NotifyAllExhausted(a.keys.Status())

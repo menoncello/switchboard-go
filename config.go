@@ -42,6 +42,8 @@ type Config struct {
 
 	SMTP SMTPConfig
 
+	Telegram TelegramConfig
+
 	// MinContext is the smallest declared context window a tier model needs to be
 	// eligible (tier 0 is exempt); 0 turns the floor off.
 	MinContext int
@@ -145,6 +147,10 @@ type yamlConfig struct {
 		TLS      bool   `yaml:"tls"`
 		StartTLS bool   `yaml:"starttls"`
 	} `yaml:"smtp"`
+	Telegram struct {
+		BotToken string `yaml:"bot_token"`
+		ChatID   string `yaml:"chat_id"`
+	} `yaml:"telegram"`
 	Limits struct {
 		MaxRequestBodyBytes int64 `yaml:"max_request_body_bytes"`
 	} `yaml:"limits"`
@@ -259,7 +265,7 @@ func loadYAMLConfig(path string) (Config, error) {
 	if err != nil {
 		return Config{}, err
 	}
-	return Config{Tiers: tiers, MinContext: minContext, StateFile: strings.TrimSpace(yc.StateFile), ListenAddr: yc.Server.ListenAddr, UpstreamBaseURL: yc.Upstream.BaseURL, ProxyAPIKey: yc.Server.ProxyAPIKey, UpstreamAPIKeys: yc.Upstream.APIKeys, MaxRequestBodyBytes: yc.Limits.MaxRequestBodyBytes, RetryExhaustedAfter: retry, UpstreamResponseHeaderTimeout: headerTimeout, SMTP: SMTPConfig{Host: yc.SMTP.Host, Port: yc.SMTP.Port, Username: yc.SMTP.Username, Password: yc.SMTP.Password, From: yc.SMTP.From, To: yc.SMTP.To, TLS: yc.SMTP.TLS, StartTLS: yc.SMTP.StartTLS}}, nil
+	return Config{Tiers: tiers, MinContext: minContext, StateFile: strings.TrimSpace(yc.StateFile), ListenAddr: yc.Server.ListenAddr, UpstreamBaseURL: yc.Upstream.BaseURL, ProxyAPIKey: yc.Server.ProxyAPIKey, UpstreamAPIKeys: yc.Upstream.APIKeys, MaxRequestBodyBytes: yc.Limits.MaxRequestBodyBytes, RetryExhaustedAfter: retry, UpstreamResponseHeaderTimeout: headerTimeout, SMTP: SMTPConfig{Host: yc.SMTP.Host, Port: yc.SMTP.Port, Username: yc.SMTP.Username, Password: yc.SMTP.Password, From: yc.SMTP.From, To: yc.SMTP.To, TLS: yc.SMTP.TLS, StartTLS: yc.SMTP.StartTLS}, Telegram: TelegramConfig{BotToken: yc.Telegram.BotToken, ChatID: yc.Telegram.ChatID}}, nil
 }
 
 func mergeConfig(dst *Config, src Config) {
@@ -307,6 +313,12 @@ func mergeConfig(dst *Config, src Config) {
 	}
 	if src.SMTP.To != "" {
 		dst.SMTP.To = src.SMTP.To
+	}
+	if src.Telegram.BotToken != "" {
+		dst.Telegram.BotToken = src.Telegram.BotToken
+	}
+	if src.Telegram.ChatID != "" {
+		dst.Telegram.ChatID = src.Telegram.ChatID
 	}
 	if len(src.Tiers) > 0 {
 		dst.Tiers = src.Tiers
@@ -484,7 +496,7 @@ func validateTiers(tiers []TierConfig) error {
 }
 
 func safeConfigSummary(cfg Config) string {
-	return fmt.Sprintf("listen=%s upstream=%s upstream_keys=%d smtp_configured=%t config_source=%s max_request_body_bytes=%d retry_exhausted_after=%s response_header_timeout=%s tiers=%d", cfg.ListenAddr, cfg.UpstreamBaseURL, len(cfg.UpstreamAPIKeys), cfg.SMTP.Host != "" && cfg.SMTP.From != "" && cfg.SMTP.To != "", defaultString(cfg.ConfigSourcePath, "none"), cfg.MaxRequestBodyBytes, cfg.RetryExhaustedAfter, cfg.UpstreamResponseHeaderTimeout, len(cfg.Tiers))
+	return fmt.Sprintf("listen=%s upstream=%s upstream_keys=%d smtp_configured=%t telegram_configured=%t config_source=%s max_request_body_bytes=%d retry_exhausted_after=%s response_header_timeout=%s tiers=%d", cfg.ListenAddr, cfg.UpstreamBaseURL, len(cfg.UpstreamAPIKeys), cfg.SMTP.Host != "" && cfg.SMTP.From != "" && cfg.SMTP.To != "", cfg.Telegram.BotToken != "" && cfg.Telegram.ChatID != "", defaultString(cfg.ConfigSourcePath, "none"), cfg.MaxRequestBodyBytes, cfg.RetryExhaustedAfter, cfg.UpstreamResponseHeaderTimeout, len(cfg.Tiers))
 }
 
 func parseBool(v string) bool { b, _ := strconv.ParseBool(strings.TrimSpace(v)); return b }
