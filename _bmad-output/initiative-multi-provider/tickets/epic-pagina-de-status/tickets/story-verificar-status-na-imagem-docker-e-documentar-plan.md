@@ -3,7 +3,7 @@ title: 'Verificar /status na imagem Docker e documentar'
 type: 'chore'
 ticket: '2'
 created: '2026-10-29'
-status: 'built'
+status: done
 baseline_revision: 'a47026df02148b60bb9207e3a59065eb63c35348'
 route: 'oneshot'
 route_source: 'auto'
@@ -63,3 +63,23 @@ Oneshot: verificação manual da imagem mais duas edições curtas de documenta�
 - Follow-up review recomendado: false.
 - Verificação: `docker build` ok; container respondeu 200 `text/html` em `/status` com `#1 (atual)` e `#2` (erro de uso `HTTP 401`, esperado com chaves falsas), sem valor de chave no corpo; `/admin/keys` sem chave deu 401; `go test -count=1 ./...` passa.
 - Riscos residuais: nenhum novo; uso real contra o OpenCode Go não testado (chaves falsas).
+
+## Code Review
+
+### 2026-10-29
+
+Code review: 0 decision-needed, 0 patch, 0 defer, 13 rejected. Lenses: blind-hunter, edge-case-hunter, verification-gap, intent-alignment.
+
+#### Rejected
+- Blind: README omits usage-query note — low, operations.md carries it; README already says to restrict the port.
+- Blind: no mitigation for anonymous upstream trigger — false: `usageFor` holds a mutex (visits coalesce) and caches per key for `UsageCacheTTL` (60s, `USAGE_CACHE_TTL`).
+- Blind: key-leak path with key-bearing upstream error untested — false for this diff: docs-only, handler reviewed in 1.1; `fetchUsage` keeps only HTTP status or error type.
+- Blind: Docker check not repeatable — low, a CI smoke step is extra scope.
+- Blind: open-routes sublist under the Admin heading — low, heading rename already rejected in the plan.
+- Blind: `docs/admin-api.md` lacks `/status` — low, outside the ticket's named files.
+- Blind: `/status` format undocumented — low, README describes the content in one line.
+- Blind: stale ticket metadata — low, workflow artifact, not product.
+- Blind: long line in operations.md — low, cosmetic.
+- Intent: Docker verification attested only in plan prose — descriptive, not a defect; the Verify step is an action recorded in the plan.
+- Intent: operations.md already listed `/status` — requirement met, only the warning was missing.
+- Edge Case Hunter and Verification Gap: no findings.
