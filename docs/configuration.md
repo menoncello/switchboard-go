@@ -127,13 +127,17 @@ Every proxied request writes one JSON line to stderr when its response ends
 {"time":"...","level":"INFO","msg":"request","model":"glm-5.1","api_style":"openai","tier":"opencode-go","key_index":0,"key_name":"main","status":200,"latency_ms":412}
 ```
 
-- `model`: top-level `model` of the request body, empty if there is none.
+- `model`: top-level `model` of the request body, empty if there is none;
+  cut at 128 bytes.
 - `api_style`: `openai` or `anthropic`.
 - `tier`: `opencode-go` for tier 0, the tier `name` for an extra tier, empty when
   no tier answered (local `429`, `502` on a connection error).
 - `key_index` and `key_name`: only for tier 0 (`key_name` can be empty).
 - `status`: the status the client received.
 - `latency_ms`: from before the body is read to the last byte sent to the client.
+
+Requests rejected while reading the body (`413` too large, `400` read failure)
+are logged too, with empty `model` and `tier` and no key fields.
 
 The key value, `Authorization`, `x-api-key` and the request body and headers are
 never logged.

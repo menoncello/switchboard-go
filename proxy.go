@@ -10,9 +10,13 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 )
 
 const tier0Name = "opencode-go"
+
+// maxLoggedModel bounds the model in the request log so a client cannot inflate a log line.
+const maxLoggedModel = 128
 
 type APIStyle int
 
@@ -63,6 +67,13 @@ func (a *App) proxyV1(w http.ResponseWriter, r *http.Request, style APIStyle) {
 	apiStyle := "openai"
 	if style == APIStyleAnthropic {
 		apiStyle = "anthropic"
+	}
+	if len(model) > maxLoggedModel {
+		cut := maxLoggedModel
+		for !utf8.RuneStart(model[cut]) {
+			cut--
+		}
+		model = model[:cut]
 	}
 	attrs := []any{"model", model, "api_style", apiStyle, "tier", tier}
 	if keyIdx >= 0 {

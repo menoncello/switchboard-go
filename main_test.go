@@ -1851,10 +1851,55 @@ func TestRequestLogTierNamedLikeTier0HasNoKeyFields(t *testing.T) {
 func TestRequestBodyTooLargeStill413(t *testing.T) {
 	app := newApp(Config{ProxyAPIKey: "p", UpstreamAPIKeys: []string{"k"}, UpstreamBaseURL: "http://127.0.0.1:1", MaxRequestBodyBytes: 8, RetryExhaustedAfter: time.Hour})
 	lines := captureLog(app)
-	if rec := tierReq(app, http.MethodPost, "/v1/chat/completions", `{"model":"glm-5.1","messages":[]}`, nil); rec.Code != http.StatusRequestEntityTooLarge {
+	srv := httptest.NewServer(app)
+	defer srv.Close()
+	req, _ := http.NewRequest(http.MethodPost, srv.URL+"/v1/chat/completions", strings.NewReader(`{"model":"glm-5.1","messages":[]}`))
+	req.Header.Set("Authorization", "Bearer p")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = resp.Body.Close()
+	// The connection is closed after a 413 only when MaxBytesReader wraps the original writer.
+	if resp.StatusCode != http.StatusRequestEntityTooLarge || !resp.Close {
+		t.Fatalf("code=%d close=%v", resp.StatusCode, resp.Close)
+	}
+	// The log line is written after the handler returns, which can be after the client has the response.
+	var got []map[string]any
+	for deadline := time.Now().Add(2 * time.Second); len(got) == 0 && time.Now().Before(deadline); time.Sleep(10 * time.Millisecond) {
+		got = lines(t)
+	}
+	if len(got) != 1 || got[0]["status"] != float64(413) || got[0]["model"] != "" || got[0]["tier"] != "" {
+		t.Fatalf("lines: %v", got)
+	}
+}
+
+func TestRequestLogKeyZeroIsLogged(t *testing.T) {
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { _, _ = w.Write([]byte(`{}`)) }))
+	defer up.Close()
+	app := newApp(Config{ProxyAPIKey: "p", UpstreamAPIKeys: []string{"k"}, KeyNames: []string{"first"}, UpstreamBaseURL: up.URL, MaxRequestBodyBytes: 1 << 20, RetryExhaustedAfter: time.Hour})
+	lines := captureLog(app)
+	if rec := tierReq(app, http.MethodPost, "/v1/chat/completions", `{"model":"m"}`, nil); rec.Code != http.StatusOK {
 		t.Fatalf("code %d", rec.Code)
 	}
-	if got := lines(t); len(got) != 1 || got[0]["status"] != float64(413) {
+	got := lines(t)
+	if len(got) != 1 || got[0]["key_index"] != float64(0) || got[0]["key_name"] != "first" {
+		t.Fatalf("lines: %v", got)
+	}
+}
+
+func TestRequestLogModelIsTruncated(t *testing.T) {
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { _, _ = w.Write([]byte(`{}`)) }))
+	defer up.Close()
+	app := newApp(Config{ProxyAPIKey: "p", UpstreamAPIKeys: []string{"k"}, UpstreamBaseURL: up.URL, MaxRequestBodyBytes: 1 << 20, RetryExhaustedAfter: time.Hour})
+	lines := captureLog(app)
+	// 127 ASCII bytes then a 2-byte rune straddling the 128-byte cut.
+	long := strings.Repeat("a", 127) + strings.Repeat("é", 500)
+	if rec := tierReq(app, http.MethodPost, "/v1/chat/completions", `{"model":"`+long+`"}`, nil); rec.Code != http.StatusOK {
+		t.Fatalf("code %d", rec.Code)
+	}
+	got := lines(t)
+	if len(got) != 1 || got[0]["model"] != strings.Repeat("a", 127) {
 		t.Fatalf("lines: %v", got)
 	}
 }
