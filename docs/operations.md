@@ -58,7 +58,10 @@ disables the cooldown: exhausted keys are retried on the very next request and n
 - If exposing beyond a trusted LAN, put the service behind TLS and a firewall.
 - Do not commit API keys, SMTP credentials, or systemd files containing secrets.
 - `/healthz`, `/readyz` and `/status` are intentionally unauthenticated. The status
-  page shows key names, state and usage, but never key values.
+  page shows key names, state and usage, but never key values. If the proxy has a
+  public URL, restrict the port by network (firewall, VPN or reverse-proxy
+  allowlist) so only trusted clients can reach `/status`. Each visit can also trigger usage
+  queries to the upstream with your keys when the usage cache has expired.
 - `/v1/*` and `/admin/*` require authentication.
 
 ## Operational behavior
