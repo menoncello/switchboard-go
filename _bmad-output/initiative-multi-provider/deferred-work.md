@@ -15,3 +15,6 @@
 
 ## Deferred from: code review of story-elegibilidade-por-contexto-minimo-e-tool-calling-plan (2026-10-29)
 - Plano inconsistente: checkboxes `[ ]` com status built, `proxyV1` no lugar de `serveProxy`, task de fixtures rejeitada ainda listada. Corrigir no fechamento do plano.
+
+## Deferred from: code review of story-persistir-o-cooldown-dos-tiers-plan (2026-10-29)
+- Plano inconsistente: tasks `[ ]` com status built, "8 testes novos" quando são 9, "última gravação bem-sucedida" no Design Notes. Corrigir junto com o patch do `lastState`.

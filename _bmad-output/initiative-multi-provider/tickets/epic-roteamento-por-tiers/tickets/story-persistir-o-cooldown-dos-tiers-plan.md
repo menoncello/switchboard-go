@@ -3,7 +3,7 @@ title: 'Persistir o cooldown dos tiers'
 type: 'feature'
 ticket: 7
 created: '2026-10-29'
-status: 'built'
+status: 'done'
 baseline_revision: '986fc6795e179e46369de062e5c2a50e54293785'
 route: 'full'
 route_source: 'auto'
@@ -105,3 +105,27 @@ Formato: `{"tier0": "<RFC3339>", "tiers": {"nome": "<RFC3339>"}, "keys": {"<16 h
 **Commands:**
 - `go build ./... && go vet ./...` -- expected: sem erros
 - `go test -race -count=1 ./...` -- expected: todos passam, incluindo os novos
+
+## Code Review
+
+### 2026-10-29 — 3 patch, 1 defer, 21 rejected
+
+- [x] [Review][Patch] Com todas as chaves restauradas como esgotadas, marcar `allNotified=true` em `KeyManager.restore` para o e-mail não repetir após reinício (decidido: opção 1) [keys.go:restore]
+- [x] [Review][Patch] `saveState` guarda `lastState` mesmo quando a gravação falha, então não há nova tentativa; gravar só em sucesso e corrigir o comentário de `App.lastState`, com teste de falha seguida de recuperação [server.go:100]
+- [x] [Review][Patch] Sem teste de que `/admin/reset-key` e `/admin/reset-all-keys` persistem no state file (recriar o app e conferir a chave disponível) [main_test.go]
+- [x] [Review][Defer] Plano inconsistente: tasks `[ ]` com status built, "8 testes novos" (são 9), "última gravação bem-sucedida" — deferred: o conserto edita arquivo de ticket
+
+#### Rejected
+- Timestamps restaurados sem teto (R2, R18): só com arquivo editado à mão ou salto de relógio; o teto acopla à config.
+- Sem sonda de escrita na partida (R3): a falha já é logada na primeira gravação.
+- Perda em SIGKILL ou stream longo (R4, R13, R17): o Shutdown deixa os handlers rodarem o defer.
+- Testes frouxos e casos faltando (R5, R11): o gap do admin virou patch; o resto é churn.
+- Gaps de docs (R7): o `state_file` do exemplo é ilustrativo; o resto é lista de desejos.
+- Campo de versão no arquivo (R8): especulativo.
+- Avanço redundante em `restore` (R12): nenhum defeito mostrado.
+- Aviso só no `main` (R14): confere com "aviso na partida" do ticket.
+- Docker só com bind mount (R15): o ticket pede só documentar a permissão.
+- Um timestamp inválido descarta o arquivo todo (R20): a escrita atômica torna a corrupção improvável.
+- Nomes de tier órfãos regravados (R21): inofensivo até vencer.
+- Arquivo apagado por fora não recriado (R22): artificial.
+- I/O síncrono sob mutex no defer (R25): arquivo pequeno, depois do corpo da resposta.
