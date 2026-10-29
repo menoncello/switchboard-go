@@ -2782,6 +2782,70 @@ func TestStateSaveSkipsUnchangedBytes(t *testing.T) {
 	}
 }
 
+func TestStateAllExhaustedNotNotifiedAgainAfterRestart(t *testing.T) {
+	cfg := stateFileCfg(t)
+	app := newApp(cfg)
+	app.keys.MarkExhausted(0)
+	app.keys.MarkExhausted(1)
+	app.saveState()
+	app2 := newApp(cfg)
+	if !app2.keys.AllExhausted() {
+		t.Fatal("exhausted keys not restored")
+	}
+	if app2.keys.ShouldNotifyAllExhausted() {
+		t.Fatal("all-exhausted email would repeat after restart")
+	}
+}
+
+func TestStateSaveRetriedAfterFailedWrite(t *testing.T) {
+	cfg := stateFileCfg(t)
+	cfg.StateFile = filepath.Join(t.TempDir(), "missing", "state.json")
+	app := newApp(cfg)
+	app.keys.MarkExhausted(0)
+	app.saveState()
+	if _, err := os.Stat(cfg.StateFile); err == nil {
+		t.Fatal("write should have failed")
+	}
+	if err := os.Mkdir(filepath.Dir(cfg.StateFile), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	app.saveState() // same bytes as the failed attempt: must still be written
+	if _, err := os.Stat(cfg.StateFile); err != nil {
+		t.Fatalf("state not written on retry: %v", err)
+	}
+}
+
+func TestStateAdminResetSurvivesRestart(t *testing.T) {
+	for _, tc := range []struct {
+		path, body string
+		wantFree   []int
+	}{
+		{"/admin/reset-key", `{"index":0}`, []int{0}},
+		{"/admin/reset-all-keys", "", []int{0, 1}},
+	} {
+		t.Run(tc.path, func(t *testing.T) {
+			cfg := stateFileCfg(t)
+			app := newApp(cfg)
+			app.keys.MarkExhausted(0)
+			app.keys.MarkExhausted(1)
+			app.saveState()
+			req := httptest.NewRequest(http.MethodPost, tc.path, strings.NewReader(tc.body))
+			req.Header.Set("Authorization", "Bearer p")
+			rec := httptest.NewRecorder()
+			app.ServeHTTP(rec, req)
+			if rec.Code != http.StatusOK {
+				t.Fatalf("got %d body %s", rec.Code, rec.Body.String())
+			}
+			app2 := newApp(cfg)
+			for i := range app2.keys.states {
+				if got, want := app2.keys.states[i] == KeyExhausted, !slices.Contains(tc.wantFree, i); got != want {
+					t.Fatalf("key %d exhausted=%v, want %v", i, got, want)
+				}
+			}
+		})
+	}
+}
+
 func TestLoadConfigStateFile(t *testing.T) {
 	tiersYAML(t, "state_file: /data/state.json\n")
 	cfg, err := loadConfig()

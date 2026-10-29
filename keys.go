@@ -302,4 +302,8 @@ func (m *KeyManager) restore(in map[string]time.Time) {
 	if !m.eligibleLocked(m.current) {
 		m.advanceLocked()
 	}
+	// All keys exhausted before the restart: the "all exhausted" email already went out.
+	if m.allExhaustedLocked() {
+		m.allNotified = true
+	}
 }

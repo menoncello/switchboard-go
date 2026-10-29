@@ -29,7 +29,7 @@ type App struct {
 	// cooldowns holds the per-tier cooldown (tier 0 under tier0CooldownKey).
 	cooldowns *tierCooldowns
 
-	// stateMu serializes saveState; lastState is what the last successful write held.
+	// stateMu serializes saveState; lastState is what the last successful write held (unchanged until a write succeeds).
 	stateMu   sync.Mutex
 	lastState []byte
 }
@@ -98,11 +98,12 @@ func (a *App) saveState() {
 	if err == nil {
 		err = writeFileAtomic(a.config.StateFile, b)
 	}
-	// Also remembered on failure, so a bad path logs once per change instead of on every request.
-	a.lastState = b
+	// lastState only moves on success, so a failed write is retried on the next call.
 	if err != nil {
 		a.logger.Error("state file not saved", "error", err.Error())
+		return
 	}
+	a.lastState = b
 }
 
 func writeFileAtomic(path string, b []byte) error {
