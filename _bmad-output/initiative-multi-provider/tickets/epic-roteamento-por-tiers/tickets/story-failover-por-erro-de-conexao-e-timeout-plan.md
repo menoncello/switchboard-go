@@ -58,9 +58,9 @@ deferred: []
 ## Tasks & Acceptance
 
 **Execution:**
-- [ ] `proxy.go` -- erro de `doUpstream` no tier 0 e nos extras vira falha sem cooldown (segue ao próximo tier), 502 só sem resposta retida, cancelamento do cliente encerra com 499 -- failover por conexão e timeout
-- [ ] `main_test.go` -- testes da matriz: conexão recusada e `response_header_timeout` curto no tier 0 e num extra (sem cooldown, a request seguinte tenta o tier de novo), todos inalcançáveis, resposta retida seguida de erro, sem `model`, cliente que cancela (contexto cancelado, nenhum tier seguinte chamado, cooldown vazio, log 499); reescrever os dois testes antigos; `go test -race ./...` passa -- cobrir a matriz
-- [ ] `docs/configuration.md` -- trocar a frase do 502 pela regra nova (failover sem cooldown, 502 só quando nada atende, cancelamento do cliente não conta); ajustar a descrição do log -- documentação
+- [x] `proxy.go` -- erro de `doUpstream` no tier 0 e nos extras vira falha sem cooldown (segue ao próximo tier), 502 só sem resposta retida, cancelamento do cliente encerra com 499 -- failover por conexão e timeout
+- [x] `main_test.go` -- testes da matriz: conexão recusada e `response_header_timeout` curto no tier 0 e num extra (sem cooldown, a request seguinte tenta o tier de novo), todos inalcançáveis, resposta retida seguida de erro, sem `model`, cliente que cancela (contexto cancelado, nenhum tier seguinte chamado, cooldown vazio, log 499); reescrever os dois testes antigos; `go test -race ./...` passa -- cobrir a matriz
+- [x] `docs/configuration.md` -- trocar a frase do 502 pela regra nova (failover sem cooldown, 502 só quando nada atende, cancelamento do cliente não conta); ajustar a descrição do log -- documentação
 
 **Acceptance Criteria:**
 - Given um upstream que recusa a conexão e outro que atende, when chega request com modelo mapeado, then o tier que atende responde e o tier que recusou continua sem cooldown.

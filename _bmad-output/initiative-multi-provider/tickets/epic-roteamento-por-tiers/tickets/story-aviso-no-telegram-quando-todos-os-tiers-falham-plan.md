@@ -56,11 +56,11 @@ deferred: []
 ## Tasks & Acceptance
 
 **Execution:**
-- [ ] `telegram.go` -- `TelegramConfig{BotToken, ChatID}`, `TelegramNotifier` com estado armado/desarmado sob mutex; `notifyFailure(model)` (envia só se configurado e armado, desarma; `go` com timeout de ~10s e client próprio), `rearm()`; URL base em `var telegramAPIBase = "https://api.telegram.org"` para o teste; erro de envio logado sem token -- notificador isolado e testável
-- [ ] `config.go` -- campo `Telegram TelegramConfig`; `yaml:"telegram"` com `bot_token` e `chat_id` (chat_id aceita número ou string: tipo `string` basta com YAML escalar); `mergeConfig`; `safeConfigSummary` com `telegram_configured` -- config só em YAML
-- [ ] `server.go` e `proxy.go` -- `App.telegram` criado em `newApp`; `serveProxy` chama `notifyFailure` no ponto da falha (depois do `orig.Err()` do cancelamento, então cancelamento não conta) e `rearm()` quando algum tier atende
-- [ ] `docs/configuration.md` -- documentar `telegram:` (campos, uma vez por episódio, convive com SMTP, token no arquivo como as demais credenciais)
-- [ ] `main_test.go` -- servidor Telegram falso (`httptest`): primeira falha envia e o cliente recebe o erro; segunda no mesmo episódio não envia; depois de um tier atender, nova falha envia; sem `telegram:` nada enviado; falha de envio (500) não afeta a request; `safeConfigSummary` e logs sem o token
+- [x] `telegram.go` -- `TelegramConfig{BotToken, ChatID}`, `TelegramNotifier` com estado armado/desarmado sob mutex; `notifyFailure(model)` (envia só se configurado e armado, desarma; `go` com timeout de ~10s e client próprio), `rearm()`; URL base em `var telegramAPIBase = "https://api.telegram.org"` para o teste; erro de envio logado sem token -- notificador isolado e testável
+- [x] `config.go` -- campo `Telegram TelegramConfig`; `yaml:"telegram"` com `bot_token` e `chat_id` (chat_id aceita número ou string: tipo `string` basta com YAML escalar); `mergeConfig`; `safeConfigSummary` com `telegram_configured` -- config só em YAML
+- [x] `server.go` e `proxy.go` -- `App.telegram` criado em `newApp`; `serveProxy` chama `notifyFailure` no ponto da falha (depois do `orig.Err()` do cancelamento, então cancelamento não conta) e `rearm()` quando algum tier atende
+- [x] `docs/configuration.md` -- documentar `telegram:` (campos, uma vez por episódio, convive com SMTP, token no arquivo como as demais credenciais)
+- [x] `main_test.go` -- servidor Telegram falso (`httptest`): primeira falha envia e o cliente recebe o erro; segunda no mesmo episódio não envia; depois de um tier atender, nova falha envia; sem `telegram:` nada enviado; falha de envio (500) não afeta a request; `safeConfigSummary` e logs sem o token
 
 **Acceptance Criteria:**
 - Given `telegram:` configurado e nenhum tier disponível, when chega uma request, then o cliente recebe o erro de sempre e o servidor Telegram falso recebe um `sendMessage` com o `chat_id` configurado.
@@ -101,12 +101,12 @@ Episódio = intervalo entre dois sucessos de qualquer tier. Resposta 400 devolvi
 
 ### 2026-10-29 — 0 decision-needed, 6 patch, 0 defer, 15 rejected
 
-- [ ] [Review][Patch] Teste: rearme quando o tier 0 atende após uma falha [proxy.go:153]
-- [ ] [Review][Patch] Teste: cancelamento do cliente não envia aviso nem consome o episódio [proxy.go:159]
-- [ ] [Review][Patch] Teste: `newApp` com `Telegram` na config envia sem sobrescrever `app.telegram` [server.go:46]
-- [ ] [Review][Patch] Teste: `telegram_configured=false` com só um dos dois campos [config.go:499]
-- [ ] [Review][Patch] Teste: resposta 4xx de upstream que não é falha de tier rearma; gatilho do SMTP segue igual com Telegram ligado [proxy.go:150]
-- [ ] [Review][Patch] `bot_token` e `chat_id` sem `strings.TrimSpace` (`state_file` já é aparado) [config.go:268]
+- [x] [Review][Patch] Teste: rearme quando o tier 0 atende após uma falha [proxy.go:153]
+- [x] [Review][Patch] Teste: cancelamento do cliente não envia aviso nem consome o episódio [proxy.go:159]
+- [x] [Review][Patch] Teste: `newApp` com `Telegram` na config envia sem sobrescrever `app.telegram` [server.go:46]
+- [x] [Review][Patch] Teste: `telegram_configured=false` com só um dos dois campos [config.go:499]
+- [x] [Review][Patch] Teste: resposta 4xx de upstream que não é falha de tier rearma; gatilho do SMTP segue igual com Telegram ligado [proxy.go:150]
+- [x] [Review][Patch] `bot_token` e `chat_id` sem `strings.TrimSpace` (`state_file` já é aparado) [config.go:268]
 
 #### Rejected
 - Aviso perdido se o envio falha (2 achados): o plano aceita sem retry; rearmar na falha dispararia um envio por request.

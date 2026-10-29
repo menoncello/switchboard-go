@@ -8,7 +8,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log"
 	"log/slog"
 	"net"
 	"net/http"
@@ -321,12 +320,4 @@ func (a *App) handleValidateKeys(w http.ResponseWriter, r *http.Request) {
 		results = append(results, res)
 	}
 	writeJSON(w, http.StatusOK, ValidateKeysResponse{Results: results})
-}
-
-func (a *App) validateConfigAndPrint() error {
-	if err := validateConfig(a.config); err != nil {
-		return err
-	}
-	log.Println(safeConfigSummary(a.config))
-	return nil
 }

@@ -104,16 +104,6 @@ func (m *KeyManager) ShouldNotifyAllExhausted() bool {
 	return true
 }
 
-func (m *KeyManager) AdvanceOnExhaustion() (int, string, bool) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	if len(m.keys) == 0 {
-		return 0, "", false
-	}
-	m.advanceLocked()
-	return m.current, m.keys[m.current], true
-}
-
 func (m *KeyManager) advanceLocked() {
 	if len(m.keys) == 0 {
 		return

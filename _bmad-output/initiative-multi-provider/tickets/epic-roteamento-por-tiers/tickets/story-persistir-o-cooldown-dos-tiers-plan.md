@@ -58,11 +58,11 @@ deferred: []
 ## Tasks & Acceptance
 
 **Execution:**
-- [ ] `config.go`, `main.go` -- `StateFile` (YAML `state_file`, merge) e `warnNoStateFile`, chamado na partida e no `validate-config`
-- [ ] `cooldown.go`, `keys.go` -- `snapshot`/`restore` dos cooldowns e das chaves esgotadas (hash por prefixo do SHA-256)
-- [ ] `server.go` -- `saveState` (JSON, deduplicado, escrita atômica, erro só logado), carga em `newApp`, chamada ao fim das requests de proxy e admin
-- [ ] `main_test.go` -- cobrir a matriz: sobrevive a recriar o app, vencido volta elegível, chave achada pelo hash e arquivo sem o valor da chave, sem `state_file` nada gravado e aviso, falha de escrita não derruba a request, arquivo corrompido
-- [ ] `docs/configuration.md`, `docs/docker.md` -- `state_file` (YAML, sem env, aviso sem ele) e o volume (diretório gravável por UID 65532 do `nonroot`)
+- [x] `config.go`, `main.go` -- `StateFile` (YAML `state_file`, merge) e `warnNoStateFile`, chamado na partida e no `validate-config`
+- [x] `cooldown.go`, `keys.go` -- `snapshot`/`restore` dos cooldowns e das chaves esgotadas (hash por prefixo do SHA-256)
+- [x] `server.go` -- `saveState` (JSON, deduplicado, escrita atômica, erro só logado), carga em `newApp`, chamada ao fim das requests de proxy e admin
+- [x] `main_test.go` -- cobrir a matriz: sobrevive a recriar o app, vencido volta elegível, chave achada pelo hash e arquivo sem o valor da chave, sem `state_file` nada gravado e aviso, falha de escrita não derruba a request, arquivo corrompido
+- [x] `docs/configuration.md`, `docs/docker.md` -- `state_file` (YAML, sem env, aviso sem ele) e o volume (diretório gravável por UID 65532 do `nonroot`)
 
 **Acceptance Criteria:**
 - Given um tier em cooldown e `state_file` definido, when o app é recriado a partir do arquivo, then o tier continua em cooldown.
@@ -90,7 +90,7 @@ deferred: []
 ## Auto Run Result
 
 - Mudança: `state_file` (YAML) grava um JSON com os cooldowns vigentes (tier 0 e extras) e as chaves esgotadas do tier 0, identificadas por 16 hex do SHA-256, com escrita atômica; `newApp` carrega e ignora o que já venceu. Sem `state_file`, nada é gravado e a partida avisa.
-- Arquivos: `config.go` (campo, YAML, merge, `warnNoStateFile`), `main.go` (aviso na partida e no `validate-config`), `cooldown.go` e `keys.go` (`snapshot`/`restore`, `keyID`), `server.go` (`loadState`, `saveState`, `writeFileAtomic`, gravação ao fim das requests de proxy e admin), `main_test.go` (8 testes novos), `docs/configuration.md` e `docs/docker.md`.
+- Arquivos: `config.go` (campo, YAML, merge, `warnNoStateFile`), `main.go` (aviso na partida e no `validate-config`), `cooldown.go` e `keys.go` (`snapshot`/`restore`, `keyID`), `server.go` (`loadState`, `saveState`, `writeFileAtomic`, gravação ao fim das requests de proxy e admin), `main_test.go` (testes novos), `docs/configuration.md` e `docs/docker.md`.
 - Review: 7 achados low; 3 patches aplicados, 4 rejeitados (motivos no log).
 - Follow-up recomendado: não.
 - Verificação: `go build`, `go vet` e `go test -race -count=1 ./...` passam, antes e depois dos patches.

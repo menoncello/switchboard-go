@@ -100,7 +100,8 @@ func (a *App) serveProxy(w http.ResponseWriter, r *http.Request, style APIStyle)
 	keyIdx = -1
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
-		if strings.Contains(err.Error(), "request body too large") {
+		var tooLarge *http.MaxBytesError
+		if errors.As(err, &tooLarge) {
 			http.Error(w, "request body too large", http.StatusRequestEntityTooLarge)
 			return
 		}

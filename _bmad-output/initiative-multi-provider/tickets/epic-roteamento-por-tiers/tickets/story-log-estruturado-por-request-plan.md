@@ -57,10 +57,10 @@ deferred: []
 ## Tasks & Acceptance
 
 **Execution:**
-- [ ] `proxy.go` -- trocar `proxyV1` por um wrapper que embrulha o `ResponseWriter` num recorder de status (com `Flush`, `Unwrap`), mede o tempo e grava a linha no fim; mover o corpo atual para uma função interna que devolve `model`, `tier`, `key_index`, para o wrapper logar; `proxyTiers` passa a devolver o nome do tier que respondeu (vazio quando devolveu 502); extrair o helper do `model` de topo -- log por request
-- [ ] `server.go` -- campo `logger` em `App` e valor padrão em `newApp` -- ponto único de saída do log, substituível em teste
-- [ ] `main_test.go` -- testes da matriz: tier 0 e tier 1 conferindo os campos (inclusive `key_name`), stream com latência até o fim, 429 local, 502 sem tier, ausência dos valores de chave em todas as linhas, estilo Anthropic; confirmar que os testes existentes seguem passando -- cobrir a matriz
-- [ ] `docs/configuration.md` -- seção `## Request log` com a linha de exemplo, os campos e o aviso de que a chave nunca é logada -- documentação
+- [x] `proxy.go` -- trocar `proxyV1` por um wrapper que embrulha o `ResponseWriter` num recorder de status (com `Flush`, `Unwrap`), mede o tempo e grava a linha no fim; mover o corpo atual para uma função interna que devolve `model`, `tier`, `key_index`, para o wrapper logar; `proxyTiers` passa a devolver o nome do tier que respondeu (vazio quando devolveu 502); extrair o helper do `model` de topo -- log por request
+- [x] `server.go` -- campo `logger` em `App` e valor padrão em `newApp` -- ponto único de saída do log, substituível em teste
+- [x] `main_test.go` -- testes da matriz: tier 0 e tier 1 conferindo os campos (inclusive `key_name`), stream com latência até o fim, 429 local, 502 sem tier, ausência dos valores de chave em todas as linhas, estilo Anthropic; confirmar que os testes existentes seguem passando -- cobrir a matriz
+- [x] `docs/configuration.md` -- seção `## Request log` com a linha de exemplo, os campos e o aviso de que a chave nunca é logada -- documentação
 
 **Acceptance Criteria:**
 - Given uma request atendida pelo tier 0 e outra pelo tier 1, when as duas terminam, then há duas linhas JSON com modelo, estilo, tier (e chave no tier 0), status e latência, e nenhuma contém o valor de uma chave.

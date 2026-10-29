@@ -60,11 +60,11 @@ deferred: []
 ## Tasks & Acceptance
 
 **Execution:**
-- [ ] `config.go` -- campo `cooldown` por tier (parse e validação) -- cooldown por tier
-- [ ] `server.go` (ou `cooldown.go`) -- estado de cooldown por tier, com `now` injetável e consulta do tempo restante -- base do pulo e do `Retry-After`
-- [ ] `proxy.go` -- classificador de status de falha (`401`, `402`, `404` elegível, `>=500`, `429`), tier 0 pulado em cooldown e posto em cooldown nos statuses que não giram chave, laço de tiers com pulo/cooldown/retenção da última resposta, `Retry-After` calculado entre os tiers elegíveis -- failover por status
-- [ ] `main_test.go` -- testes da matriz (cada status com um upstream que falha e outro que atende, 400, 404 de modelo inexistente, stream iniciado, volta após o cooldown com relógio injetado, última resposta quando todos falham, 429 local com `Retry-After`, `cooldown` do tier e padrão); atualizar os dois testes antigos; `go test -race ./...` passa -- cobrir a matriz
-- [ ] `docs/configuration.md` -- `cooldown` na tabela de campos, regras de failover e cooldown, 404 de modelo inexistente, última resposta e 429 local; remover as frases antigas ("any other response... without further failover", "só quota 429") -- documentação
+- [x] `config.go` -- campo `cooldown` por tier (parse e validação) -- cooldown por tier
+- [x] `server.go` (ou `cooldown.go`) -- estado de cooldown por tier, com `now` injetável e consulta do tempo restante -- base do pulo e do `Retry-After`
+- [x] `proxy.go` -- classificador de status de falha (`401`, `402`, `404` elegível, `>=500`, `429`), tier 0 pulado em cooldown e posto em cooldown nos statuses que não giram chave, laço de tiers com pulo/cooldown/retenção da última resposta, `Retry-After` calculado entre os tiers elegíveis -- failover por status
+- [x] `main_test.go` -- testes da matriz (cada status com um upstream que falha e outro que atende, 400, 404 de modelo inexistente, stream iniciado, volta após o cooldown com relógio injetado, última resposta quando todos falham, 429 local com `Retry-After`, `cooldown` do tier e padrão); atualizar os dois testes antigos; `go test -race ./...` passa -- cobrir a matriz
+- [x] `docs/configuration.md` -- `cooldown` na tabela de campos, regras de failover e cooldown, 404 de modelo inexistente, última resposta e 429 local; remover as frases antigas ("any other response... without further failover", "só quota 429") -- documentação
 
 **Acceptance Criteria:**
 - Given tier 0 responde cada um de 401, 402, 404 (modelo mapeado), 500 e 429 comum e o tier 1 atende, when a request chega, then o tier 1 responde, o tier 0 fica em cooldown e a request seguinte não chama o tier 0.

@@ -49,17 +49,17 @@ deferred: []
 ## Code Map
 
 - `config.go` -- `Config` (campo novo `MinContext int`), `defaultConfig` (64000), `yamlConfig` (`min_context *int`; `loadYAMLConfig` passa -1 quando ausente, como `retry`), `mergeConfig` (`>= 0` sobrescreve), `validateConfig` (< 0 rejeita). `TierModel.Context/Tools` já existem e já são parseados.
-- `proxy.go` -- `tierModelID(t, model, style)` é o ponto único do filtro, chamado por `proxyTiers` e `localRetryAfter`; `proxyV1` já tem `fields` (via `topLevelModel`) de onde sai o `tools`. Reutilizar `tierModelID`, não criar segundo filtro.
+- `proxy.go` -- `tierModelID(t, model, style)` é o ponto único do filtro, chamado por `proxyTiers` e `localRetryAfter`; `serveProxy` já tem `fields` (via `topLevelModel`) de onde sai o `tools`. Reutilizar `tierModelID`, não criar segundo filtro.
 - `main_test.go` -- fixture `tierOK` (~l.1343) e testes de tiers: modelos com `context` ausente passam a ficar inelegíveis; ajustar os fixtures dos testes de failover (`context` >= padrão ou `min_context` explícito) e `tools: true` onde a request leva tools.
 - `docs/configuration.md` -- exemplo YAML (l.~77-87) e tabela de campos do tier (l.~145); seção "Tiers".
 
 ## Tasks & Acceptance
 
 **Execution:**
-- [ ] `config.go` -- `MinContext` na `Config` (padrão 64000), YAML `min_context`, merge, validação `>= 0`
-- [ ] `proxy.go` -- `tierModelID` passa a receber `minContext int` e `needTools bool` e retorna `false` se `m.Context < minContext` ou (`needTools && !m.Tools`); `proxyV1` calcula `needTools` uma vez a partir de `fields["tools"]` (presente, não `null`, não `[]`) e o repassa a `proxyTiers` e `localRetryAfter`
-- [ ] `main_test.go` -- ajustar fixtures existentes e cobrir cada linha da matriz (inclui `min_context` ausente = 64000, `0` e negativo; `localRetryAfter` ignora tier inelegível)
-- [ ] `docs/configuration.md` -- `min_context` no exemplo e numa subseção "Eligibility" (context, tools, tier 0 isento, contexto ausente = inelegível, request sem tools); `context` e `tools` descritos na tabela de `models`
+- [x] `config.go` -- `MinContext` na `Config` (padrão 64000), YAML `min_context`, merge, validação `>= 0`
+- [x] `proxy.go` -- `tierModelID` passa a receber `minContext int` e `needTools bool` e retorna `false` se `m.Context < minContext` ou (`needTools && !m.Tools`); `serveProxy` calcula `needTools` uma vez a partir de `fields["tools"]` (presente, não `null`, não `[]`) e o repassa a `proxyTiers` e `localRetryAfter`
+- [x] `main_test.go` -- cobrir cada linha da matriz (inclui `min_context` ausente = 64000, `0` e negativo; `localRetryAfter` ignora tier inelegível) (o ajuste dos fixtures existentes foi rejeitado na revisão)
+- [x] `docs/configuration.md` -- `min_context` no exemplo e numa subseção "Eligibility" (context, tools, tier 0 isento, contexto ausente = inelegível, request sem tools); `context` e `tools` descritos na tabela de `models`
 
 **Acceptance Criteria:**
 - Given um modelo mapeado com contexto abaixo do mínimo, when a request chega com o tier 0 em cooldown, then o tier é pulado e o cliente recebe o 429 local.
