@@ -620,7 +620,7 @@ func (a *App) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		_, _ = w.Write([]byte("ok"))
 	case r.URL.Path == "/readyz":
 		a.handleReadyz(w, r)
-	case r.URL.Path == "/status" && r.Method == http.MethodGet:
+	case r.URL.Path == "/status" && (r.Method == http.MethodGet || r.Method == http.MethodHead):
 		a.handleStatusPage(w, r)
 	case strings.HasPrefix(r.URL.Path, "/admin/"):
 		if !a.authOK(r) {

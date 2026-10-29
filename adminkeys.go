@@ -126,14 +126,20 @@ func (a *App) usageFor(ctx context.Context) []usageEntry {
 		}(i, key)
 	}
 	wg.Wait()
-	for i, e := range fresh {
-		if e != nil {
-			c.entries[i] = *e
+	// A cancelled request yields cancel errors: show them once, never cache them for the TTL.
+	if ctx.Err() == nil {
+		for i, e := range fresh {
+			if e != nil {
+				c.entries[i] = *e
+			}
 		}
 	}
 	out := make([]usageEntry, len(keys))
 	for i := range keys {
 		out[i] = c.entries[i]
+		if fresh[i] != nil {
+			out[i] = *fresh[i]
+		}
 	}
 	return out
 }

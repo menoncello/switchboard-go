@@ -3,7 +3,7 @@ title: 'Página /status com o estado e o uso de cada chave'
 type: 'feature'
 ticket: '1'
 created: '2026-10-29'
-status: 'built'
+status: done
 baseline_revision: '271272114ce07e5aac86bc213295618d47871a93'
 route: 'oneshot'
 route_source: 'auto'
@@ -74,3 +74,25 @@ Oneshot: mudança pequena (~80 linhas em 2 arquivos + testes), um template e uma
 - Follow-up review recomendado: false (nenhum patch high, menos de 2 medium).
 - Verificação: `gofmt`, `go vet` e `go test -count=1 ./...` passam. Abrir `/status` contra o proxy rodando não foi feito.
 - Riscos residuais: o cache de uso pode guardar erro de cancelamento (adiado); com `USAGE_CACHE_TTL=0` cada visita consulta o upstream (aceito).
+
+## Code Review
+
+### 2026-10-29
+Code review complete. 0 `decision-needed`, 7 `patch`, 0 `defer`, 14 rejected.
+
+- [x] [Review][Patch] Cancelar a requisição durante usageFor grava erro no cache de uso (agora alcançável sem autenticação); não guardar entradas quando ctx.Err() != nil [adminkeys.go:usageFor]
+- [x] [Review][Patch] Testes de /status não verificam a célula de cooldown nem o marcador "(atual)" [main_test.go:TestStatusPageOpenAndNoKeyLeak]
+- [x] [Review][Patch] Janela de uso parcial (traço "—") não é exercitada; um 500 por nil não seria pego [main_test.go]
+- [x] [Review][Patch] `Cache-Control: no-store` não é verificado [main_test.go]
+- [x] [Review][Patch] Erro de uso não é fixado na linha da chave, escape de HTML (KeyNames/UsageError) não é testado e as asserções por substring são frouxas ("7.0%" casa "17.0%") [main_test.go:TestStatusPageUsageErrorOnKeyRow]
+- [x] [Review][Patch] HEAD /status devolve 404; aceitar HEAD [main.go:623]
+- [x] [Review][Patch] docs/operations.md diz que só /healthz e /readyz são abertas; incluir /status [docs/operations.md:60]
+
+Rejected:
+- Gastar cota com visitas anônimas: falso, usageFor segura o mutex no refresh e coalesce; limite é chaves por TTL (TTL=0 aceito no épico).
+- Nil em .Usage no template: falso, fetchUsage devolve usage não-nil quando err vazio e usageFor preenche todo índice.
+- UsageError vaza detalhe do upstream: falso, só "HTTP n", timeout ou nome de tipo Go.
+- Contagem do log de revisão / check manual não feito: falso, contas batem e o check pendente está declarado.
+- usage[i] fora do limite: falso, KeyManager e usage nascem da mesma lista imutável.
+- Mutex de usageFor ignora ctx: baixo, espera limitada a 5s, correção exige lock com ctx.
+- Zero chaves / ProxyAPIKey vazia sem teste: baixo, zero chaves é rejeitado na config (main.go:319).
