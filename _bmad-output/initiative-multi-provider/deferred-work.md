@@ -12,3 +12,6 @@
 
 ## Deferred from: code review of story-estilos-de-api-por-tier-plan (2026-10-29)
 - `proxy.go:352`: `apiStyleForRequest` testa `HasPrefix(path, "/complete")` e classifica `/v1/completions` (OpenAI legado) como anthropic; a request sai com `x-api-key` e pula tiers só OpenAI. Pré-existente.
+
+## Deferred from: code review of story-elegibilidade-por-contexto-minimo-e-tool-calling-plan (2026-10-29)
+- Plano inconsistente: checkboxes `[ ]` com status built, `proxyV1` no lugar de `serveProxy`, task de fixtures rejeitada ainda listada. Corrigir no fechamento do plano.

@@ -3,7 +3,7 @@ title: 'Elegibilidade por contexto mínimo e tool calling'
 type: 'feature'
 ticket: 6
 created: '2026-10-29'
-status: 'built'
+status: 'done'
 baseline_revision: 'a7364d61a316fdc124260f1ee3d91111aacb4a95'
 route: 'full'
 route_source: 'auto'
@@ -97,3 +97,20 @@ O tier 0 não passa por `tierModelID`, então já é isento sem código novo. `t
 **Commands:**
 - `go build ./... && go vet ./...` -- expected: sem erros
 - `go test -race -count=1 ./...` -- expected: todos passam, incluindo os novos
+
+## Code Review
+
+### 2026-10-29 — 2 decision-needed, 2 patch, 1 defer, 7 rejected
+
+- [x] [Review][Patch] Tier inelegível é silencioso: nota de upgrade em docs/configuration.md e aviso no startup quando um tier não tem modelo elegível sob `min_context` [config.go, docs/configuration.md] (decisão 1b)
+- [x] [Review][Patch] Documentar que só `tools` não vazio conta como request com tools; `functions` e `tools` não-array não são tratados [docs/configuration.md] (decisão 2a)
+- [x] [Review][Patch] `Retry-After` com needTools=true sem teste [main_test.go:TestLocalRetryAfterIgnoresIneligibleTier]
+- [x] [Review][Patch] Faltam testes: tier 0 isento, padrão 64000 carregado passando pelo proxy, `"tools": [ ]`, estilo anthropic [main_test.go]
+- [x] [Review][Defer] Plano inconsistente (checkboxes `[ ]` com status built, `proxyV1` no lugar de `serveProxy`, task de fixtures rejeitada ainda listada) [plan] — deferred: o fix edita o arquivo de ticket/plano
+
+Rejected:
+- `tools` parseado em toda request: custo desprezível, o fix preguiçoso adiciona complexidade.
+- tool_calls no histórico sem `tools`: clientes reenviam `tools` a cada turno.
+- Parâmetros posicionais crescendo em proxyTiers/localRetryAfter: refactor sem defeito.
+- Exemplo do doc possivelmente inelegível: falso, o exemplo tem `context: 131072` e `tools: true`.
+- Menores (mensagem de erro, validação redundante, comentários longos, "risco nenhum"): baixo valor.
