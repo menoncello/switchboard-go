@@ -1553,6 +1553,32 @@ func TestTierSkippedWhenStyleMissing(t *testing.T) {
 	}
 }
 
+func TestTierAuthFollowsRequestStyle(t *testing.T) {
+	f := newTierFixture(t, false, false)
+	f.app.config.Tiers = f.app.config.Tiers[1:] // only t2, which speaks both styles
+	tierReq(f.app, http.MethodPost, "/v1/chat/completions", `{"model":"a"}`, nil)
+	tierReq(f.app, http.MethodPost, "/v1/messages", `{"model":"a"}`, map[string]string{"anthropic-version": "2023-06-01"})
+	_, auths := f.seen()
+	if len(auths) != 2 || auths[0] != "Bearer k2||" || auths[1] != "|k2|2023-06-01" {
+		t.Fatalf("auths %q", auths)
+	}
+}
+
+func TestNoCompatibleTierReturnsLocal429InRequestStyle(t *testing.T) {
+	f := newTierFixture(t, false, false)
+	f.app.config.Tiers = f.app.config.Tiers[:1] // only t1, openai only
+	rec := tierReq(f.app, http.MethodPost, "/v1/messages", `{"model":"a"}`, map[string]string{"anthropic-version": "2023-06-01"})
+	var got struct {
+		Type  string `json:"type"`
+		Error struct {
+			Type string `json:"type"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil || rec.Code != http.StatusTooManyRequests || got.Type != "error" || got.Error.Type != "rate_limit_error" || f.hits()[1] != 0 {
+		t.Fatalf("code=%d body=%q hits=%v", rec.Code, rec.Body.String(), f.hits())
+	}
+}
+
 func TestTierExhaustedFallsToNextTier(t *testing.T) {
 	f := newTierFixture(t, false, true)
 	rec := tierReq(f.app, http.MethodPost, "/v1/chat/completions", `{"model":"a"}`, nil)

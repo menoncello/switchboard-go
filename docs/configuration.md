@@ -146,6 +146,20 @@ and only when every tier 0 key is exhausted. To try it by hand, run
 
 `validate-config` shows only the number of tiers (`tiers=N`).
 
+### API styles
+
+A request is `anthropic` when its path starts with `/v1/messages` or
+`/v1/complete`, or it carries any `anthropic-*` header; otherwise it is `openai`.
+`styles` lists the styles a tier speaks, and the proxy never translates between
+them: a tier that does not list the request's style is skipped. The credential
+follows the request's style, not the tier's: `x-api-key` (plus
+`anthropic-version`, `2023-06-01` when the client sent none) for `anthropic`, and
+`Authorization: Bearer` for `openai`, so a tier that lists both authenticates
+each request the way that request expects. Tier 0 is not filtered by style. When
+no tier speaks the request's style and none returned a response, the client gets
+the local `429` (see above), in the request's own error format. A provider that serves the two styles at different
+URLs is two tiers, each with its own `base_url`.
+
 ## Request log
 
 Every proxied request writes one JSON line to stderr when its response ends
