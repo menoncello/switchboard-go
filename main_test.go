@@ -1628,17 +1628,20 @@ func TestTierEmptyIDForwardsName(t *testing.T) {
 	}
 }
 
-func TestTierConnectionErrorReturns502(t *testing.T) {
+func TestTierConnectionErrorFailsOverWithoutCooldown(t *testing.T) {
 	f := newTierFixture(t, false, false)
 	dead := httptest.NewServer(http.NotFoundHandler())
 	f.app.config.Tiers[0].BaseURL = dead.URL
 	dead.Close()
 	rec := tierReq(f.app, http.MethodPost, "/v1/chat/completions", `{"model":"a"}`, nil)
-	if rec.Code != http.StatusBadGateway || f.hits()[2] != 0 {
+	if rec.Code != http.StatusOK || f.hits()[2] != 1 || f.app.cooldowns.remaining("t1") != 0 {
 		t.Fatalf("got %d hits=%v", rec.Code, f.hits())
 	}
-	if strings.Contains(rec.Body.String(), dead.URL) {
-		t.Fatalf("502 body leaks tier URL: %q", rec.Body.String())
+	// every extra tier unreachable: 502 that does not leak the tier URL
+	f.app.config.Tiers[1].BaseURL = dead.URL
+	rec = tierReq(f.app, http.MethodPost, "/v1/chat/completions", `{"model":"a"}`, nil)
+	if rec.Code != http.StatusBadGateway || strings.Contains(rec.Body.String(), dead.URL) {
+		t.Fatalf("got %d %q", rec.Code, rec.Body.String())
 	}
 }
 
@@ -2117,18 +2120,117 @@ func TestFailoverTier0WithoutExtraTiersCooldownAndRetry(t *testing.T) {
 	}
 }
 
-func TestFailoverHeldTier0FailureThenUnreachableTierReturns502(t *testing.T) {
+func TestFailoverHeldTier0FailureThenUnreachableTierGoesOn(t *testing.T) {
 	s0, s1, s2 := newStub(t, 500, `from t0`), newStub(t, 200, `x`), newStub(t, 200, `{"from":"t2"}`)
 	s1.srv.Close() // t1 is unreachable: connection refused
 	app, _ := failoverApp(t, s0, s1, s2, time.Hour)
-	lines := captureLog(app)
 	rec := chatReq(app, `{"model":"a"}`)
-	if rec.Code != 502 || s2.hits.Load() != 0 {
-		t.Fatalf("got %d %q t2 hits=%d", rec.Code, rec.Body.String(), s2.hits.Load())
+	if rec.Code != 200 || rec.Body.String() != `{"from":"t2"}` || app.cooldowns.remaining("t1") != 0 {
+		t.Fatalf("got %d %q", rec.Code, rec.Body.String())
 	}
-	// the held tier 0 response is discarded on a connection error
-	if l := lines(t); len(l) != 1 || l[0]["status"] != float64(502) || l[0]["tier"] != "" {
-		t.Fatalf("log %v", l)
+	// no tier left after the unreachable one: the held tier 0 response is served
+	s2.srv.Close()
+	app, _ = failoverApp(t, newStub(t, 500, `from t0`), s1, nil, time.Hour)
+	rec = chatReq(app, `{"model":"a"}`)
+	if rec.Code != 500 || rec.Body.String() != "from t0" {
+		t.Fatalf("held: %d %q", rec.Code, rec.Body.String())
+	}
+}
+
+func TestFailoverConnectionErrorTier0(t *testing.T) {
+	s0, s1 := newStub(t, 200, `x`), newStub(t, 200, `{"from":"t1"}`)
+	s0.srv.Close()
+	app, _ := failoverApp(t, s0, s1, nil, time.Hour)
+	rec := chatReq(app, `{"model":"a"}`)
+	idx, _, ok := app.keys.Current()
+	if rec.Body.String() != `{"from":"t1"}` || app.cooldowns.remaining(tier0CooldownKey) != 0 || !ok || idx != 0 {
+		t.Fatalf("got %d %q idx=%d", rec.Code, rec.Body.String(), idx)
+	}
+	// the next request tries tier 0 again (still no cooldown, keys intact)
+	chatReq(app, `{"model":"a"}`)
+	if idx, _, _ := app.keys.Current(); app.cooldowns.remaining(tier0CooldownKey) != 0 || idx != 0 || s1.hits.Load() != 2 {
+		t.Fatalf("second request: idx=%d t1 hits=%d", idx, s1.hits.Load())
+	}
+}
+
+func TestFailoverHeaderTimeoutGoesToNextTier(t *testing.T) {
+	slow := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.Copy(io.Discard, r.Body) // lets the server notice the client closing
+		select {
+		case <-r.Context().Done():
+		case <-time.After(5 * time.Second):
+		}
+	}))
+	defer slow.Close()
+	s1 := newStub(t, 200, `{"from":"t1"}`)
+	app, _ := failoverApp(t, &stub{srv: slow}, s1, nil, time.Hour)
+	app.client.Transport.(*http.Transport).ResponseHeaderTimeout = 50 * time.Millisecond
+	rec := chatReq(app, `{"model":"a"}`)
+	if rec.Body.String() != `{"from":"t1"}` || app.cooldowns.remaining(tier0CooldownKey) != 0 {
+		t.Fatalf("got %d %q", rec.Code, rec.Body.String())
+	}
+}
+
+func TestFailoverConnectionErrorExtraTierAndAllUnreachable(t *testing.T) {
+	s0, s1, s2 := newStub(t, 500, `from t0`), newStub(t, 200, `x`), newStub(t, 200, `{"from":"t2"}`)
+	s1.srv.Close()
+	app, _ := failoverApp(t, s0, s1, s2, time.Hour)
+	rec := chatReq(app, `{"model":"a"}`)
+	if rec.Body.String() != `{"from":"t2"}` || app.cooldowns.remaining("t1") != 0 {
+		t.Fatalf("extra tier: %d %q", rec.Code, rec.Body.String())
+	}
+	d0, d1 := newStub(t, 200, `x`), newStub(t, 200, `x`)
+	d0.srv.Close()
+	d1.srv.Close()
+	app, _ = failoverApp(t, d0, d1, nil, time.Hour)
+	lines := captureLog(app)
+	rec = chatReq(app, `{"model":"a"}`)
+	if l := lines(t); rec.Code != 502 || l[0]["tier"] != "" || l[0]["status"] != float64(502) ||
+		app.cooldowns.remaining(tier0CooldownKey) != 0 || app.cooldowns.remaining("t1") != 0 {
+		t.Fatalf("all unreachable: %d %v", rec.Code, l)
+	}
+}
+
+func TestFailoverNoModelStaysOnTier0(t *testing.T) {
+	s0, s1 := newStub(t, 200, `x`), newStub(t, 200, `x`)
+	s0.srv.Close()
+	app, _ := failoverApp(t, s0, s1, nil, time.Hour)
+	rec := tierReq(app, http.MethodGet, "/v1/models", "", nil)
+	if rec.Code != 502 || s1.hits.Load() != 0 {
+		t.Fatalf("got %d t1 hits=%d", rec.Code, s1.hits.Load())
+	}
+}
+
+func TestFailoverClientCancelStopsWithoutTouchingState(t *testing.T) {
+	for _, slowTier := range []int{0, 1} {
+		ctx, cancel := context.WithCancel(context.Background())
+		slow := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			_, _ = io.Copy(io.Discard, r.Body) // lets the server notice the client closing
+			cancel()
+			select {
+			case <-r.Context().Done():
+			case <-time.After(5 * time.Second):
+			}
+		}))
+		defer slow.Close()
+		next, s2 := newStub(t, 200, `x`), newStub(t, 200, `x`)
+		var app *App
+		if slowTier == 0 {
+			app, _ = failoverApp(t, &stub{srv: slow}, next, s2, time.Hour)
+		} else {
+			app, _ = failoverApp(t, newStub(t, 500, `from t0`), &stub{srv: slow}, s2, time.Hour)
+		}
+		lines := captureLog(app)
+		req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"a"}`)).WithContext(ctx)
+		req.Header.Set("Authorization", "Bearer p")
+		app.ServeHTTP(httptest.NewRecorder(), req)
+		l := lines(t)
+		if len(l) != 1 || l[0]["status"] != float64(499) || l[0]["tier"] != "" || s2.hits.Load() != 0 || next.hits.Load() != 0 || app.cooldowns.remaining("t1") != 0 {
+			t.Fatalf("slow tier %d: log=%v t2 hits=%d next hits=%d", slowTier, l, s2.hits.Load(), next.hits.Load())
+		}
+		if slowTier == 0 && app.cooldowns.remaining(tier0CooldownKey) != 0 {
+			t.Fatal("tier 0 in cooldown after a client cancel")
+		}
 	}
 }
 

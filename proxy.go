@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"math"
 	"net/http"
@@ -113,8 +114,13 @@ func (a *App) serveProxy(w http.ResponseWriter, r *http.Request, style APIStyle)
 			}
 			resp, reqErr := a.doUpstream(orig, r, body, a.config.UpstreamBaseURL, key, style)
 			if reqErr != nil {
-				http.Error(w, reqErr.Error(), http.StatusBadGateway)
-				return model, "", -1
+				if orig.Err() != nil {
+					w.WriteHeader(statusClientClosed)
+					return model, "", -1
+				}
+				// Connection error or timeout: no cooldown, no key rotation, on to the extra tiers.
+				last.err = reqErr
+				break
 			}
 			if isKeyDead(resp) {
 				_ = resp.Body.Close()
@@ -141,6 +147,10 @@ func (a *App) serveProxy(w http.ResponseWriter, r *http.Request, style APIStyle)
 	if name, ok := a.proxyTiers(orig, w, r, fields, model, style, &last); ok {
 		return model, name, -1
 	}
+	if last.err != nil && orig.Err() != nil {
+		w.WriteHeader(statusClientClosed)
+		return model, "", -1
+	}
 	// No tier served it; alert once when every tier 0 key is exhausted.
 	if a.keys.ShouldNotifyAllExhausted() {
 		a.sender.NotifyAllExhausted(a.keys.Status())
@@ -148,6 +158,10 @@ func (a *App) serveProxy(w http.ResponseWriter, r *http.Request, style APIStyle)
 	if last.resp != nil {
 		copyResponse(w, last.resp)
 		return model, last.tier, last.key
+	}
+	if last.err != nil {
+		http.Error(w, last.err.Error(), http.StatusBadGateway)
+		return model, "", -1
 	}
 	// No eligible tier remains. Fail fast locally instead of hammering upstream,
 	// and hint well-behaved clients at the first window via Retry-After.
@@ -164,11 +178,15 @@ type heldResponse struct {
 	resp *http.Response
 	tier string
 	key  int
+	err  error // last connection error or timeout, served as 502 when no response is held
 }
+
+// statusClientClosed is logged when the client cancels the request (nginx's 499).
+const statusClientClosed = 499
 
 func (h *heldResponse) hold(resp *http.Response, tier string, key int) {
 	h.release()
-	*h = heldResponse{resp: resp, tier: tier, key: key}
+	*h = heldResponse{resp: resp, tier: tier, key: key, err: h.err}
 }
 
 func (h *heldResponse) release() {
@@ -227,8 +245,9 @@ func isTierFailure(resp *http.Response, hasModel bool) bool {
 
 // proxyTiers tries the configured tiers in order after tier 0 failed or was
 // skipped and returns the name of the tier that answered and whether one did (the
-// name is empty for the 502 on a connection error). A tier that fails is put in
-// cooldown and its response kept in last. A request without a top-level string
+// name is empty when none did). A tier that fails with a response is put in
+// cooldown and its response kept in last; a connection error or timeout only
+// records the error in last and moves on, with no cooldown. A request without a top-level string
 // "model" stays on tier 0.
 func (a *App) proxyTiers(ctx context.Context, w http.ResponseWriter, r *http.Request, fields map[string]json.RawMessage, model string, style APIStyle, last *heldResponse) (string, bool) {
 	if model == "" {
@@ -247,8 +266,11 @@ func (a *App) proxyTiers(ctx context.Context, w http.ResponseWriter, r *http.Req
 		}
 		resp, err := a.doUpstream(ctx, r, tierBody, t.BaseURL, t.APIKey, style)
 		if err != nil {
-			http.Error(w, "tier upstream unreachable", http.StatusBadGateway)
-			return "", true
+			last.err = errors.New("tier upstream unreachable")
+			if ctx.Err() != nil {
+				return "", false
+			}
+			continue
 		}
 		if isTierFailure(resp, true) {
 			cooldown := a.config.RetryExhaustedAfter

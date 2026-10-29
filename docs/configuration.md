@@ -117,10 +117,14 @@ For an extra tier the proxy rewrites the top-level `model` of the request body t
 the tier's model `id` (the model name when `id` is empty) and sends it with the
 tier's `api_key`. A tier without a mapping for that model, or that does not speak
 the request's API style, is skipped. A request without a `model` in the body stays
-on tier 0. A connection error or timeout to a tier returns `502` (no failover).
+on tier 0. A connection error or timeout (including `response_header_timeout`)
+before the first byte counts as a failed attempt: the request goes on to the next
+tier, with no cooldown and without rotating keys. A client that cancels the
+request ends it: no other tier is called and no state changes (logged as `499`).
 
 If every tier fails, the client gets the last failure response received (its
-tier and key are the ones in the request log). If no tier was tried at all
+tier and key are the ones in the request log). If no tier returned a response
+and a connection error or timeout happened, the client gets `502`. If no tier was tried at all
 (all in cooldown, skipped or tier 0 keys exhausted) the client gets the local
 `429` "all upstream keys exhausted", with `Retry-After` set to the shortest time
 left among the tiers that could serve the request (tier 0 counts its tier
@@ -155,7 +159,7 @@ Every proxied request writes one JSON line to stderr when its response ends
   cut at 128 bytes.
 - `api_style`: `openai` or `anthropic`.
 - `tier`: `opencode-go` for tier 0, the tier `name` for an extra tier, empty when
-  no tier answered (local `429`, `502` on a connection error).
+  no tier answered (local `429`, `502` when no tier was reachable, `499` when the client cancelled).
 - `key_index` and `key_name`: only for tier 0 (`key_name` can be empty).
 - `status`: the status the client received.
 - `latency_ms`: from before the body is read to the last byte sent to the client.
