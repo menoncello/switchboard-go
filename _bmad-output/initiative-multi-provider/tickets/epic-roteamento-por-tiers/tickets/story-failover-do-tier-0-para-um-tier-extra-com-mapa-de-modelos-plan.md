@@ -3,7 +3,7 @@ title: "Failover do tier 0 para um tier extra com mapa de modelos"
 type: 'feature'
 ticket: 2
 created: '2026-10-29'
-status: built
+status: done
 baseline_revision: '09cdd29eaf150055a6dd07252056f3a985f8a761'
 route: 'full'
 route_source: 'auto'
@@ -134,7 +134,7 @@ Reescrever só o campo `model` com `map[string]json.RawMessage` mantém os valor
 ### 2026-10-29
 Revisão do ticket 2.2 (4 lentes): 1 decision-needed, 9 patch, 0 defer, 15 rejeitados.
 
-- [ ] [Review][Decision] Sem aviso SMTP nem log quando o tier 0 esgota e um tier atende — o failover mascara a exaustão e o operador só sabe quando todos falham. Options: (a) chamar `NotifyAllExhausted` também na troca para um tier; (b) só uma linha de log na troca; (c) manter como está e só documentar. Recommended: (b) — barato e cabe no "sem log estruturado" do plano; o alerta por e-mail na troca é decisão de escopo do Eduardo.
+- [x] [Review][Decision] Sem aviso SMTP nem log quando o tier 0 esgota e um tier atende — o failover mascara a exaustão e o operador só sabe quando todos falham. Options: (a) chamar `NotifyAllExhausted` também na troca para um tier; (b) só uma linha de log na troca; (c) manter como está e só documentar. Recommended: (b) — barato e cabe no "sem log estruturado" do plano; o alerta por e-mail na troca é decisão de escopo do Eduardo.
 - [x] [Review][Patch] Sem teste de que `Retry-After` não sai e `ShouldNotifyAllExhausted` segue armado quando um tier atende [main_test.go:TestTierFailoverRewritesModelAndKey]
 - [x] [Review][Patch] Sem teste de que um 429 de tier sem marca de cota é copiado ao cliente, sem tentar o tier seguinte [main_test.go:TestTierNonQuotaResponseCopiedWithoutFurtherFailover]
 - [x] [Review][Patch] Sem teste de `base_url` de tier com barra final e prefixo de path (`/api/v1/`) [main_test.go]
@@ -154,3 +154,5 @@ Revisão do ticket 2.2 (4 lentes): 1 decision-needed, 9 patch, 0 defer, 15 rejei
 - Caminho curl sem teste automático — falso: verificação manual por desenho, rodada no review.
 - Dockerfile fora do escopo — falso: correção necessária, justificada.
 - Teste admin/status fora de estado de failover; um só tier 0 nos testes; `TestDoUpstream*` com mesma URL — baixo, endpoints não usam tiers, rotação é anterior, tier tests cobrem.
+
+Decisão do aviso na troca de tier: opção (b), log na troca, exibido na tela de acompanhamento. Fica para a story da seção de tiers na página de status, pois o Never desta story proíbe mexer em `/status`.
