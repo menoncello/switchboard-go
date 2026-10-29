@@ -46,6 +46,10 @@ type Config struct {
 	// eligible (tier 0 is exempt); 0 turns the floor off.
 	MinContext int
 
+	// StateFile is where the cooldowns and the exhausted tier 0 keys are saved so
+	// they survive a restart; empty keeps them in memory only. YAML only.
+	StateFile string
+
 	// Tiers are extra free upstreams for failover; the upstream above is the
 	// implicit tier 0 and is not listed here.
 	Tiers []TierConfig
@@ -145,6 +149,7 @@ type yamlConfig struct {
 		MaxRequestBodyBytes int64 `yaml:"max_request_body_bytes"`
 	} `yaml:"limits"`
 	MinContext *int       `yaml:"min_context"`
+	StateFile  string     `yaml:"state_file"`
 	Tiers      []yamlTier `yaml:"tiers"`
 }
 
@@ -254,7 +259,7 @@ func loadYAMLConfig(path string) (Config, error) {
 	if err != nil {
 		return Config{}, err
 	}
-	return Config{Tiers: tiers, MinContext: minContext, ListenAddr: yc.Server.ListenAddr, UpstreamBaseURL: yc.Upstream.BaseURL, ProxyAPIKey: yc.Server.ProxyAPIKey, UpstreamAPIKeys: yc.Upstream.APIKeys, MaxRequestBodyBytes: yc.Limits.MaxRequestBodyBytes, RetryExhaustedAfter: retry, UpstreamResponseHeaderTimeout: headerTimeout, SMTP: SMTPConfig{Host: yc.SMTP.Host, Port: yc.SMTP.Port, Username: yc.SMTP.Username, Password: yc.SMTP.Password, From: yc.SMTP.From, To: yc.SMTP.To, TLS: yc.SMTP.TLS, StartTLS: yc.SMTP.StartTLS}}, nil
+	return Config{Tiers: tiers, MinContext: minContext, StateFile: strings.TrimSpace(yc.StateFile), ListenAddr: yc.Server.ListenAddr, UpstreamBaseURL: yc.Upstream.BaseURL, ProxyAPIKey: yc.Server.ProxyAPIKey, UpstreamAPIKeys: yc.Upstream.APIKeys, MaxRequestBodyBytes: yc.Limits.MaxRequestBodyBytes, RetryExhaustedAfter: retry, UpstreamResponseHeaderTimeout: headerTimeout, SMTP: SMTPConfig{Host: yc.SMTP.Host, Port: yc.SMTP.Port, Username: yc.SMTP.Username, Password: yc.SMTP.Password, From: yc.SMTP.From, To: yc.SMTP.To, TLS: yc.SMTP.TLS, StartTLS: yc.SMTP.StartTLS}}, nil
 }
 
 func mergeConfig(dst *Config, src Config) {
@@ -275,6 +280,9 @@ func mergeConfig(dst *Config, src Config) {
 	}
 	if src.RetryExhaustedAfter >= 0 {
 		dst.RetryExhaustedAfter = src.RetryExhaustedAfter
+	}
+	if src.StateFile != "" {
+		dst.StateFile = src.StateFile
 	}
 	if src.MinContext >= 0 {
 		dst.MinContext = src.MinContext
@@ -496,5 +504,11 @@ func ineligibleTiers(cfg Config) []string {
 func warnIneligibleTiers(cfg Config) {
 	for _, name := range ineligibleTiers(cfg) {
 		log.Printf("warning: tier %q has no model with context >= min_context (%d); it will never serve requests (declare context on its models or set min_context: 0)", name, cfg.MinContext)
+	}
+}
+
+func warnNoStateFile(cfg Config) {
+	if cfg.StateFile == "" {
+		log.Printf("warning: state_file is not set; tier cooldowns and exhausted keys are lost on restart")
 	}
 }

@@ -1,6 +1,8 @@
 package main
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"math"
 	"sync"
 	"time"
@@ -262,4 +264,42 @@ type ValidateKeyResult struct {
 
 type ValidateKeysResponse struct {
 	Results []ValidateKeyResult `json:"results"`
+}
+
+// keyID identifies a key in the state file without revealing it: a prefix of its SHA-256.
+func keyID(key string) string {
+	h := sha256.Sum256([]byte(key))
+	return hex.EncodeToString(h[:8])
+}
+
+// snapshot is the exhausted keys still inside their cooldown, by keyID, with the
+// time of their last quota error. With the cooldown off nothing is kept.
+func (m *KeyManager) snapshot() map[string]time.Time {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := map[string]time.Time{}
+	for i, k := range m.keys {
+		if t, ok := m.last429[i]; ok && m.states[i] == KeyExhausted && m.cooldown > 0 && m.now().Before(t.Add(m.cooldown)) {
+			out[keyID(k)] = t
+		}
+	}
+	return out
+}
+
+// restore marks exhausted the keys saved by snapshot whose cooldown has not ended.
+func (m *KeyManager) restore(in map[string]time.Time) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.cooldown <= 0 {
+		return
+	}
+	for i, k := range m.keys {
+		if t, ok := in[keyID(k)]; ok && m.now().Before(t.Add(m.cooldown)) {
+			m.states[i] = KeyExhausted
+			m.last429[i] = t
+		}
+	}
+	if !m.eligibleLocked(m.current) {
+		m.advanceLocked()
+	}
 }

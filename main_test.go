@@ -2632,3 +2632,160 @@ func TestAnthropicToolsRequestNeedsToolsModel(t *testing.T) {
 		t.Fatalf("tools model: code=%d hits=%v", rec.Code, f.hits())
 	}
 }
+
+func stateFileCfg(t *testing.T) Config {
+	t.Helper()
+	return Config{ProxyAPIKey: "p", UpstreamAPIKeys: []string{"sk-secret-1", "sk-secret-2"}, MaxRequestBodyBytes: 1 << 20, RetryExhaustedAfter: time.Hour, StateFile: filepath.Join(t.TempDir(), "state.json")}
+}
+
+func TestStateSurvivesRestart(t *testing.T) {
+	f := newTierFixture(t, false, true)
+	f.app.config.StateFile = filepath.Join(t.TempDir(), "state.json")
+	if rec := tierReq(f.app, http.MethodPost, "/v1/chat/completions", `{"model":"a"}`, nil); rec.Code != http.StatusOK {
+		t.Fatalf("code=%d", rec.Code)
+	}
+	if f.app.cooldowns.remaining("t1") == 0 {
+		t.Fatal("t1 should be in cooldown")
+	}
+	app2 := newApp(f.app.config)
+	if app2.cooldowns.remaining("t1") == 0 || app2.cooldowns.remaining("t2") != 0 {
+		t.Fatal("t1 cooldown not restored (or t2 wrongly set)")
+	}
+	if _, _, ok := app2.keys.Current(); ok {
+		t.Fatal("exhausted tier 0 key not restored")
+	}
+	before := f.hits()
+	if rec := tierReq(app2, http.MethodPost, "/v1/chat/completions", `{"model":"a"}`, nil); rec.Code != http.StatusOK {
+		t.Fatalf("code=%d", rec.Code)
+	}
+	if after := f.hits(); after[0] != before[0] || after[1] != before[1] {
+		t.Fatalf("restored app called a tier in cooldown: before=%v after=%v", before, after)
+	}
+}
+
+func TestStateTier0CooldownSurvivesRestart(t *testing.T) {
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(http.StatusInternalServerError) }))
+	t.Cleanup(up.Close)
+	cfg := stateFileCfg(t)
+	cfg.UpstreamBaseURL = up.URL
+	app := newApp(cfg)
+	tierReq(app, http.MethodPost, "/v1/chat/completions", `{"model":"a"}`, nil)
+	if newApp(cfg).cooldowns.remaining(tier0CooldownKey) == 0 {
+		t.Fatal("tier 0 cooldown not restored")
+	}
+}
+
+func TestStateExpiredNotRestored(t *testing.T) {
+	cfg := stateFileCfg(t)
+	past := time.Now().Add(-2 * time.Hour).UTC().Format(time.RFC3339)
+	body := `{"tier0":"` + past + `","tiers":{"t1":"` + past + `"},"keys":{"` + keyID("sk-secret-1") + `":"` + past + `"}}`
+	if err := os.WriteFile(cfg.StateFile, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	app := newApp(cfg)
+	if app.cooldowns.remaining("t1") != 0 || app.cooldowns.remaining(tier0CooldownKey) != 0 {
+		t.Fatal("expired cooldown restored")
+	}
+	if idx, _, ok := app.keys.Current(); !ok || idx != 0 {
+		t.Fatal("expired exhausted key restored")
+	}
+}
+
+func TestStateKeyFoundByHashNotValue(t *testing.T) {
+	cfg := stateFileCfg(t)
+	app := newApp(cfg)
+	app.keys.MarkExhausted(0) // sk-secret-1 exhausted, 2 takes over
+	app.saveState()
+	b, err := os.ReadFile(cfg.StateFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(b), "sk-secret") {
+		t.Fatalf("state file leaks a key: %s", b)
+	}
+	cfg.UpstreamAPIKeys = []string{"sk-secret-2", "sk-secret-1"} // order changed
+	app2 := newApp(cfg)
+	if idx, key, ok := app2.keys.Current(); !ok || idx != 0 || key != "sk-secret-2" {
+		t.Fatalf("idx=%d key=%q ok=%v", idx, key, ok)
+	}
+	if app2.keys.states[1] != KeyExhausted {
+		t.Fatal("sk-secret-1 should be exhausted at its new position")
+	}
+}
+
+func TestStateNoFileWithoutStateFile(t *testing.T) {
+	dir := t.TempDir()
+	old, _ := os.Getwd()
+	if err := os.Chdir(dir); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chdir(old) })
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(http.StatusInternalServerError) }))
+	t.Cleanup(up.Close)
+	app := newApp(Config{ProxyAPIKey: "p", UpstreamAPIKeys: []string{"u"}, UpstreamBaseURL: up.URL, MaxRequestBodyBytes: 1 << 20, RetryExhaustedAfter: time.Hour})
+	tierReq(app, http.MethodPost, "/v1/chat/completions", `{"model":"a"}`, nil)
+	if entries, _ := os.ReadDir(dir); len(entries) != 0 {
+		t.Fatalf("files written: %v", entries)
+	}
+	var buf bytes.Buffer
+	log.SetOutput(&buf)
+	t.Cleanup(func() { log.SetOutput(os.Stderr) })
+	warnNoStateFile(Config{})
+	warnNoStateFile(Config{StateFile: "x"})
+	if strings.Count(buf.String(), "state_file is not set") != 1 {
+		t.Fatalf("log: %q", buf.String())
+	}
+}
+
+func TestStateWriteFailureDoesNotAffectRequest(t *testing.T) {
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(http.StatusInternalServerError) }))
+	t.Cleanup(up.Close)
+	cfg := stateFileCfg(t)
+	cfg.UpstreamBaseURL = up.URL
+	cfg.StateFile = filepath.Join(t.TempDir(), "missing", "state.json")
+	var logs bytes.Buffer
+	app := newApp(cfg)
+	app.logger = slog.New(slog.NewJSONHandler(&logs, nil))
+	rec := tierReq(app, http.MethodPost, "/v1/chat/completions", `{"model":"a"}`, nil)
+	if rec.Code != http.StatusTooManyRequests && rec.Code != http.StatusInternalServerError {
+		t.Fatalf("code=%d", rec.Code)
+	}
+	if !strings.Contains(logs.String(), "state file not saved") || strings.Contains(logs.String(), "sk-secret") {
+		t.Fatalf("logs: %s", logs.String())
+	}
+}
+
+func TestStateCorruptFileStartsEmpty(t *testing.T) {
+	cfg := stateFileCfg(t)
+	if err := os.WriteFile(cfg.StateFile, []byte("{not json"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	app := newApp(cfg)
+	if _, _, ok := app.keys.Current(); !ok {
+		t.Fatal("keys should be available")
+	}
+	if app.cooldowns.remaining(tier0CooldownKey) != 0 {
+		t.Fatal("unexpected cooldown")
+	}
+}
+
+func TestStateSaveSkipsUnchangedBytes(t *testing.T) {
+	cfg := stateFileCfg(t)
+	app := newApp(cfg)
+	app.saveState()
+	if err := os.Remove(cfg.StateFile); err != nil {
+		t.Fatal(err)
+	}
+	app.saveState() // same bytes as the last good write: no new write
+	if _, err := os.Stat(cfg.StateFile); err == nil {
+		t.Fatal("unchanged state was rewritten")
+	}
+}
+
+func TestLoadConfigStateFile(t *testing.T) {
+	tiersYAML(t, "state_file: /data/state.json\n")
+	cfg, err := loadConfig()
+	if err != nil || cfg.StateFile != "/data/state.json" {
+		t.Fatalf("cfg=%q err=%v", cfg.StateFile, err)
+	}
+}

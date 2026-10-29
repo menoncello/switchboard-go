@@ -1,9 +1,11 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/subtle"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -11,7 +13,9 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -22,12 +26,99 @@ type App struct {
 	sender *SMTPNotifier
 	usage  *usageCache
 	logger *slog.Logger
-	// cooldowns holds the per-tier cooldown (tier 0 under tier0Name), in memory only.
+	// cooldowns holds the per-tier cooldown (tier 0 under tier0CooldownKey).
 	cooldowns *tierCooldowns
+
+	// stateMu serializes saveState; lastState is what the last successful write held.
+	stateMu   sync.Mutex
+	lastState []byte
+}
+
+// persistedState is the JSON in config.StateFile.
+type persistedState struct {
+	Tier0 *time.Time           `json:"tier0,omitempty"`
+	Tiers map[string]time.Time `json:"tiers"`
+	Keys  map[string]time.Time `json:"keys"`
 }
 
 func newApp(cfg Config) *App {
-	return &App{config: cfg, keys: NewKeyManager(cfg.UpstreamAPIKeys, cfg.RetryExhaustedAfter), client: &http.Client{Transport: &http.Transport{Proxy: http.ProxyFromEnvironment, DialContext: (&net.Dialer{Timeout: 10 * time.Second, KeepAlive: 30 * time.Second}).DialContext, TLSHandshakeTimeout: 10 * time.Second, ResponseHeaderTimeout: cfg.UpstreamResponseHeaderTimeout, ExpectContinueTimeout: 2 * time.Second}}, sender: NewSMTPNotifier(cfg.SMTP), usage: newUsageCache(), logger: slog.New(slog.NewJSONHandler(os.Stderr, nil)), cooldowns: newTierCooldowns()}
+	a := &App{config: cfg, keys: NewKeyManager(cfg.UpstreamAPIKeys, cfg.RetryExhaustedAfter), client: &http.Client{Transport: &http.Transport{Proxy: http.ProxyFromEnvironment, DialContext: (&net.Dialer{Timeout: 10 * time.Second, KeepAlive: 30 * time.Second}).DialContext, TLSHandshakeTimeout: 10 * time.Second, ResponseHeaderTimeout: cfg.UpstreamResponseHeaderTimeout, ExpectContinueTimeout: 2 * time.Second}}, sender: NewSMTPNotifier(cfg.SMTP), usage: newUsageCache(), logger: slog.New(slog.NewJSONHandler(os.Stderr, nil)), cooldowns: newTierCooldowns()}
+	a.loadState()
+	return a
+}
+
+func (a *App) loadState() {
+	if a.config.StateFile == "" {
+		return
+	}
+	b, err := os.ReadFile(a.config.StateFile)
+	if errors.Is(err, os.ErrNotExist) {
+		a.logger.Info("no state file yet, starting without state")
+		return
+	}
+	if err != nil {
+		a.logger.Warn("state file not loaded, starting without state", "error", err.Error())
+		return
+	}
+	var st persistedState
+	if err := json.Unmarshal(b, &st); err != nil {
+		a.logger.Warn("state file is invalid, starting without state", "error", err.Error())
+		return
+	}
+	tiers := map[string]time.Time{}
+	for name, t := range st.Tiers {
+		if name != tier0CooldownKey {
+			tiers[name] = t
+		}
+	}
+	if st.Tier0 != nil {
+		tiers[tier0CooldownKey] = *st.Tier0
+	}
+	a.cooldowns.restore(tiers)
+	a.keys.restore(st.Keys)
+}
+
+// saveState writes the running cooldowns and exhausted keys to StateFile, atomically
+// and only when they changed since the last good write. A failure is only logged.
+func (a *App) saveState() {
+	if a.config.StateFile == "" {
+		return
+	}
+	a.stateMu.Lock()
+	defer a.stateMu.Unlock()
+	st := persistedState{Tiers: a.cooldowns.snapshot(), Keys: a.keys.snapshot()}
+	if t, ok := st.Tiers[tier0CooldownKey]; ok {
+		st.Tier0 = &t
+		delete(st.Tiers, tier0CooldownKey)
+	}
+	b, err := json.Marshal(st)
+	if err == nil && bytes.Equal(b, a.lastState) {
+		return
+	}
+	if err == nil {
+		err = writeFileAtomic(a.config.StateFile, b)
+	}
+	// Also remembered on failure, so a bad path logs once per change instead of on every request.
+	a.lastState = b
+	if err != nil {
+		a.logger.Error("state file not saved", "error", err.Error())
+	}
+}
+
+func writeFileAtomic(path string, b []byte) error {
+	f, err := os.CreateTemp(filepath.Dir(path), filepath.Base(path)+".tmp*")
+	if err != nil {
+		return err
+	}
+	_, err = f.Write(b)
+	err = errors.Join(err, f.Close())
+	if err == nil {
+		err = os.Rename(f.Name(), path)
+	}
+	if err != nil {
+		_ = os.Remove(f.Name())
+	}
+	return err
 }
 
 func (a *App) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -44,12 +135,14 @@ func (a *App) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			writeOpenAIError(w, http.StatusUnauthorized, "invalid_api_key", "Unauthorized")
 			return
 		}
+		defer a.saveState()
 		a.handleAdmin(w, r)
 	case isProxyPath(r.URL.Path):
 		if !a.authOK(r) {
 			writeAPIError(w, apiStyleForRequest(r), http.StatusUnauthorized, "invalid_api_key", "Unauthorized")
 			return
 		}
+		defer a.saveState()
 		a.proxyV1(w, r, apiStyleForRequest(r))
 	default:
 		http.NotFound(w, r)

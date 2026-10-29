@@ -78,6 +78,9 @@ limits:
 # 0 turns the floor off).
 min_context: 64000
 
+# File where tier cooldowns and exhausted tier 0 keys are saved (see below).
+state_file: "/var/lib/switchboard-go/state.json"
+
 tiers:
   - name: "free-provider"
     base_url: "https://api.example.com/v1"
@@ -90,6 +93,21 @@ tiers:
         context: 131072
         tools: true
 ```
+
+## State file
+
+`state_file` (top-level, YAML only, no environment variable) is the path of a
+JSON file where the proxy saves the running tier cooldowns (tier 0 included) and
+the tier 0 keys that are exhausted inside their cooldown, so a restart does not
+send requests to a tier or key that is still cooling down. The proxy rewrites it
+after a request when something changed, writing to a temporary file in the same
+directory and renaming it, so the directory must be writable. A key is stored as
+a prefix of its SHA-256, never its value, so reordering `api_keys` is safe.
+Entries whose cooldown has ended are not restored. With `retry_exhausted_after: 0`
+no key is saved, since exhausted keys have no cooldown. A missing or invalid file at
+startup is logged and the proxy starts without state; a write failure is logged
+and does not affect the request. Without `state_file` nothing is saved and
+startup (and `validate-config`) logs a warning. Daily spend is not persisted.
 
 ## Tiers
 
@@ -113,8 +131,8 @@ On tier 0 only a quota `429` and the `403` "subscription is required" rotate to
 the next key; with every key exhausted tier 0 is skipped as before. Any other
 failure status puts the whole of tier 0 in cooldown for `retry_exhausted_after`.
 A tier in cooldown, tier 0 included, is not called until the cooldown ends; the
-cooldown is kept in memory and is lost on restart. For an extra tier the cooldown
-is its `cooldown` field or, when absent, `retry_exhausted_after`; `0` means no
+cooldown is lost on restart unless `state_file` is set (see "State file"). For
+an extra tier the cooldown is its `cooldown` field or, when absent, `retry_exhausted_after`; `0` means no
 cooldown (the next tier is tried only for the request that failed).
 
 For an extra tier the proxy rewrites the top-level `model` of the request body to

@@ -37,3 +37,29 @@ func (c *tierCooldowns) remaining(name string) time.Duration {
 	delete(c.until, name)
 	return 0
 }
+
+// snapshot is the cooldowns still running, by name.
+func (c *tierCooldowns) snapshot() map[string]time.Time {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	now := c.now()
+	out := map[string]time.Time{}
+	for name, t := range c.until {
+		if t.After(now) {
+			out[name] = t
+		}
+	}
+	return out
+}
+
+// restore loads cooldowns saved by snapshot, skipping the ones that already ended.
+func (c *tierCooldowns) restore(in map[string]time.Time) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	now := c.now()
+	for name, t := range in {
+		if t.After(now) {
+			c.until[name] = t
+		}
+	}
+}
