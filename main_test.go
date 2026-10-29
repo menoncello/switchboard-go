@@ -1320,3 +1320,81 @@ func TestUsageCacheTTLEnv(t *testing.T) {
 		t.Fatalf("defaults: %+v", d)
 	}
 }
+
+func tiersYAML(t *testing.T, tiers string) {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	body := "server: {proxy_api_key: p}\nupstream: {api_keys: [u]}\n" + tiers
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("SWITCHBOARD_GO_CONFIG", path)
+}
+
+const tierOK = `  - name: a
+    base_url: https://a
+    api_key: secret-a
+    free: true
+    models:
+      m1: {id: x/m1, context: 100, tools: true}
+`
+
+func TestLoadConfigTiers(t *testing.T) {
+	tiersYAML(t, "tiers:\n"+tierOK+`  - name: b
+    base_url: https://b
+    api_key: secret-b
+    free: true
+    styles: [anthropic]
+    models:
+      m2: {id: y/m2}
+`)
+	cfg, err := loadConfig()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cfg.Tiers) != 2 || len(cfg.Tiers[0].Styles) != 1 || cfg.Tiers[0].Styles[0] != APIStyleOpenAI || cfg.Tiers[1].Styles[0] != APIStyleAnthropic {
+		t.Fatalf("unexpected tiers: %+v", cfg.Tiers)
+	}
+	if m := cfg.Tiers[0].Models[0]; m.Name != "m1" || m.ID != "x/m1" || m.Context != 100 || !m.Tools {
+		t.Fatalf("unexpected model: %+v", m)
+	}
+	s := safeConfigSummary(cfg)
+	if !strings.Contains(s, "tiers=2") || strings.Contains(s, "secret-") {
+		t.Fatalf("bad summary: %s", s)
+	}
+}
+
+func TestLoadConfigWithoutTiers(t *testing.T) {
+	tiersYAML(t, "")
+	cfg, err := loadConfig()
+	if err != nil || len(cfg.Tiers) != 0 {
+		t.Fatalf("cfg=%+v err=%v", cfg, err)
+	}
+}
+
+func TestLoadConfigTiersRejected(t *testing.T) {
+	cases := map[string]struct{ tier, want string }{
+		"paid":          {strings.Replace(tierOK, "free: true", "free: false", 1), "free must be true"},
+		"free absent":   {strings.Replace(tierOK, "    free: true\n", "", 1), "free must be true"},
+		"no base_url":   {strings.Replace(tierOK, "base_url: https://a", "base_url: \"\"", 1), "base_url is required"},
+		"no api_key":    {strings.Replace(tierOK, "api_key: secret-a", "api_key: \"\"", 1), "api_key is required"},
+		"no name":       {strings.Replace(tierOK, "name: a", "name: \"\"", 1), "name is required"},
+		"dup tier name": {tierOK + tierOK, "duplicate name"},
+		"dup model":     {tierOK + "      m1: {id: x/other}\n", "duplicate model"},
+		"bad style":     {tierOK + "    styles: [grpc]\n", "unknown style"},
+		"no models":     {strings.Replace(tierOK, "    models:\n      m1: {id: x/m1, context: 100, tools: true}\n", "", 1), "at least one model"},
+		"neg context":   {strings.Replace(tierOK, "context: 100", "context: -1", 1), "context must be >= 0"},
+	}
+	for name, c := range cases {
+		t.Run(name, func(t *testing.T) {
+			tiersYAML(t, "tiers:\n"+c.tier)
+			_, err := loadConfig()
+			if err == nil {
+				t.Fatal("expected error")
+			}
+			if strings.Contains(err.Error(), "secret-a") {
+				t.Fatalf("error leaks api_key: %v", err)
+			}
+		})
+	}
+}

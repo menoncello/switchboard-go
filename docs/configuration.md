@@ -73,7 +73,38 @@ smtp:
 
 limits:
   max_request_body_bytes: 20971520
+
+tiers:
+  - name: "free-provider"
+    base_url: "https://api.example.com/v1"
+    api_key: "sk-tier"
+    free: true
+    styles: ["openai"]
+    models:
+      model-a:
+        id: "provider/model-a"
+        context: 131072
+        tools: true
 ```
+
+## Tiers
+
+`tiers:` lists extra upstreams used for failover. The `upstream:` block above
+stays as the implicit tier 0 and is not listed here (it is exempt from the
+`free` rule). Without `tiers:` the proxy behaves as before. Tiers are read from
+the YAML file only, not from environment variables. This release only reads and
+validates them; routing comes later.
+
+| Field | Required | Description |
+| --- | --- | --- |
+| `name` | Yes | Unique tier name, used in error messages. |
+| `base_url` | Yes | Tier base URL (only checked for being non-empty). |
+| `api_key` | Yes | Tier key. Never printed by `validate-config` or in logs. |
+| `free` | Yes | Must be `true`. A tier without `free: true` is rejected at startup. |
+| `styles` | No | List of `openai` and/or `anthropic`. Absent means OpenAI only. |
+| `models` | Yes | Map of model name to an object with `id`, and optional `context` (>= 0) and `tools`. At least one; names must be unique. |
+
+`validate-config` shows only the number of tiers (`tiers=N`).
 
 ## Environment variables
 

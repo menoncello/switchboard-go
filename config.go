@@ -39,6 +39,24 @@ type Config struct {
 	UsageCacheTTL time.Duration
 
 	SMTP SMTPConfig
+
+	// Tiers are extra free upstreams for failover; the upstream above is the
+	// implicit tier 0 and is not listed here.
+	Tiers []TierConfig
+}
+
+type TierConfig struct {
+	Name, BaseURL, APIKey string
+	Free                  bool
+	Styles                []APIStyle
+	Models                []TierModel
+}
+
+// TierModel is kept in a slice (file order) so a repeated key survives to validateConfig.
+type TierModel struct {
+	Name, ID string
+	Context  int
+	Tools    bool
 }
 
 type SMTPConfig struct {
@@ -117,6 +135,55 @@ type yamlConfig struct {
 	Limits struct {
 		MaxRequestBodyBytes int64 `yaml:"max_request_body_bytes"`
 	} `yaml:"limits"`
+	Tiers []yamlTier `yaml:"tiers"`
+}
+
+type yamlTier struct {
+	Name    string    `yaml:"name"`
+	BaseURL string    `yaml:"base_url"`
+	APIKey  string    `yaml:"api_key"`
+	Free    bool      `yaml:"free"`
+	Styles  []string  `yaml:"styles"`
+	Models  yaml.Node `yaml:"models"`
+}
+
+func convertTiers(in []yamlTier) ([]TierConfig, error) {
+	var out []TierConfig
+	for i, yt := range in {
+		t := TierConfig{Name: yt.Name, BaseURL: yt.BaseURL, APIKey: yt.APIKey, Free: yt.Free}
+		for _, s := range yt.Styles {
+			switch s {
+			case "openai":
+				t.Styles = append(t.Styles, APIStyleOpenAI)
+			case "anthropic":
+				t.Styles = append(t.Styles, APIStyleAnthropic)
+			default:
+				t.Styles = append(t.Styles, APIStyle(-1)) // validateConfig rejects it
+			}
+		}
+		if len(t.Styles) == 0 {
+			t.Styles = []APIStyle{APIStyleOpenAI}
+		}
+		switch n := &yt.Models; n.Kind {
+		case 0: // models absent; validateConfig reports it
+		case yaml.MappingNode:
+			for j := 0; j+1 < len(n.Content); j += 2 {
+				var v struct {
+					ID      string `yaml:"id"`
+					Context int    `yaml:"context"`
+					Tools   bool   `yaml:"tools"`
+				}
+				if err := n.Content[j+1].Decode(&v); err != nil {
+					return nil, fmt.Errorf("parse tiers[%d].models: %w", i, err)
+				}
+				t.Models = append(t.Models, TierModel{Name: n.Content[j].Value, ID: v.ID, Context: v.Context, Tools: v.Tools})
+			}
+		default:
+			return nil, fmt.Errorf("parse tiers[%d].models: must be a map of model name to object", i)
+		}
+		out = append(out, t)
+	}
+	return out, nil
 }
 
 func loadYAMLConfig(path string) (Config, error) {
@@ -152,7 +219,11 @@ func loadYAMLConfig(path string) (Config, error) {
 		}
 		headerTimeout = d
 	}
-	return Config{ListenAddr: yc.Server.ListenAddr, UpstreamBaseURL: yc.Upstream.BaseURL, ProxyAPIKey: yc.Server.ProxyAPIKey, UpstreamAPIKeys: yc.Upstream.APIKeys, MaxRequestBodyBytes: yc.Limits.MaxRequestBodyBytes, RetryExhaustedAfter: retry, UpstreamResponseHeaderTimeout: headerTimeout, SMTP: SMTPConfig{Host: yc.SMTP.Host, Port: yc.SMTP.Port, Username: yc.SMTP.Username, Password: yc.SMTP.Password, From: yc.SMTP.From, To: yc.SMTP.To, TLS: yc.SMTP.TLS, StartTLS: yc.SMTP.StartTLS}}, nil
+	tiers, err := convertTiers(yc.Tiers)
+	if err != nil {
+		return Config{}, err
+	}
+	return Config{Tiers: tiers, ListenAddr: yc.Server.ListenAddr, UpstreamBaseURL: yc.Upstream.BaseURL, ProxyAPIKey: yc.Server.ProxyAPIKey, UpstreamAPIKeys: yc.Upstream.APIKeys, MaxRequestBodyBytes: yc.Limits.MaxRequestBodyBytes, RetryExhaustedAfter: retry, UpstreamResponseHeaderTimeout: headerTimeout, SMTP: SMTPConfig{Host: yc.SMTP.Host, Port: yc.SMTP.Port, Username: yc.SMTP.Username, Password: yc.SMTP.Password, From: yc.SMTP.From, To: yc.SMTP.To, TLS: yc.SMTP.TLS, StartTLS: yc.SMTP.StartTLS}}, nil
 }
 
 func mergeConfig(dst *Config, src Config) {
@@ -194,6 +265,9 @@ func mergeConfig(dst *Config, src Config) {
 	}
 	if src.SMTP.To != "" {
 		dst.SMTP.To = src.SMTP.To
+	}
+	if len(src.Tiers) > 0 {
+		dst.Tiers = src.Tiers
 	}
 	dst.SMTP.TLS = src.SMTP.TLS || dst.SMTP.TLS
 	dst.SMTP.StartTLS = src.SMTP.StartTLS || dst.SMTP.StartTLS
@@ -313,11 +387,55 @@ func validateConfig(cfg Config) error {
 	if cfg.UsageCacheTTL < 0 {
 		return errors.New("USAGE_CACHE_TTL must be >= 0")
 	}
+	return validateTiers(cfg.Tiers)
+}
+
+func validateTiers(tiers []TierConfig) error {
+	names := map[string]bool{}
+	for i, t := range tiers {
+		if strings.TrimSpace(t.Name) == "" {
+			return fmt.Errorf("tiers[%d]: name is required", i)
+		}
+		if names[t.Name] {
+			return fmt.Errorf("tier %q: duplicate name", t.Name)
+		}
+		names[t.Name] = true
+		if strings.TrimSpace(t.BaseURL) == "" {
+			return fmt.Errorf("tier %q: base_url is required", t.Name)
+		}
+		if strings.TrimSpace(t.APIKey) == "" {
+			return fmt.Errorf("tier %q: api_key is required", t.Name)
+		}
+		if !t.Free {
+			return fmt.Errorf("tier %q: free must be true (only free tiers are allowed)", t.Name)
+		}
+		for _, s := range t.Styles {
+			if s != APIStyleOpenAI && s != APIStyleAnthropic {
+				return fmt.Errorf("tier %q: unknown style (use openai or anthropic)", t.Name)
+			}
+		}
+		if len(t.Models) == 0 {
+			return fmt.Errorf("tier %q: at least one model is required", t.Name)
+		}
+		models := map[string]bool{}
+		for _, m := range t.Models {
+			if strings.TrimSpace(m.Name) == "" {
+				return fmt.Errorf("tier %q: model name must not be empty", t.Name)
+			}
+			if models[m.Name] {
+				return fmt.Errorf("tier %q: duplicate model %q", t.Name, m.Name)
+			}
+			models[m.Name] = true
+			if m.Context < 0 {
+				return fmt.Errorf("tier %q: model %q: context must be >= 0", t.Name, m.Name)
+			}
+		}
+	}
 	return nil
 }
 
 func safeConfigSummary(cfg Config) string {
-	return fmt.Sprintf("listen=%s upstream=%s upstream_keys=%d smtp_configured=%t config_source=%s max_request_body_bytes=%d retry_exhausted_after=%s response_header_timeout=%s", cfg.ListenAddr, cfg.UpstreamBaseURL, len(cfg.UpstreamAPIKeys), cfg.SMTP.Host != "" && cfg.SMTP.From != "" && cfg.SMTP.To != "", defaultString(cfg.ConfigSourcePath, "none"), cfg.MaxRequestBodyBytes, cfg.RetryExhaustedAfter, cfg.UpstreamResponseHeaderTimeout)
+	return fmt.Sprintf("listen=%s upstream=%s upstream_keys=%d smtp_configured=%t config_source=%s max_request_body_bytes=%d retry_exhausted_after=%s response_header_timeout=%s tiers=%d", cfg.ListenAddr, cfg.UpstreamBaseURL, len(cfg.UpstreamAPIKeys), cfg.SMTP.Host != "" && cfg.SMTP.From != "" && cfg.SMTP.To != "", defaultString(cfg.ConfigSourcePath, "none"), cfg.MaxRequestBodyBytes, cfg.RetryExhaustedAfter, cfg.UpstreamResponseHeaderTimeout, len(cfg.Tiers))
 }
 
 func parseBool(v string) bool { b, _ := strconv.ParseBool(strings.TrimSpace(v)); return b }
