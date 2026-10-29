@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"io"
 	"log"
@@ -9,6 +10,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -980,6 +982,118 @@ func TestAdminKeysAuthAndMethod(t *testing.T) {
 	app.ServeHTTP(rec, req)
 	if rec.Code != http.StatusNotFound {
 		t.Fatalf("POST should not match (same as other admin routes), got %d", rec.Code)
+	}
+}
+
+func getStatusPage(app *App) *httptest.ResponseRecorder {
+	rec := httptest.NewRecorder()
+	app.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/status", nil))
+	return rec
+}
+
+func TestStatusPageOpenAndNoKeyLeak(t *testing.T) {
+	var hits int32
+	srv := fakeUsageServer(t, &hits)
+	app := newApp(Config{ProxyAPIKey: "p", UpstreamAPIKeys: []string{"sk-good-SEGREDO1", "sk-bad-SEGREDO2"}, KeyNames: []string{"principal"}, UsageURL: srv.URL, UsageCacheTTL: time.Minute, RetryExhaustedAfter: time.Hour})
+	app.keys.MarkExhausted(1)
+	rec := getStatusPage(app)
+	body := rec.Body.String()
+	if rec.Code != http.StatusOK || !strings.HasPrefix(rec.Header().Get("Content-Type"), "text/html") {
+		t.Fatalf("got %d %s", rec.Code, rec.Header().Get("Content-Type"))
+	}
+	if rec.Header().Get("Cache-Control") != "no-store" {
+		t.Fatalf("Cache-Control: %q", rec.Header().Get("Cache-Control"))
+	}
+	for _, want := range []string{"principal", "#2", "exhausted", "<td>12.5%</td>", "<td>40.0%</td>", "<td>7.0%</td>"} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("missing %q in %s", want, body)
+		}
+	}
+	rows := strings.Split(body, "<tr>")
+	if !strings.Contains(rows[2], "(atual)") || regexp.MustCompile(`<td>\d+s</td>`).MatchString(rows[2]) {
+		t.Fatalf("current key row: %s", rows[2])
+	}
+	if !regexp.MustCompile(`<td>\d+s</td>`).MatchString(rows[3]) || strings.Contains(rows[3], "(atual)") {
+		t.Fatalf("exhausted key row: %s", rows[3])
+	}
+	head := httptest.NewRecorder()
+	app.ServeHTTP(head, httptest.NewRequest(http.MethodHead, "/status", nil))
+	if head.Code != http.StatusOK {
+		t.Fatalf("HEAD /status: %d", head.Code)
+	}
+	for _, secret := range []string{"SEGREDO1", "SEGREDO2", "sk-good", "sk-bad"} {
+		if strings.Contains(body, secret) {
+			t.Fatalf("leaked %q: %s", secret, body)
+		}
+	}
+	req := httptest.NewRequest(http.MethodGet, "/admin/keys", nil)
+	rec = httptest.NewRecorder()
+	app.ServeHTTP(rec, req)
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("/admin/keys without key: %d", rec.Code)
+	}
+}
+
+func TestStatusPageUsageErrorOnKeyRow(t *testing.T) {
+	var hits int32
+	srv := fakeUsageServer(t, &hits)
+	app := newApp(Config{ProxyAPIKey: "p", UpstreamAPIKeys: []string{"sk-bad-1", "sk-good-2"}, UsageURL: srv.URL})
+	rec := getStatusPage(app)
+	body := rec.Body.String()
+	rows := strings.Split(body, "<tr>")
+	if rec.Code != http.StatusOK || len(rows) != 4 {
+		t.Fatalf("got %d %s", rec.Code, body)
+	}
+	if !strings.Contains(rows[2], "erro de uso: HTTP 401") || strings.Contains(rows[2], "%</td>") {
+		t.Fatalf("key #1 row: %s", rows[2])
+	}
+	if !strings.Contains(rows[3], "<td>12.5%</td>") || strings.Contains(rows[3], "erro de uso") {
+		t.Fatalf("key #2 row: %s", rows[3])
+	}
+}
+
+func TestStatusPageEscapesKeyName(t *testing.T) {
+	var hits int32
+	srv := fakeUsageServer(t, &hits)
+	app := newApp(Config{ProxyAPIKey: "p", UpstreamAPIKeys: []string{"sk-good-1"}, KeyNames: []string{"<b>x</b>"}, UsageURL: srv.URL})
+	body := getStatusPage(app).Body.String()
+	if !strings.Contains(body, "&lt;b&gt;x&lt;/b&gt;") || strings.Contains(body, "<b>x</b>") {
+		t.Fatalf("name not escaped: %s", body)
+	}
+}
+
+func TestStatusPagePartialWindows(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"usage":{"weekly":{"percent":40}}}`))
+	}))
+	t.Cleanup(srv.Close)
+	app := newApp(Config{ProxyAPIKey: "p", UpstreamAPIKeys: []string{"sk-good-1"}, UsageURL: srv.URL})
+	rec := getStatusPage(app)
+	body := rec.Body.String()
+	if rec.Code != http.StatusOK || !strings.Contains(body, "<td>40.0%</td>") || !strings.Contains(body, "<td>—</td>") {
+		t.Fatalf("got %d %s", rec.Code, body)
+	}
+}
+
+func TestUsageForCancelledRequestDoesNotPoisonCache(t *testing.T) {
+	var hits int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if atomic.AddInt32(&hits, 1) == 1 {
+			<-r.Context().Done() // slow upstream: hold until the client gives up
+			return
+		}
+		_, _ = w.Write([]byte(fakeUsageBody))
+	}))
+	t.Cleanup(srv.Close)
+	app := newApp(Config{ProxyAPIKey: "p", UpstreamAPIKeys: []string{"sk-good-1"}, UsageURL: srv.URL, UsageCacheTTL: time.Minute})
+	ctx, cancel := context.WithCancel(context.Background())
+	time.AfterFunc(50*time.Millisecond, cancel)
+	if got := app.usageFor(ctx); len(got) != 1 || got[0].err == "" {
+		t.Fatalf("expected a cancel error for this response only: %+v", got)
+	}
+	got := app.usageFor(context.Background())
+	if got[0].err != "" || got[0].usage == nil || atomic.LoadInt32(&hits) != 2 {
+		t.Fatalf("expected a refetch after cancel: %+v hits=%d", got, atomic.LoadInt32(&hits))
 	}
 }
 

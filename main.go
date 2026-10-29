@@ -47,9 +47,9 @@ type Config struct {
 	// KeyNames labels UpstreamAPIKeys by position (OPENCODE_GO_KEY_NAMES); the
 	// key value itself is never shown. Missing entries mean an empty name.
 	KeyNames []string
-	// UsageURL is the OpenCode Go usage endpoint queried by /admin/keys.
+	// UsageURL is the OpenCode Go usage endpoint queried by /admin/keys and /status.
 	UsageURL string
-	// UsageCacheTTL is how long /admin/keys reuses a usage lookup per key.
+	// UsageCacheTTL is how long /admin/keys and /status reuse a usage lookup per key.
 	UsageCacheTTL time.Duration
 
 	SMTP SMTPConfig
@@ -620,6 +620,8 @@ func (a *App) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		_, _ = w.Write([]byte("ok"))
 	case r.URL.Path == "/readyz":
 		a.handleReadyz(w, r)
+	case r.URL.Path == "/status" && (r.Method == http.MethodGet || r.Method == http.MethodHead):
+		a.handleStatusPage(w, r)
 	case strings.HasPrefix(r.URL.Path, "/admin/"):
 		if !a.authOK(r) {
 			writeOpenAIError(w, http.StatusUnauthorized, "invalid_api_key", "Unauthorized")
