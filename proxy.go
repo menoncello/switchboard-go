@@ -147,7 +147,7 @@ func (a *App) serveProxy(w http.ResponseWriter, r *http.Request, style APIStyle)
 	if name, ok := a.proxyTiers(orig, w, r, fields, model, style, &last); ok {
 		return model, name, -1
 	}
-	if last.err != nil && orig.Err() != nil {
+	if orig.Err() != nil {
 		w.WriteHeader(statusClientClosed)
 		return model, "", -1
 	}
@@ -160,7 +160,7 @@ func (a *App) serveProxy(w http.ResponseWriter, r *http.Request, style APIStyle)
 		return model, last.tier, last.key
 	}
 	if last.err != nil {
-		http.Error(w, last.err.Error(), http.StatusBadGateway)
+		http.Error(w, "upstream unreachable", http.StatusBadGateway) // fixed text: the error would leak the tier URL
 		return model, "", -1
 	}
 	// No eligible tier remains. Fail fast locally instead of hammering upstream,
