@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"io"
 	"log"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -1650,5 +1651,210 @@ func TestAdminAndStatusUnchangedWithTiers(t *testing.T) {
 		if a.Code != b.Code || a.Body.String() != b.Body.String() {
 			t.Fatalf("%s differs: %d %q vs %d %q", path, a.Code, a.Body.String(), b.Code, b.Body.String())
 		}
+	}
+}
+
+type lockedBuf struct {
+	mu sync.Mutex
+	b  bytes.Buffer
+}
+
+func (l *lockedBuf) Write(p []byte) (int, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.b.Write(p)
+}
+
+func (l *lockedBuf) String() string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.b.String()
+}
+
+// captureLog routes the app's request log into a buffer and returns a reader of the parsed lines.
+func captureLog(app *App) func(t *testing.T) []map[string]any {
+	buf := &lockedBuf{}
+	app.logger = slog.New(slog.NewJSONHandler(buf, nil))
+	return func(t *testing.T) []map[string]any {
+		t.Helper()
+		var out []map[string]any
+		for _, ln := range strings.Split(strings.TrimSpace(buf.String()), "\n") {
+			if ln == "" {
+				continue
+			}
+			m := map[string]any{}
+			if err := json.Unmarshal([]byte(ln), &m); err != nil {
+				t.Fatalf("bad log line %q: %v", ln, err)
+			}
+			out = append(out, m)
+		}
+		return out
+	}
+}
+
+func TestRequestLogTier0AndTier1(t *testing.T) {
+	s0 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") == "Bearer secret-key-1" {
+			w.WriteHeader(http.StatusTooManyRequests)
+			_, _ = w.Write([]byte(quotaBody))
+			return
+		}
+		_, _ = w.Write([]byte(`{"ok":true}`))
+	}))
+	defer s0.Close()
+	s1 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"from":"t1"}`))
+	}))
+	defer s1.Close()
+	app := newApp(Config{ProxyAPIKey: "p", UpstreamAPIKeys: []string{"secret-key-1", "secret-key-2"}, KeyNames: []string{"first", "second"}, UpstreamBaseURL: s0.URL, MaxRequestBodyBytes: 1 << 20, RetryExhaustedAfter: time.Hour, Tiers: []TierConfig{
+		{Name: "t1", BaseURL: s1.URL, APIKey: "secret-tier-key", Free: true, Styles: []APIStyle{APIStyleOpenAI}, Models: []TierModel{{Name: "a"}}},
+	}})
+	lines := captureLog(app)
+	if rec := tierReq(app, http.MethodPost, "/v1/chat/completions", `{"model":"glm-5.1"}`, nil); rec.Code != http.StatusOK {
+		t.Fatalf("tier0: %d", rec.Code)
+	}
+	app.keys.MarkExhausted(1) // tier 0 is now fully exhausted
+	if rec := tierReq(app, http.MethodPost, "/v1/chat/completions", `{"model":"a"}`, nil); rec.Code != http.StatusOK {
+		t.Fatalf("tier1: %d", rec.Code)
+	}
+	got := lines(t)
+	if len(got) != 2 {
+		t.Fatalf("lines: %v", got)
+	}
+	l0, l1 := got[0], got[1]
+	if l0["msg"] != "request" || l0["model"] != "glm-5.1" || l0["api_style"] != "openai" || l0["tier"] != "opencode-go" ||
+		l0["key_index"] != float64(1) || l0["key_name"] != "second" || l0["status"] != float64(200) || l0["latency_ms"] == nil {
+		t.Fatalf("tier0 line: %v", l0)
+	}
+	if l1["model"] != "a" || l1["tier"] != "t1" || l1["status"] != float64(200) {
+		t.Fatalf("tier1 line: %v", l1)
+	}
+	if _, ok := l1["key_index"]; ok {
+		t.Fatalf("tier1 line has key_index: %v", l1)
+	}
+	if _, ok := l1["key_name"]; ok {
+		t.Fatalf("tier1 line has key_name: %v", l1)
+	}
+	raw, _ := json.Marshal(got)
+	for _, secret := range []string{"secret-key-1", "secret-key-2", "secret-tier-key"} {
+		if strings.Contains(string(raw), secret) {
+			t.Fatalf("log leaks %q: %s", secret, raw)
+		}
+	}
+}
+
+func TestRequestLogStreamLatencyCoversWholeStream(t *testing.T) {
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("data: 1\n\n"))
+		w.(http.Flusher).Flush()
+		time.Sleep(200 * time.Millisecond)
+		_, _ = w.Write([]byte("data: 2\n\n"))
+	}))
+	defer up.Close()
+	app := newApp(Config{ProxyAPIKey: "p", UpstreamAPIKeys: []string{"k"}, UpstreamBaseURL: up.URL, MaxRequestBodyBytes: 1 << 20, RetryExhaustedAfter: time.Hour})
+	lines := captureLog(app)
+	if rec := doProxyReq(app); rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), "data: 2") || !rec.Flushed {
+		t.Fatalf("code=%d flushed=%v body=%q", rec.Code, rec.Flushed, rec.Body.String())
+	}
+	got := lines(t)
+	if len(got) != 1 || got[0]["latency_ms"].(float64) < 200 {
+		t.Fatalf("lines: %v", got)
+	}
+}
+
+func TestRequestLogLocal429And502HaveNoTier(t *testing.T) {
+	f := newTierFixture(t, false, false)
+	f.app.config.Tiers = nil
+	lines := captureLog(f.app)
+	if rec := tierReq(f.app, http.MethodPost, "/v1/chat/completions", `{"model":"a"}`, nil); rec.Code != http.StatusTooManyRequests {
+		t.Fatalf("setup: %d", rec.Code)
+	}
+	if rec := tierReq(f.app, http.MethodPost, "/v1/chat/completions", `{"model":"a"}`, nil); rec.Code != http.StatusTooManyRequests {
+		t.Fatalf("429: %d", rec.Code)
+	}
+	dead := newApp(Config{ProxyAPIKey: "p", UpstreamAPIKeys: []string{"k"}, UpstreamBaseURL: "http://127.0.0.1:1", MaxRequestBodyBytes: 1 << 20, RetryExhaustedAfter: time.Hour})
+	deadLines := captureLog(dead)
+	if rec := doProxyReq(dead); rec.Code != http.StatusBadGateway {
+		t.Fatalf("502: %d", rec.Code)
+	}
+	// tier 0 quota-exhausted, then the tier upstream is unreachable
+	tierDead := newApp(Config{ProxyAPIKey: "p", UpstreamAPIKeys: []string{"u"}, UpstreamBaseURL: f.app.config.UpstreamBaseURL, MaxRequestBodyBytes: 1 << 20, RetryExhaustedAfter: time.Hour, Tiers: []TierConfig{
+		{Name: "t1", BaseURL: "http://127.0.0.1:1", APIKey: "k1", Free: true, Styles: []APIStyle{APIStyleOpenAI}, Models: []TierModel{{Name: "a"}}},
+	}})
+	tierDeadLines := captureLog(tierDead)
+	if rec := tierReq(tierDead, http.MethodPost, "/v1/chat/completions", `{"model":"a"}`, nil); rec.Code != http.StatusBadGateway {
+		t.Fatalf("tier 502: %d", rec.Code)
+	}
+	for i, got := range [][]map[string]any{lines(t), deadLines(t), tierDeadLines(t)} {
+		l := got[len(got)-1]
+		want := []float64{429, 502, 502}[i]
+		if l["tier"] != "" || l["status"] != want {
+			t.Fatalf("line %d: %v", i, l)
+		}
+		if _, ok := l["key_index"]; ok {
+			t.Fatalf("line %d has key_index: %v", i, l)
+		}
+	}
+}
+
+func TestRequestLogAnthropicStyle(t *testing.T) {
+	s0 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusTooManyRequests)
+		_, _ = w.Write([]byte(quotaBody))
+	}))
+	defer s0.Close()
+	s1 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { _, _ = w.Write([]byte(`{}`)) }))
+	defer s1.Close()
+	app := newApp(Config{ProxyAPIKey: "p", UpstreamAPIKeys: []string{"k"}, UpstreamBaseURL: s0.URL, MaxRequestBodyBytes: 1 << 20, RetryExhaustedAfter: time.Hour, Tiers: []TierConfig{
+		{Name: "t1", BaseURL: s1.URL, APIKey: "tk", Free: true, Styles: []APIStyle{APIStyleAnthropic}, Models: []TierModel{{Name: "m"}}},
+	}})
+	lines := captureLog(app)
+	if rec := tierReq(app, http.MethodPost, "/v1/messages", `{"model":"m"}`, nil); rec.Code != http.StatusOK {
+		t.Fatalf("code %d", rec.Code)
+	}
+	got := lines(t)
+	if len(got) != 1 || got[0]["api_style"] != "anthropic" || got[0]["tier"] != "t1" || got[0]["status"] != float64(200) {
+		t.Fatalf("lines: %v", got)
+	}
+	if _, ok := got[0]["key_index"]; ok {
+		t.Fatalf("tier line has key_index: %v", got[0])
+	}
+}
+
+func TestRequestLogTierNamedLikeTier0HasNoKeyFields(t *testing.T) {
+	s0 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusTooManyRequests)
+		_, _ = w.Write([]byte(quotaBody))
+	}))
+	defer s0.Close()
+	s1 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { _, _ = w.Write([]byte(`{}`)) }))
+	defer s1.Close()
+	app := newApp(Config{ProxyAPIKey: "p", UpstreamAPIKeys: []string{"k"}, KeyNames: []string{"n"}, UpstreamBaseURL: s0.URL, MaxRequestBodyBytes: 1 << 20, RetryExhaustedAfter: time.Hour, Tiers: []TierConfig{
+		{Name: "opencode-go", BaseURL: s1.URL, APIKey: "tk", Free: true, Styles: []APIStyle{APIStyleOpenAI}, Models: []TierModel{{Name: "m"}}},
+	}})
+	lines := captureLog(app)
+	if rec := tierReq(app, http.MethodPost, "/v1/chat/completions", `{"model":"m"}`, nil); rec.Code != http.StatusOK {
+		t.Fatalf("code %d", rec.Code)
+	}
+	got := lines(t)
+	if len(got) != 1 || got[0]["tier"] != "opencode-go" {
+		t.Fatalf("lines: %v", got)
+	}
+	for _, k := range []string{"key_index", "key_name"} {
+		if _, ok := got[0][k]; ok {
+			t.Fatalf("extra tier line has %s: %v", k, got[0])
+		}
+	}
+}
+
+func TestRequestBodyTooLargeStill413(t *testing.T) {
+	app := newApp(Config{ProxyAPIKey: "p", UpstreamAPIKeys: []string{"k"}, UpstreamBaseURL: "http://127.0.0.1:1", MaxRequestBodyBytes: 8, RetryExhaustedAfter: time.Hour})
+	lines := captureLog(app)
+	if rec := tierReq(app, http.MethodPost, "/v1/chat/completions", `{"model":"glm-5.1","messages":[]}`, nil); rec.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("code %d", rec.Code)
+	}
+	if got := lines(t); len(got) != 1 || got[0]["status"] != float64(413) {
+		t.Fatalf("lines: %v", got)
 	}
 }

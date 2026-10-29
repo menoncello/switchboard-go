@@ -118,6 +118,26 @@ only fire in that case. To try it by hand, run
 
 `validate-config` shows only the number of tiers (`tiers=N`).
 
+## Request log
+
+Every proxied request writes one JSON line to stderr when its response ends
+(for a stream, after the last event):
+
+```json
+{"time":"...","level":"INFO","msg":"request","model":"glm-5.1","api_style":"openai","tier":"opencode-go","key_index":0,"key_name":"main","status":200,"latency_ms":412}
+```
+
+- `model`: top-level `model` of the request body, empty if there is none.
+- `api_style`: `openai` or `anthropic`.
+- `tier`: `opencode-go` for tier 0, the tier `name` for an extra tier, empty when
+  no tier answered (local `429`, `502` on a connection error).
+- `key_index` and `key_name`: only for tier 0 (`key_name` can be empty).
+- `status`: the status the client received.
+- `latency_ms`: from before the body is read to the last byte sent to the client.
+
+The key value, `Authorization`, `x-api-key` and the request body and headers are
+never logged.
+
 ## Environment variables
 
 | Variable | Required | Default | Description |

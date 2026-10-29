@@ -9,7 +9,10 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"time"
 )
+
+const tier0Name = "opencode-go"
 
 type APIStyle int
 
@@ -18,8 +21,61 @@ const (
 	APIStyleAnthropic
 )
 
+// statusRecorder keeps the first status the client was sent and still flushes.
+type statusRecorder struct {
+	http.ResponseWriter
+	status int
+}
+
+func (s *statusRecorder) WriteHeader(code int) {
+	if s.status == 0 {
+		s.status = code
+	}
+	s.ResponseWriter.WriteHeader(code)
+}
+
+func (s *statusRecorder) Write(b []byte) (int, error) {
+	if s.status == 0 {
+		s.status = http.StatusOK
+	}
+	return s.ResponseWriter.Write(b)
+}
+
+func (s *statusRecorder) Flush() {
+	if f, ok := s.ResponseWriter.(http.Flusher); ok {
+		f.Flush()
+	}
+}
+
+func (s *statusRecorder) Unwrap() http.ResponseWriter { return s.ResponseWriter }
+
+// proxyV1 serves one proxied request and logs one JSON line when the response
+// (including a stream) is done. The line never carries a key value.
 func (a *App) proxyV1(w http.ResponseWriter, r *http.Request, style APIStyle) {
+	start := time.Now()
+	// Limit with the original writer so net/http still sees an oversized body and closes the connection.
 	r.Body = http.MaxBytesReader(w, r.Body, a.config.MaxRequestBodyBytes)
+	rec := &statusRecorder{ResponseWriter: w}
+	model, tier, keyIdx := a.serveProxy(rec, r, style)
+	if rec.status == 0 {
+		rec.status = http.StatusOK
+	}
+	apiStyle := "openai"
+	if style == APIStyleAnthropic {
+		apiStyle = "anthropic"
+	}
+	attrs := []any{"model", model, "api_style", apiStyle, "tier", tier}
+	if keyIdx >= 0 {
+		attrs = append(attrs, "key_index", keyIdx, "key_name", a.config.keyName(keyIdx))
+	}
+	attrs = append(attrs, "status", rec.status, "latency_ms", time.Since(start).Milliseconds())
+	a.logger.Info("request", attrs...)
+}
+
+// serveProxy does the work of proxyV1 and returns what the log line needs: the
+// top-level model, the tier that answered ("" when none did) and the tier 0 key index (-1 when tier 0 did not answer).
+func (a *App) serveProxy(w http.ResponseWriter, r *http.Request, style APIStyle) (model, tier string, keyIdx int) {
+	keyIdx = -1
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
 		if strings.Contains(err.Error(), "request body too large") {
@@ -30,6 +86,7 @@ func (a *App) proxyV1(w http.ResponseWriter, r *http.Request, style APIStyle) {
 		return
 	}
 	_ = r.Body.Close()
+	fields, model := topLevelModel(body)
 	orig := r.Context()
 	for attempts := 0; attempts < len(a.config.UpstreamAPIKeys); attempts++ {
 		idx, key, ok := a.keys.Current()
@@ -39,7 +96,7 @@ func (a *App) proxyV1(w http.ResponseWriter, r *http.Request, style APIStyle) {
 		resp, reqErr := a.doUpstream(orig, r, body, a.config.UpstreamBaseURL, key, style)
 		if reqErr != nil {
 			http.Error(w, reqErr.Error(), http.StatusBadGateway)
-			return
+			return model, "", -1
 		}
 		if isKeyDead(resp) {
 			_ = resp.Body.Close()
@@ -54,10 +111,10 @@ func (a *App) proxyV1(w http.ResponseWriter, r *http.Request, style APIStyle) {
 		// flags re-arm for the next depletion round.
 		a.keys.MarkAvailable(idx)
 		copyResponse(w, resp)
-		return
+		return model, tier0Name, idx
 	}
-	if a.proxyTiers(orig, w, r, body, style) {
-		return
+	if name, ok := a.proxyTiers(orig, w, r, fields, model, style); ok {
+		return model, name, -1
 	}
 	// No eligible key remains. Fail fast locally instead of hammering upstream,
 	// and hint well-behaved clients at the next probe window via Retry-After.
@@ -68,16 +125,16 @@ func (a *App) proxyV1(w http.ResponseWriter, r *http.Request, style APIStyle) {
 		w.Header().Set("Retry-After", strconv.Itoa(secs))
 	}
 	writeAPIError(w, style, http.StatusTooManyRequests, "rate_limit_exceeded", "all upstream keys exhausted")
+	return model, "", -1
 }
 
 // proxyTiers tries the configured tiers in order once tier 0 is exhausted and
-// reports whether one answered. A request without a top-level string "model"
-// stays on tier 0.
-func (a *App) proxyTiers(ctx context.Context, w http.ResponseWriter, r *http.Request, body []byte, style APIStyle) bool {
-	var fields map[string]json.RawMessage
-	var model string
-	if json.Unmarshal(body, &fields) != nil || json.Unmarshal(fields["model"], &model) != nil || model == "" {
-		return false
+// returns the name of the tier that answered and whether one did (the name is
+// empty for the 502 on a connection error). A request without a top-level string
+// "model" stays on tier 0.
+func (a *App) proxyTiers(ctx context.Context, w http.ResponseWriter, r *http.Request, fields map[string]json.RawMessage, model string, style APIStyle) (string, bool) {
+	if model == "" {
+		return "", false
 	}
 	for _, t := range a.config.Tiers {
 		id, ok := tierModelID(t, model, style)
@@ -93,16 +150,27 @@ func (a *App) proxyTiers(ctx context.Context, w http.ResponseWriter, r *http.Req
 		resp, err := a.doUpstream(ctx, r, tierBody, t.BaseURL, t.APIKey, style)
 		if err != nil {
 			http.Error(w, "tier upstream unreachable", http.StatusBadGateway)
-			return true
+			return "", true
 		}
 		if isQuota429(resp) {
 			_ = resp.Body.Close()
 			continue
 		}
 		copyResponse(w, resp)
-		return true
+		return t.Name, true
 	}
-	return false
+	return "", false
+}
+
+// topLevelModel parses body once and returns its fields and the top-level string
+// "model" ("" when the body is not a JSON object or has no string model).
+func topLevelModel(body []byte) (map[string]json.RawMessage, string) {
+	var fields map[string]json.RawMessage
+	var model string
+	if json.Unmarshal(body, &fields) != nil || json.Unmarshal(fields["model"], &model) != nil {
+		return nil, ""
+	}
+	return fields, model
 }
 
 // tierModelID returns the upstream model ID for model when the tier speaks style and maps it.
