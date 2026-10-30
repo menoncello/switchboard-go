@@ -149,6 +149,12 @@ logged, the file is renamed to `<usage_file>.bad` (so the next write does not
 destroy it) and the history starts empty. Without `usage_file` the history stays in
 memory and startup (and `validate-config`) logs a warning.
 
+`GET /status` shows this history in a "Uso" section below the tiers: today's
+total (requests and tokens, with the `timezone` zone) and, inside a `<details>`,
+one table per day, project, model, key and tier for the last 7 days (today plus
+the 6 before). Only tokens and requests: no price. The section is left out while
+the window has no request.
+
 ## Tiers
 
 `tiers:` lists extra upstreams used for failover. The `upstream:` block above

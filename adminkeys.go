@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"cmp"
 	"context"
 	"encoding/json"
 	"errors"
@@ -12,6 +13,7 @@ import (
 	"math"
 	"net/http"
 	"net/url"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -232,7 +234,15 @@ var statusTmpl = template.Must(template.New("status").Funcs(template.FuncMap{
 {{if .Tiers}}<h2>Tiers</h2>
 <table><tr><th>Tier</th><th>Estado</th><th>Cooldown</th></tr>
 {{range .Tiers}}<tr><td>{{.Name}}</td><td>{{.State}}</td><td>{{if .RemainingSeconds}}{{.RemainingSeconds}}s{{else}}—{{end}}</td></tr>
-{{end}}</table>{{end}}</body></html>
+{{end}}</table>{{end}}{{with .Usage}}
+<h2>Uso</h2>
+<p>Hoje ({{.Today}}, {{.Timezone}}): {{.Total.Requests}} requests, {{.Total.TokensIn}} tokens in, {{.Total.TokensOut}} tokens out, {{.Total.TokensCacheIn}} tokens cache.</p>
+<details><summary>Últimos 7 dias</summary>
+{{range .Dims}}<h3>{{.Title}}</h3>
+<table><tr><th>{{.Title}}</th><th>Requests</th><th>Tokens in</th><th>Tokens out</th><th>Tokens cache</th><th>Sem usage</th></tr>
+{{range .Rows}}<tr><td>{{.Label}}</td><td>{{.Requests}}</td><td>{{.TokensIn}}</td><td>{{.TokensOut}}</td><td>{{.TokensCacheIn}}</td><td>{{.NoUsage}}</td></tr>
+{{end}}</table>
+{{end}}</details>{{end}}</body></html>
 `))
 
 type tierRow struct {
@@ -245,6 +255,87 @@ type tierRow struct {
 type statusPage struct {
 	KeysReportResponse
 	Tiers []tierRow
+	Usage *usageReport
+}
+
+type usageLine struct {
+	Label                                                 string
+	Requests, TokensIn, TokensOut, TokensCacheIn, NoUsage int
+}
+
+type usageDim struct {
+	Title string
+	Rows  []usageLine
+}
+
+// usageReport is the usage section of /status: today's total and the last 7 days
+// per dimension. Only names already stored in the history, never key values.
+type usageReport struct {
+	Timezone, Today string
+	Total           usageLine
+	Dims            []usageDim
+}
+
+func (a *App) usageReport() *usageReport {
+	today, rows := a.history.window(7)
+	if len(rows) == 0 {
+		return nil
+	}
+	rep := &usageReport{Timezone: a.history.loc.String(), Today: today}
+	dims := []struct {
+		title string
+		by    func(usageRow) string
+	}{
+		{"Dia", func(r usageRow) string { return r.Day }},
+		{"Projeto", func(r usageRow) string {
+			if r.Project == "" {
+				return noProject
+			}
+			return r.Project
+		}},
+		{"Modelo", func(r usageRow) string { return r.Model }},
+		{"Chave", func(r usageRow) string {
+			if r.Key == "" {
+				return "—"
+			}
+			return r.Key
+		}},
+		{"Tier", func(r usageRow) string { return r.Tier }},
+	}
+	for i, d := range dims {
+		sums := map[string]*usageLine{}
+		for _, r := range rows {
+			l := sums[d.by(r)]
+			if l == nil {
+				l = &usageLine{Label: d.by(r)}
+				sums[d.by(r)] = l
+			}
+			l.Requests += r.Requests
+			l.TokensIn += r.TokensIn
+			l.TokensOut += r.TokensOut
+			l.TokensCacheIn += r.TokensCacheIn
+			l.NoUsage += r.NoUsage
+		}
+		lines := make([]usageLine, 0, len(sums))
+		for _, l := range sums {
+			lines = append(lines, *l)
+		}
+		slices.SortFunc(lines, func(x, y usageLine) int {
+			if i == 0 { // days: newest first
+				return strings.Compare(y.Label, x.Label)
+			}
+			return cmp.Or(cmp.Compare(y.Requests, x.Requests), strings.Compare(x.Label, y.Label))
+		})
+		rep.Dims = append(rep.Dims, usageDim{d.title, lines})
+		if i == 0 {
+			for _, l := range lines {
+				if l.Label == today {
+					rep.Total = l
+				}
+			}
+		}
+	}
+	return rep
 }
 
 func (a *App) tierRows() []tierRow {
@@ -277,7 +368,7 @@ func (a *App) tierRows() []tierRow {
 
 func (a *App) handleStatusPage(w http.ResponseWriter, r *http.Request) {
 	var buf bytes.Buffer
-	if err := statusTmpl.Execute(&buf, statusPage{a.buildKeysReport(r.Context()), a.tierRows()}); err != nil {
+	if err := statusTmpl.Execute(&buf, statusPage{a.buildKeysReport(r.Context()), a.tierRows(), a.usageReport()}); err != nil {
 		log.Printf("status page render failed: %v", err)
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return

@@ -161,6 +161,21 @@ func (h *usageHistory) snapshot() []usageRow {
 	return h.snapshotLocked()
 }
 
+// window returns today (YYYY-MM-DD in h.loc) and the rows of the last days days, today included.
+func (h *usageHistory) window(days int) (string, []usageRow) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	now := h.now().In(h.loc)
+	today, from := now.Format("2006-01-02"), now.AddDate(0, 0, -(days-1)).Format("2006-01-02")
+	var rows []usageRow
+	for _, r := range h.snapshotLocked() {
+		if r.Day >= from && r.Day <= today {
+			rows = append(rows, r)
+		}
+	}
+	return today, rows
+}
+
 // flush drops days past retention and writes the file. The write runs outside
 // h.mu so requests are not blocked by the disk. A failure is only logged and
 // dirty is set again for the next flush.

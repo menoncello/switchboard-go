@@ -287,3 +287,104 @@ func TestShutdownFlushesHistory(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+func statusBody(app *App) string { return getStatusPage(app).Body.String() }
+
+func TestStatusUsageSection(t *testing.T) {
+	at := time.Date(2026, 10, 29, 12, 0, 0, 0, time.UTC)
+	app := historyAppWith(t, 200, usageBody, func(c *Config) {
+		c.Timezone = "America/Sao_Paulo"
+		c.UpstreamAPIKeys = []string{"sk-SEGREDO1"}
+		c.Tiers = []TierConfig{{Name: "gratis", BaseURL: "http://segredo-a.invalid", APIKey: "kt-SEGREDO2", Free: true, Models: []TierModel{{Name: "a", ID: "a"}}}}
+	})
+	if strings.Contains(statusBody(app), "<h2>Uso</h2>") {
+		t.Fatal("usage section without requests")
+	}
+	app.history.now = func() time.Time { return at.AddDate(0, 0, -8) }
+	post(app, "velho") // outside the window
+	app.history.now = func() time.Time { return at }
+	if strings.Contains(statusBody(app), "<h2>Uso</h2>") {
+		t.Fatal("usage section for a row outside the window")
+	}
+	app.history.now = func() time.Time { return at.AddDate(0, 0, -1) }
+	post(app, "ontem")
+	app.history.now = func() time.Time { return at }
+	post(app, "a")
+	post(app, "b")
+	post(app, "")
+	body := statusBody(app)
+	if strings.Index(body, "<h2>Uso</h2>") < strings.Index(body, "<h2>Tiers</h2>") || !strings.Contains(body, "<h2>Tiers</h2>") {
+		t.Fatalf("usage not below tiers: %s", body)
+	}
+	for _, want := range []string{"Hoje (2026-10-29, America/Sao_Paulo): 3 requests, 30 tokens in, 9 tokens out, 0 tokens cache.", "<td>a</td><td>1</td>", "<td>b</td><td>1</td>", "<td>sem projeto</td><td>1</td>", "<td>ontem</td>", "<td>2026-10-28</td><td>1</td>"} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("missing %q in %s", want, body)
+		}
+	}
+	if strings.Contains(body, "velho") || strings.Contains(body, "2026-10-21") {
+		t.Fatalf("row outside the window shown: %s", body)
+	}
+	for _, secret := range []string{"SEGREDO1", "SEGREDO2", "segredo-a"} {
+		if strings.Contains(body, secret) {
+			t.Fatalf("leaked %q", secret)
+		}
+	}
+}
+
+func TestStatusUsageNoUsageAndHostileModel(t *testing.T) {
+	app := historyApp(t, 200, `{}`, "")
+	tierReq(app, http.MethodPost, "/v1/chat/completions", `{"model":"<script>x</script>"}`, nil)
+	body := statusBody(app)
+	if strings.Contains(body, "<script>x") || !strings.Contains(body, "&lt;script&gt;x") {
+		t.Fatalf("model not escaped: %s", body)
+	}
+	if !strings.Contains(body, "<td>1</td><td>0</td><td>0</td><td>0</td><td>1</td>") {
+		t.Fatalf("no_usage count missing: %s", body)
+	}
+}
+
+func TestStatusUsageWindowAndOrder(t *testing.T) {
+	app := historyApp(t, 200, usageBody, "")
+	app.history.now = func() time.Time { return time.Date(2026, 10, 29, 12, 0, 0, 0, time.UTC) }
+	add := func(day, project, model, key string, req, in, out, cache int) {
+		app.history.rows[usageKey{day, project, model, key, "t"}] = &usageCounts{Requests: req, TokensIn: in, TokensOut: out, TokensCacheIn: cache}
+	}
+	add("2026-10-22", "p7", "m7", "k7", 9, 9, 9, 9) // today-7: outside
+	add("2026-10-23", "p6", "m1", "", 1, 0, 0, 0)   // today-6: inside
+	add("2026-10-29", "zeta", "m1", "k1", 1, 10, 1, 5)
+	add("2026-10-29", "alfa", "m2", "k1", 1, 10, 1, 7)
+	add("2026-10-29", "beta", "m2", "", 3, 30, 3, 0)
+	body := statusBody(app)
+	if !strings.Contains(body, "Hoje (2026-10-29, UTC): 5 requests, 50 tokens in, 5 tokens out, 12 tokens cache.") {
+		t.Fatalf("day total: %s", body)
+	}
+	for _, gone := range []string{"p7", "m7", "k7", "2026-10-22"} {
+		if strings.Contains(body, gone) {
+			t.Fatalf("today-7 row shown (%q): %s", gone, body)
+		}
+	}
+	section := func(title string) string {
+		s := body[strings.Index(body, "<h3>"+title+"</h3>"):]
+		s = s[len("<h3>"+title+"</h3>"):]
+		if i := strings.Index(s, "<h3>"); i >= 0 {
+			s = s[:i]
+		}
+		return s
+	}
+	inOrder := func(title string, cells ...string) {
+		t.Helper()
+		s, last := section(title), -1
+		for _, c := range cells {
+			i := strings.Index(s, "<td>"+c+"</td>")
+			if i <= last {
+				t.Fatalf("%s: %q out of order or missing in %s", title, c, s)
+			}
+			last = i
+		}
+	}
+	inOrder("Dia", "2026-10-29", "2026-10-23")
+	inOrder("Projeto", "beta", "alfa", "p6", "zeta") // requests desc, then label
+	inOrder("Modelo", "m2", "m1")
+	inOrder("Chave", "—", "k1") // empty key shows as a dash
+	inOrder("Tier", "t")
+}
