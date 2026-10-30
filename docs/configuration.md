@@ -248,9 +248,19 @@ Every proxied request writes one JSON line to stderr when its response ends
   they come from the last `usage` seen (Anthropic: `input_tokens` from
   `message_start`, cumulative `output_tokens` from the last `message_delta`).
   The proxy never changes the request to get them and never estimates them.
+- `tokens_cache_in`: only when above 0, the cache tokens of the response added
+  together (Anthropic `cache_creation_input_tokens` + `cache_read_input_tokens`,
+  OpenAI `prompt_tokens_details.cached_tokens`). They are not part of `tokens_in`.
+- `usage_partial`: `true` when a stream broke before its end and the tokens are
+  what had arrived (Anthropic: `output_tokens` can still be the `message_start`
+  placeholder).
 - `usage_missing`: `true` when the response was `2xx` from a tier but carried no
   usable `usage` (absent, malformed, a compressed body with `Content-Encoding`,
-  or a JSON body above 1 MiB). The line then has no `tokens_*`.
+  or a JSON body above 1 MiB). A `usage` of 0 input and 0 output counts as
+  missing. An OpenAI stream without `stream_options.include_usage` in the request
+  has no `usage` either, and the proxy does not alter the request to add it.
+  Only `POST` requests are flagged (a `GET /v1/models` is not).
+  The line then has no `tokens_*`.
   Responses that are not `2xx` and requests no tier answered (local `429`, `502`,
   `499`, `413`, `400`) have neither `tokens_*` nor `usage_missing`.
 

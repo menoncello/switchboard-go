@@ -3290,3 +3290,116 @@ func TestStreamReachesClientBeforeUpstreamEnds(t *testing.T) {
 		t.Fatalf("log: %v", got)
 	}
 }
+
+// usageApp is an app whose tier 0 is the server answering with handler.
+func usageApp(t *testing.T, handler http.HandlerFunc) (*App, func(*testing.T) []map[string]any) {
+	t.Helper()
+	up := httptest.NewServer(handler)
+	t.Cleanup(up.Close)
+	app := newApp(Config{ProxyAPIKey: "p", UpstreamAPIKeys: []string{"k"}, UpstreamBaseURL: up.URL, MaxRequestBodyBytes: 1 << 20, RetryExhaustedAfter: time.Hour})
+	return app, captureLog(app)
+}
+
+func TestRequestLogTokensFallbackTier(t *testing.T) {
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"usage":{"prompt_tokens":11,"completion_tokens":7}}`))
+	})
+	s0, s1 := httptest.NewServer(handler), httptest.NewServer(handler)
+	defer s0.Close()
+	defer s1.Close()
+	app := newApp(Config{ProxyAPIKey: "p", UpstreamAPIKeys: []string{"k"}, UpstreamBaseURL: s0.URL, MaxRequestBodyBytes: 1 << 20, RetryExhaustedAfter: time.Hour, Tiers: []TierConfig{
+		{Name: "t1", BaseURL: s1.URL, APIKey: "tk", Free: true, Styles: []APIStyle{APIStyleOpenAI}, Models: []TierModel{{Name: "a"}}},
+	}})
+	lines := captureLog(app)
+	app.cooldowns.set(tier0CooldownKey, time.Hour)
+	if rec := tierReq(app, http.MethodPost, "/v1/chat/completions", `{"model":"a"}`, nil); rec.Code != http.StatusOK {
+		t.Fatalf("code %d", rec.Code)
+	}
+	got := lines(t)
+	if len(got) != 1 || got[0]["tier"] != "t1" || got[0]["tokens_in"] != float64(11) || got[0]["tokens_out"] != float64(7) {
+		t.Fatalf("log: %v", got)
+	}
+}
+
+func TestRequestLogUsageAboveMaxBody(t *testing.T) {
+	body := `{"usage":{"prompt_tokens":1,"completion_tokens":1},"pad":"` + strings.Repeat("x", maxUsageBody) + `"}`
+	app, lines := usageApp(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(body))
+	})
+	if rec := tierReq(app, http.MethodPost, "/v1/chat/completions", `{"model":"m"}`, nil); rec.Code != 200 || rec.Body.String() != body {
+		t.Fatalf("client got %d, %d bytes", rec.Code, rec.Body.Len())
+	}
+	got := lines(t)
+	_, in := got[0]["tokens_in"]
+	_, out := got[0]["tokens_out"]
+	if len(got) != 1 || got[0]["usage_missing"] != true || in || out {
+		t.Fatalf("log: %v", got)
+	}
+}
+
+func TestRequestLogNoUsageFieldsOnErrors(t *testing.T) {
+	for _, status := range []int{http.StatusTooManyRequests, http.StatusBadGateway} {
+		app, lines := usageApp(t, func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(status)
+			_, _ = w.Write([]byte(`{"usage":{"prompt_tokens":1,"completion_tokens":1}}`))
+		})
+		tierReq(app, http.MethodPost, "/v1/chat/completions", `{"model":"m"}`, nil)
+		got := lines(t)
+		if len(got) != 1 {
+			t.Fatalf("%d: lines %v", status, got)
+		}
+		for _, k := range []string{"tokens_in", "tokens_out", "tokens_cache_in", "usage_missing", "usage_partial"} {
+			if _, has := got[0][k]; has {
+				t.Fatalf("%d: unexpected %s: %v", status, k, got[0])
+			}
+		}
+	}
+}
+
+func TestRequestLogUsageMissingOnlyForPost(t *testing.T) {
+	app, lines := usageApp(t, func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"data":[]}`))
+	})
+	if rec := tierReq(app, http.MethodGet, "/v1/models", "", nil); rec.Code != 200 {
+		t.Fatalf("code %d", rec.Code)
+	}
+	got := lines(t)
+	if _, has := got[0]["usage_missing"]; len(got) != 1 || has {
+		t.Fatalf("log: %v", got)
+	}
+}
+
+func TestRequestLogCacheTokens(t *testing.T) {
+	cases := []struct{ name, path, body string }{
+		{"anthropic", "/v1/messages", `{"usage":{"input_tokens":3,"output_tokens":5,"cache_creation_input_tokens":100,"cache_read_input_tokens":20}}`},
+		{"openai", "/v1/chat/completions", `{"usage":{"prompt_tokens":3,"completion_tokens":5,"prompt_tokens_details":{"cached_tokens":120}}}`},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			app, lines := usageApp(t, func(w http.ResponseWriter, r *http.Request) { _, _ = w.Write([]byte(c.body)) })
+			tierReq(app, http.MethodPost, c.path, `{"model":"m"}`, nil)
+			got := lines(t)
+			if len(got) != 1 || got[0]["tokens_in"] != float64(3) || got[0]["tokens_out"] != float64(5) || got[0]["tokens_cache_in"] != float64(120) {
+				t.Fatalf("log: %v", got)
+			}
+			if _, has := got[0]["usage_partial"]; has {
+				t.Fatalf("usage_partial on a complete body: %v", got[0])
+			}
+		})
+	}
+}
+
+func TestRequestLogStreamCutKeepsPartialUsage(t *testing.T) {
+	app, lines := usageApp(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":12,\"output_tokens\":1,\"cache_read_input_tokens\":40}}}\n\n"))
+		w.(http.Flusher).Flush()
+		panic(http.ErrAbortHandler) // drops the connection mid-stream
+	})
+	tierReq(app, http.MethodPost, "/v1/messages", `{"model":"m"}`, nil)
+	got := lines(t)
+	if len(got) != 1 || got[0]["tokens_in"] != float64(12) || got[0]["tokens_out"] != float64(1) || got[0]["tokens_cache_in"] != float64(40) || got[0]["usage_partial"] != true {
+		t.Fatalf("log: %v", got)
+	}
+}

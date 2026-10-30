@@ -11,8 +11,9 @@ const maxUsageBody = 1 << 20
 
 // usageTokens is the token count a response reported in its `usage` field.
 type usageTokens struct {
-	in, out int
-	found   bool
+	in, out, cache int
+	found          bool
+	partial        bool // the stream broke before its end; the counts are what had arrived
 }
 
 type usageFields struct {
@@ -20,6 +21,12 @@ type usageFields struct {
 	InputTokens      int `json:"input_tokens"`
 	CompletionTokens int `json:"completion_tokens"`
 	OutputTokens     int `json:"output_tokens"`
+
+	CacheCreation int `json:"cache_creation_input_tokens"`
+	CacheRead     int `json:"cache_read_input_tokens"`
+	PromptDetails struct {
+		CachedTokens int `json:"cached_tokens"`
+	} `json:"prompt_tokens_details"`
 }
 
 // parseUsage reads `usage` from the top of raw (OpenAI, Anthropic JSON, stream chunk) or from
@@ -41,12 +48,13 @@ func parseUsage(raw []byte) usageTokens {
 	if u == nil {
 		return usageTokens{}
 	}
-	t := usageTokens{in: max(u.PromptTokens, u.InputTokens), out: max(u.CompletionTokens, u.OutputTokens)}
+	t := usageTokens{in: max(u.PromptTokens, u.InputTokens), out: max(u.CompletionTokens, u.OutputTokens),
+		cache: u.CacheCreation + u.CacheRead + u.PromptDetails.CachedTokens}
 	t.found = t.in > 0 || t.out > 0
 	return t
 }
 
-// sseUsageScanner is an io.Writer fed with an SSE stream. It keeps the last non-zero in and out
+// sseUsageScanner is an io.Writer fed with an SSE stream. It keeps the last non-zero in, out and cache
 // seen in `data:` lines, so Anthropic's input_tokens (message_start) and cumulative output_tokens
 // (message_delta) end up together. It never fails a write.
 type sseUsageScanner struct {
@@ -97,6 +105,9 @@ func (s *sseUsageScanner) scan(line []byte) {
 	}
 	if t.out != 0 {
 		s.out = t.out
+	}
+	if t.cache != 0 {
+		s.cache = t.cache
 	}
 	s.found = s.in > 0 || s.out > 0
 }

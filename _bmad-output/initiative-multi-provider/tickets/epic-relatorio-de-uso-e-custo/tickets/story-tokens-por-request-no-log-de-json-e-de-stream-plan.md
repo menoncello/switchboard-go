@@ -3,7 +3,7 @@ title: 'Tokens por request no log, de JSON e de stream'
 type: 'feature'
 ticket: 2
 created: '2026-10-29'
-status: 'built'
+status: done
 baseline_revision: 'd4dfcc4a702122d814295f49e59ae39fff9b822b'
 route: 'full'
 route_source: 'auto'
@@ -109,3 +109,25 @@ Anthropic informa `input_tokens` no `message_start` e o `output_tokens` cumulati
 **Commands:**
 - `go vet ./...` -- expected: sem aviso
 - `go test ./...` -- expected: verde, com os testes novos de tokens
+
+## Code Review
+
+### 2026-10-29
+2 `decision-needed`, 3 `patch`, 0 `defer`, 12 rejected.
+
+- [x] [Review][Patch] (decidido: manter tokens_in e gravar tokens_cache_in à parte) Tokens de cache não entram em tokens_in — Anthropic `input_tokens` exclui `cache_creation_input_tokens` e `cache_read_input_tokens`; tokens_in subconta quem usa cache e o custo (R13) sai menor. Options: (a) tokens_in = input + cache_creation + cache_read; (b) manter tokens_in e gravar tokens_cache_in à parte; (c) fora do escopo, só documentar. Recommended: (b) — preserva a contagem simples e deixa a tabela de preços pesar o cache.
+- [x] [Review][Patch] (decidido: manter o parcial e gravar usage_partial=true) Stream interrompido grava tokens parciais como finais — o loop ignora o erro de Read; um corte após message_start grava o output_tokens placeholder (1). Options: (a) em erro de Read devolver usageTokens{} (cai em usage_missing); (b) manter o parcial e gravar usage_partial=true; (c) só documentar. Recommended: (b) — tokens parciais são gasto real.
+- [x] [Review][Patch] Testes faltando: tokens de tier extra, corpo JSON acima de maxUsageBody, 429/5xx sem tokens [main_test.go]
+- [x] [Review][Patch] usage_missing em 2xx sem usage por natureza (ex.: GET /v1/models) — limitar a POST [proxy.go:119]
+- [x] [Review][Patch] Docs não citam stream OpenAI sem include_usage nem usage 0/0 como causas de usage_missing [docs/configuration.md]
+
+Rejected:
+- Resposta comprimida vira usage_missing: falso, `Accept-Encoding` é removido em proxy.go:377.
+- Cauda de linha SSE acima do teto: baixo, a cauda precisa começar com `data:` para casar.
+- `message` como string em parseUsage: baixo, nenhum provedor envia.
+- Teste do stream pode travar em t.Fatal precoce: baixo, só em falha de Do, só no teste.
+- Metadados do ticket inconsistentes: baixo, contabilidade.
+- Sem teste de request idêntico: baixo, doUpstream intocado.
+- Content-Encoding identity: baixo, raro.
+- Corpo binário bufferizado até 1 MiB: baixo, limitado pelo teto.
+- response.usage / contagens float: baixo, fora do escopo.

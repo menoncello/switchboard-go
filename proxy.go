@@ -116,7 +116,13 @@ func (a *App) proxyV1(w http.ResponseWriter, r *http.Request, style APIStyle) {
 	attrs = append(attrs, "status", rec.status, "latency_ms", time.Since(start).Milliseconds())
 	if usage.found {
 		attrs = append(attrs, "tokens_in", usage.in, "tokens_out", usage.out)
-	} else if tier != "" && rec.status/100 == 2 {
+		if usage.cache > 0 {
+			attrs = append(attrs, "tokens_cache_in", usage.cache)
+		}
+		if usage.partial {
+			attrs = append(attrs, "usage_partial", true)
+		}
+	} else if tier != "" && rec.status/100 == 2 && r.Method == http.MethodPost { // GET /v1/models has no usage by nature
 		attrs = append(attrs, "usage_missing", true)
 	}
 	a.logger.Info("request", attrs...)
@@ -449,6 +455,7 @@ func copyResponse(w http.ResponseWriter, resp *http.Response) usageTokens {
 	track := resp.StatusCode/100 == 2 && resp.Header.Get("Content-Encoding") == ""
 	var sse sseUsageScanner
 	var jsonBuf cappedBuffer
+	var readErr error // why the stream ended: nil or io.EOF is a clean end
 	switch {
 	case canFlush && isStream:
 		buf := make([]byte, 4096)
@@ -462,11 +469,12 @@ func copyResponse(w http.ResponseWriter, resp *http.Response) usageTokens {
 				}
 			}
 			if err != nil {
+				readErr = err
 				break
 			}
 		}
 	case track && isStream:
-		_, _ = io.Copy(io.MultiWriter(w, &sse), resp.Body)
+		_, readErr = io.Copy(io.MultiWriter(w, &sse), resp.Body)
 	case track:
 		_, _ = io.Copy(io.MultiWriter(w, &jsonBuf), resp.Body)
 	default:
@@ -476,7 +484,9 @@ func copyResponse(w http.ResponseWriter, resp *http.Response) usageTokens {
 	case !track:
 		return usageTokens{}
 	case isStream:
-		return sse.result()
+		t := sse.result()
+		t.partial = t.found && readErr != nil && readErr != io.EOF
+		return t
 	case jsonBuf.overflow:
 		return usageTokens{}
 	}
