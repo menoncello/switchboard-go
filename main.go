@@ -34,6 +34,9 @@ func main() {
 	warnNoStateFile(cfg)
 	warnNoUsageFile(cfg)
 	a := newApp(cfg)
+	if err := a.startupErr(); err != nil {
+		log.Fatal(err)
+	}
 	srv := &http.Server{Addr: cfg.ListenAddr, Handler: a, ReadHeaderTimeout: 10 * time.Second, ReadTimeout: 65 * time.Second, WriteTimeout: 0, IdleTimeout: 120 * time.Second}
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()

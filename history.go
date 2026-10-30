@@ -56,6 +56,7 @@ type usageHistory struct {
 	flushMu sync.Mutex // serializes flushes; taken before mu
 	mu      sync.Mutex
 	rows    map[usageKey]*usageCounts
+	unread  string // file that held usage history but could not be loaded (the .bad copy when moved aside)
 	dirty   bool
 	timer   *time.Timer
 }
@@ -92,7 +93,9 @@ func (h *usageHistory) load() {
 	if err != nil {
 		// Move the file aside so the first flush does not overwrite what could not be read.
 		bad := h.path + ".bad"
+		h.unread = bad
 		if rerr := os.Rename(h.path, bad); rerr != nil {
+			h.unread = h.path
 			h.logger.Error("usage file could not be moved aside, the next write will replace it", "error", rerr.Error())
 		} else {
 			h.logger.Warn("usage file not loaded, moved aside, starting empty", "error", err.Error(), "moved_to", bad)

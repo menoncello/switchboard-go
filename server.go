@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -51,6 +52,14 @@ func newApp(cfg Config) *App {
 	a.history = newUsageHistory(cfg.UsageFile, loc, a.logger)
 	a.loadState()
 	return a
+}
+
+// startupErr fails startup when a paid tier exists and the usage history could not be loaded: spend would restart at 0 and the cap would let it through again.
+func (a *App) startupErr() error {
+	if a.history.unread == "" || !slices.ContainsFunc(a.config.Tiers, func(t TierConfig) bool { return !t.Free }) {
+		return nil
+	}
+	return fmt.Errorf("usage_file could not be loaded (kept as %s): fix or remove it before starting, a paid tier would restart with spend 0", a.history.unread)
 }
 
 func (a *App) loadState() {

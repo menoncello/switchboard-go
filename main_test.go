@@ -1406,6 +1406,7 @@ func TestLoadConfigTiersRejected(t *testing.T) {
 		"models not map":   {strings.Replace(tierOK, "    models:\n      m1: {id: x/m1, context: 100, tools: true}\n", "    models: [a]\n", 1), "must be a map"},
 		"bad cooldown":     {tierOK + "    cooldown: soon\n", "parse tiers[0].cooldown"},
 		"neg cooldown":     {strings.Replace(tierOK, "    free: true\n", "    free: true\n    cooldown: -1s\n", 1), "cooldown must be >= 0"},
+		"reserved name":    {strings.Replace(tierOK, "name: a", "name: opencode-go", 1), "reserved for tier 0"},
 		"dup name trimmed": {tierOK + strings.Replace(tierOK, "name: a", "name: \"a \"", 1), "duplicate name"},
 	}
 	for name, c := range cases {

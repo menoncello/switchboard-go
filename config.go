@@ -555,8 +555,12 @@ func validatePaidTiers(cfg Config) error {
 		}
 		for _, m := range t.Models {
 			id := cmp.Or(m.ID, m.Name)
-			if _, ok := cfg.Prices[t.Name][id]; !ok {
+			p, ok := cfg.Prices[t.Name][id]
+			if !ok {
 				return fmt.Errorf("tier %q model %q: a tier without free: true needs a price in prices", t.Name, id)
+			}
+			if p.Input <= 0 && p.Output <= 0 {
+				return fmt.Errorf("tier %q model %q: a tier without free: true needs input or output price > 0 (the cap would never accrue)", t.Name, id)
 			}
 		}
 	}
@@ -604,6 +608,9 @@ func validateTiers(tiers []TierConfig) error {
 		name := strings.TrimSpace(t.Name)
 		if name == "" {
 			return fmt.Errorf("tiers[%d]: name is required", i)
+		}
+		if name == tier0Name {
+			return fmt.Errorf("tier %q: name is reserved for tier 0", t.Name)
 		}
 		if names[name] {
 			return fmt.Errorf("tier %q: duplicate name", t.Name)

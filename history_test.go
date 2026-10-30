@@ -540,6 +540,39 @@ func TestCostMixedLine(t *testing.T) {
 	}
 }
 
+func TestSpentIsPerTierAndToday(t *testing.T) {
+	h := &usageHistory{loc: time.UTC, now: time.Now, logger: slog.Default(), rows: map[usageKey]*usageCounts{}}
+	u, p := usageTokens{found: true, in: 1000, out: 500}, &ModelPrice{Input: 1, Output: 2}
+	h.record("", "m", "", "a", u, false, p, 0)
+	h.record("", "m", "", "a", u, false, p, 0)
+	h.record("", "m", "", "b", u, false, p, 0)
+	h.rows[usageKey{Day: h.now().UTC().AddDate(0, 0, -1).Format("2006-01-02"), Model: "m", Tier: "a"}] = &usageCounts{CostUSD: 100}
+	if a, b := h.spent("a"), h.spent("b"); math.Abs(a-0.004) > 1e-9 || math.Abs(b-0.002) > 1e-9 {
+		t.Fatalf("spent a=%v b=%v, want 0.004 and 0.002", a, b)
+	}
+}
+
+func TestUnreadUsageFileFailsStartupOnlyWithPaidTier(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "usage.json")
+	if err := os.WriteFile(path, []byte("{not json"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg := Config{ProxyAPIKey: "p", UpstreamAPIKeys: []string{"u"}, UsageFile: path, Tiers: []TierConfig{{Name: "gratis", Free: true}}}
+	if err := newApp(cfg).startupErr(); err != nil {
+		t.Fatalf("free tiers only: %v", err)
+	}
+	if err := os.WriteFile(path, []byte("{not json"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg.Tiers = append(cfg.Tiers, TierConfig{Name: "pago", DailyCap: 5})
+	if err := newApp(cfg).startupErr(); err == nil || !strings.Contains(err.Error(), path+".bad") {
+		t.Fatalf("paid tier: %v", err)
+	}
+	if err := newApp(cfg).startupErr(); err != nil { // file is gone (moved to .bad): missing file is fine
+		t.Fatalf("missing file: %v", err)
+	}
+}
+
 func TestCostSurvivesRestartAndPriceChange(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "usage.json")
 	app := pricedApp(t, `{"usage":{"prompt_tokens":1000,"completion_tokens":500}}`, path, gratisPrices)
@@ -691,24 +724,29 @@ func TestValidatePaidTier(t *testing.T) {
 		mod  func(*Config)
 		want string // "" accepts
 	}{
-		"valid":            {func(c *Config) {}, ""},
-		"no cap":           {func(c *Config) { c.Tiers[0].DailyCap = 0 }, "daily_cap"},
-		"negative cap":     {func(c *Config) { c.Tiers[0].DailyCap = -1 }, "daily_cap"},
-		"NaN cap":          {func(c *Config) { c.Tiers[0].DailyCap = math.NaN() }, "daily_cap"},
-		"Inf cap":          {func(c *Config) { c.Tiers[0].DailyCap = math.Inf(1) }, "daily_cap"},
-		"no usage_file":    {func(c *Config) { c.UsageFile = "" }, "usage_file"},
-		"model no price":   {func(c *Config) { c.Prices = nil }, `model "a-id"`},
-		"free with cap":    {func(c *Config) { c.Tiers[0].Free = true }, "only for paid"},
-		"free no cap":      {func(c *Config) { c.Tiers[0].Free, c.Tiers[0].DailyCap = true, 0 }, ""},
-		"id falls to name": {func(c *Config) { c.Tiers[0].Models[0].ID = ""; c.Prices["pago"] = map[string]ModelPrice{"a": {}} }, ""},
+		"valid":          {func(c *Config) {}, ""},
+		"no cap":         {func(c *Config) { c.Tiers[0].DailyCap = 0 }, "daily_cap"},
+		"negative cap":   {func(c *Config) { c.Tiers[0].DailyCap = -1 }, "daily_cap"},
+		"NaN cap":        {func(c *Config) { c.Tiers[0].DailyCap = math.NaN() }, "daily_cap"},
+		"Inf cap":        {func(c *Config) { c.Tiers[0].DailyCap = math.Inf(1) }, "daily_cap"},
+		"no usage_file":  {func(c *Config) { c.UsageFile = "" }, "usage_file"},
+		"model no price": {func(c *Config) { c.Prices = nil }, `model "a-id"`},
+		"free with cap":  {func(c *Config) { c.Tiers[0].Free = true }, "only for paid"},
+		"free no cap":    {func(c *Config) { c.Tiers[0].Free, c.Tiers[0].DailyCap = true, 0 }, ""},
+		"id falls to name": {func(c *Config) {
+			c.Tiers[0].Models[0].ID = ""
+			c.Prices["pago"] = map[string]ModelPrice{"a": {Output: 1}}
+		}, ""},
+		"zero price": {func(c *Config) { c.Prices["pago"]["a-id"] = ModelPrice{} }, `model "a-id"`},
+		"reserved name": {func(c *Config) {
+			c.Tiers[0].Name = tier0Name
+			c.Prices = map[string]map[string]ModelPrice{tier0Name: {"a-id": {Input: 1}}}
+		}, "reserved"},
 	} {
 		c := base()
 		tc.mod(&c)
 		err := validateConfig(c)
-		if (tc.want == "") != (err == nil) || (err != nil && !strings.Contains(err.Error(), tc.want) && !strings.Contains(err.Error(), `"pago"`)) {
-			t.Fatalf("%s: %v", name, err)
-		}
-		if err != nil && !strings.Contains(err.Error(), tc.want) {
+		if (tc.want == "") != (err == nil) || (err != nil && !strings.Contains(err.Error(), tc.want)) {
 			t.Fatalf("%s: err %v, want %q", name, err, tc.want)
 		}
 	}
@@ -795,6 +833,17 @@ func TestPaidTierStreamIncludeUsage(t *testing.T) {
 	}
 	if len(fb) != 2 || strings.Contains(fb[0], "include_usage") || !strings.Contains(fb[0], `"stream_options":{"x":1}`) || strings.Contains(fb[1], "stream_options") {
 		t.Fatalf("free bodies (must not inherit the paid edit): %v", fb)
+	}
+}
+
+func TestPaidTierStreamOptionsOddShapes(t *testing.T) {
+	for _, so := range []string{`null`, `"x"`, `{"include_usage":false,"x":1}`} {
+		paid := newCapUpstream(t, 200, "application/json", `{}`)
+		app := capApp(t, paid, nil, "")
+		rec := tierReq(app, http.MethodPost, "/v1/chat/completions", `{"model":"a","stream":true,"stream_options":`+so+`}`, nil)
+		if pb := paid.seen(); rec.Code != 200 || len(pb) != 1 || !strings.Contains(pb[0], `"include_usage":true`) {
+			t.Fatalf("stream_options %s: status %d, body %v", so, rec.Code, pb)
+		}
 	}
 }
 
