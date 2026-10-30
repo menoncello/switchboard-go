@@ -3,7 +3,7 @@ title: 'Tracer: rodada do agente com OpenRouter grava a proposta'
 type: 'chore'
 ticket: 'story-tracer-rodada-do-agente-com-openrouter-grava-a-proposta'
 created: '2026-10-30'
-status: 'built'
+status: 'done'
 baseline_revision: '1a429eda028d990d517325b7b2a22d4939b85553'
 route: 'full'
 route_source: 'auto'
@@ -110,3 +110,25 @@ deferred: []
 **Verification:** `go build ./... && go vet ./...` ok. O verify real (rodar o agente no Orca com config de exemplo) é do Eduardo (`hitl`) e não foi feito.
 
 **Residual risks:** o documento nunca foi executado por um agente; o formato da API do OpenRouter (`pricing` em USD por token, string) vem do conhecimento prévio, não de chamada real.
+
+## Code Review
+
+### 2026-10-30
+Code review complete. 2 decision-needed, 6 patch, 0 defer, 14 rejected.
+
+- [x] [Review][Decision] Pasta `catalog-proposals/` — o doc manda criar a pasta, mas só dá escrita na própria pasta (precisaria de escrita no pai). Options: (a) a pessoa cria a pasta antes e o agente nunca cria; (b) dar escrita no diretório pai. Resolved: (a). [docs/catalog-agent.md:29-31,138-139].
+- [x] [Review][Decision] Mesmo modelo em dois tiers OpenRouter — a comparação é por modelo e o item não traz o tier. Options: (a) um item por tier+modelo, com o nome do tier na linha; (b) um item por modelo. Resolved: (a). [docs/catalog-agent.md:50-62].
+- [x] [Review][Patch] Modelos sem preço: Preço e Modelos novos se contradizem; roteadores não mapeados (`-1`) inundam "Preço" toda rodada. Corrigir: sem preço e não mapeado vai em "Modelos novos" como `sem preço`; "Preço" só para mapeados [docs/catalog-agent.md:44-49,98-109]
+- [x] [Review][Patch] Valor antigo de Gratuidade: o ramo `sem preço na config` é morto (`config.go:560` exige preço em tier pago) e o valor antigo de "pago para gratuito" não está definido. Corrigir: valor antigo = entrada de `prices` (input / output); `US$ 0` só para tier gratuito sem entrada [docs/catalog-agent.md:54-58,104-106]
+- [x] [Review][Patch] Comparação de preço sem tolerância: `0.0000008 × 1e6 = 0.7999999999999999`, gera "Preço" falso toda rodada. Corrigir: arredondar a 4 casas em USD por 1M antes de comparar [docs/catalog-agent.md:44-46,59-60]
+- [x] [Review][Patch] Config ilegível/inválido ou diretório de propostas sem escrita não tem desfecho definido. Corrigir: não escrever nada, avisar no chat e encerrar [docs/catalog-agent.md:122-132]
+- [x] [Review][Patch] `pricing` com só um campo ausente/nulo/não numérico não é tratado. Corrigir: pular quando `prompt` ou `completion` faltar, for nulo, `-1` ou não numérico [docs/catalog-agent.md:46-49]
+- [x] [Review][Patch] Regra do host sem detalhe (caixa, porta, subdomínio). Corrigir: sem diferenciar caixa, ignorando porta, host exato `openrouter.ai`, sem subdomínios [docs/catalog-agent.md:40-41]
+
+#### Rejected
+- Modelos removidos/renomeados não detectados (low): recurso novo, fora do escopo do tracer.
+- Primeira rodada lista o catálogo inteiro (low): documentado; a API real tem 456 modelos; dedupe fica para story posterior.
+- Formato da API não verificado (false): chamada real confirmou `pricing.prompt/completion` como string em USD por token e `-1` nos roteadores.
+- Direção ausente em "Preço" (false): o parêntese da story define direção como gratuito↔pago, que o doc já põe em "Gratuidade".
+- Sem execução/amostra do agente (false): o verify é a rodada do Eduardo no Orca (`hitl`).
+- Sem timeout, rodadas concorrentes no mesmo minuto, fuso no nome do arquivo, `api_key` no fetch, números de linha do Code Map, critério "só 2 arquivos" vs plano, config intacta só por prosa (low): raros ou fora do doc, correção não compensa.
