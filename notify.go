@@ -21,7 +21,7 @@ func (n *SMTPNotifier) NotifyAllExhausted(st StatusResponse) {
 	go n.send("Switchboard Go exhausted all upstream keys", fmt.Sprintf("All keys exhausted\n\n%+v", st))
 }
 func (n *SMTPNotifier) NotifyPaidFirstUse(tier, model, day string) {
-	go n.send("Switchboard Go paid tier in use: "+tier, fmt.Sprintf("Paid tier %q served its first request of %s (model %s).", tier, day, model))
+	go n.send("Switchboard Go paid tier in use: "+tier, fmt.Sprintf("Paid tier %q served its first request of %s (model %q).", tier, day, model))
 }
 func (n *SMTPNotifier) send(subject, body string) {
 	if n.cfg.Host == "" || n.cfg.To == "" || n.cfg.From == "" {

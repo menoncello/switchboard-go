@@ -880,17 +880,19 @@ func TestLoadConfigPaidTier(t *testing.T) {
 	}
 }
 
+// realSendMail is the original sendMail, kept because alertApp replaces it on every call.
+var realSendMail = sendMail
+
 // alertApp has two paid tiers (p1 serves model a, p2 serves b) and a free one (f serves c); sendMail is replaced
-// by a fake that reports each message on the returned channel (or fails with sendErr).
-func alertApp(t *testing.T, usageFile string, sendErr error) (*App, chan string) {
+// by a fake that reports each message on the returned channel (or fails with sendErr). mod tweaks the Config.
+func alertApp(t *testing.T, usageFile string, sendErr error, mod ...func(*Config)) (*App, chan string) {
 	t.Helper()
 	msgs := make(chan string, 16)
-	old := sendMail
 	sendMail = func(addr string, auth smtp.Auth, from string, to []string, msg []byte, useTLS, useStartTLS bool) error {
 		msgs <- string(msg)
 		return sendErr
 	}
-	t.Cleanup(func() { sendMail = old })
+	t.Cleanup(func() { sendMail = realSendMail })
 	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		_, _ = w.Write([]byte(usageBody))
 	}))
@@ -905,9 +907,13 @@ func alertApp(t *testing.T, usageFile string, sendErr error) (*App, chan string)
 		return TierConfig{Name: name, BaseURL: up.URL, APIKey: "k" + name, Free: free, DailyCap: dailyCap, Styles: []APIStyle{APIStyleOpenAI}, Models: []TierModel{{Name: model, ID: model + "-id"}}}
 	}
 	prices := map[string]map[string]ModelPrice{"p1": {"a-id": {Input: 1, Output: 1}}, "p2": {"b-id": {Input: 1, Output: 1}}}
-	app := newApp(Config{ProxyAPIKey: "p", UpstreamAPIKeys: []string{"k"}, UpstreamBaseURL: down.URL, MaxRequestBodyBytes: 1 << 20, RetryExhaustedAfter: time.Hour,
+	cfg := Config{ProxyAPIKey: "p", UpstreamAPIKeys: []string{"k"}, UpstreamBaseURL: down.URL, MaxRequestBodyBytes: 1 << 20, RetryExhaustedAfter: time.Hour,
 		UsageFile: usageFile, Prices: prices, Tiers: []TierConfig{tier("p1", "a", false), tier("p2", "b", false), tier("f", "c", true)},
-		SMTP: SMTPConfig{Host: "h", Port: 25, From: "f@x", To: "t@x"}})
+		SMTP: SMTPConfig{Host: "h", Port: 25, From: "f@x", To: "t@x"}}
+	for _, m := range mod {
+		m(&cfg)
+	}
+	app := newApp(cfg)
 	app.history.now = func() time.Time { return capNow }
 	return app, msgs
 }
@@ -934,9 +940,11 @@ func wantAlerts(t *testing.T, msgs chan string, want ...string) {
 func TestPaidFirstUseAlert(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "usage.json")
 	app, msgs := alertApp(t, path, nil)
+	t.Cleanup(app.history.close)
+	day := capNow.Format("2006-01-02")
 	postModel(app, "a")
-	wantAlerts(t, msgs, `"p1"`)
-	if app.history.alerts["p1"] != capNow.Format("2006-01-02") {
+	wantAlerts(t, msgs, `"p1" served its first request of `+day+` (model "a")`)
+	if app.history.alerts["p1"] != day {
 		t.Fatalf("alerts: %v", app.history.alerts)
 	}
 	postModel(app, "a") // same tier, same day
@@ -945,7 +953,7 @@ func TestPaidFirstUseAlert(t *testing.T) {
 	tierReq(app, http.MethodGet, "/v1/models", "", nil)
 	wantAlerts(t, msgs)
 	postModel(app, "b") // another paid tier
-	wantAlerts(t, msgs, `"p2"`)
+	wantAlerts(t, msgs, `"p2" served its first request of `+day+` (model "b")`)
 	app.history.flush()
 
 	b, _ := os.ReadFile(path)
@@ -958,12 +966,45 @@ func TestPaidFirstUseAlert(t *testing.T) {
 	}
 
 	app2, msgs2 := alertApp(t, path, nil) // restart, same day
+	t.Cleanup(app2.history.close)
 	postModel(app2, "a")
 	wantAlerts(t, msgs2)
 	next := capNow.Add(24 * time.Hour)
 	app2.history.now = func() time.Time { return next }
 	postModel(app2, "a")
-	wantAlerts(t, msgs2, `"p1"`)
+	wantAlerts(t, msgs2, `"p1" served its first request of `+next.Format("2006-01-02")+` (model "a")`)
+}
+
+func TestPaidFirstUseAlertTimezone(t *testing.T) {
+	app, msgs := alertApp(t, "", nil, func(c *Config) { c.Timezone = "America/Sao_Paulo" })
+	at := capNow.Add(-9 * time.Hour) // 01:00 UTC, 22:00 the previous day in Sao Paulo
+	app.history.now = func() time.Time { return at }
+	postModel(app, "a")
+	prev := capNow.AddDate(0, 0, -1).Format("2006-01-02")
+	wantAlerts(t, msgs, `"p1" served its first request of `+prev+` (model "a")`)
+	if app.history.alerts["p1"] != prev {
+		t.Fatalf("alerts: %v", app.history.alerts)
+	}
+	at = capNow.Add(-6 * time.Hour) // 04:00 UTC, 01:00 local: a new day there
+	postModel(app, "a")
+	wantAlerts(t, msgs, `"p1" served its first request of `+capNow.Format("2006-01-02")+` (model "a")`)
+}
+
+func TestPaidFirstUseAlertHeldFailure(t *testing.T) {
+	down := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(503) }))
+	t.Cleanup(down.Close)
+	app, msgs := alertApp(t, "", nil, func(c *Config) {
+		for i := range c.Tiers {
+			c.Tiers[i].BaseURL = down.URL
+		}
+	})
+	if rec := tierReq(app, http.MethodPost, "/v1/chat/completions", `{"model":"a"}`, nil); rec.Code == 200 {
+		t.Fatalf("code %d", rec.Code)
+	}
+	wantAlerts(t, msgs)
+	if len(app.history.alerts) != 0 {
+		t.Fatalf("alerts: %v", app.history.alerts)
+	}
 }
 
 func TestPaidFirstUseAlertSMTPFailureNotRetried(t *testing.T) {

@@ -164,8 +164,11 @@ memory and startup (and `validate-config`) logs a warning.
 The first request a paid tier (`free` not set) serves each day sends one SMTP
 email (the `smtp` config) naming the tier and the model. The day it was sent is
 saved per tier under `alerts` in `usage_file` (`{"rows":[...],"alerts":{"tier":"2026-10-29"}}`),
-so a restart does not repeat it. The day is marked before sending, so a failed
-send is only logged and is not retried that day. Free tiers never send it.
+so a restart does not repeat it, as long as `usage_file` is set (without it the
+mark lives only in memory). The file is written up to 3 s after the request, so a
+crash before that write can repeat the email on restart. The day is marked before
+sending, so a failed send is only logged and is not retried that day. Free tiers
+never send it.
 
 `GET /status` shows this history in a "Uso" section below the tiers: today's
 total (requests, tokens and cost, with the `timezone` zone) and, inside a `<details>`,
