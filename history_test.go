@@ -290,6 +290,21 @@ func TestShutdownFlushesHistory(t *testing.T) {
 
 func statusBody(app *App) string { return getStatusPage(app).Body.String() }
 
+// section returns the body between the "<h3>title</h3>" heading and the next <h3>.
+func section(t *testing.T, body, title string) string {
+	t.Helper()
+	h := "<h3>" + title + "</h3>"
+	i := strings.Index(body, h)
+	if i < 0 {
+		t.Fatalf("heading %q not found in %s", h, body)
+	}
+	s := body[i+len(h):]
+	if j := strings.Index(s, "<h3>"); j >= 0 {
+		s = s[:j]
+	}
+	return s
+}
+
 func TestStatusUsageSection(t *testing.T) {
 	at := time.Date(2026, 10, 29, 12, 0, 0, 0, time.UTC)
 	app := historyAppWith(t, 200, usageBody, func(c *Config) {
@@ -316,9 +331,21 @@ func TestStatusUsageSection(t *testing.T) {
 	if strings.Index(body, "<h2>Uso</h2>") < strings.Index(body, "<h2>Tiers</h2>") || !strings.Contains(body, "<h2>Tiers</h2>") {
 		t.Fatalf("usage not below tiers: %s", body)
 	}
-	for _, want := range []string{"Hoje (2026-10-29, America/Sao_Paulo): 3 requests, 30 tokens in, 9 tokens out, 0 tokens cache.", "<td>a</td><td>1</td>", "<td>b</td><td>1</td>", "<td>sem projeto</td><td>1</td>", "<td>ontem</td>", "<td>2026-10-28</td><td>1</td>"} {
-		if !strings.Contains(body, want) {
-			t.Fatalf("missing %q in %s", want, body)
+	if want := "Hoje (2026-10-29, America/Sao_Paulo): 3 requests, 30 tokens in, 9 tokens out, 0 tokens cache."; !strings.Contains(body, want) {
+		t.Fatalf("missing %q in %s", want, body)
+	}
+	for title, cells := range map[string][]string{
+		"Dia":     {"<td>2026-10-29</td><td>3</td>", "<td>2026-10-28</td><td>1</td>"},
+		"Projeto": {"<td>a</td><td>1</td>", "<td>b</td><td>1</td>", "<td>sem projeto</td><td>1</td>", "<td>ontem</td>"},
+		"Modelo":  {"<td>m</td><td>4</td>"},
+		"Chave":   {"<td>main</td><td>4</td>"},
+		"Tier":    {"<td>" + tier0Name + "</td><td>4</td>"},
+	} {
+		s := section(t, body, title)
+		for _, want := range cells {
+			if !strings.Contains(s, want) {
+				t.Fatalf("%s: missing %q in %s", title, want, s)
+			}
 		}
 	}
 	if strings.Contains(body, "velho") || strings.Contains(body, "2026-10-21") {
@@ -328,6 +355,15 @@ func TestStatusUsageSection(t *testing.T) {
 		if strings.Contains(body, secret) {
 			t.Fatalf("leaked %q", secret)
 		}
+	}
+}
+
+func TestStatusUsageDayBoundaryTimezone(t *testing.T) {
+	app := historyAppWith(t, 200, usageBody, func(c *Config) { c.Timezone = "America/Sao_Paulo" })
+	app.history.now = func() time.Time { return time.Date(2026, 10, 30, 1, 0, 0, 0, time.UTC) } // still 10-29 in Sao Paulo
+	post(app, "")
+	if body := statusBody(app); !strings.Contains(body, "Hoje (2026-10-29, America/Sao_Paulo): 1 requests") {
+		t.Fatalf("day boundary: %s", body)
 	}
 }
 
@@ -363,17 +399,9 @@ func TestStatusUsageWindowAndOrder(t *testing.T) {
 			t.Fatalf("today-7 row shown (%q): %s", gone, body)
 		}
 	}
-	section := func(title string) string {
-		s := body[strings.Index(body, "<h3>"+title+"</h3>"):]
-		s = s[len("<h3>"+title+"</h3>"):]
-		if i := strings.Index(s, "<h3>"); i >= 0 {
-			s = s[:i]
-		}
-		return s
-	}
 	inOrder := func(title string, cells ...string) {
 		t.Helper()
-		s, last := section(title), -1
+		s, last := section(t, body, title), -1
 		for _, c := range cells {
 			i := strings.Index(s, "<td>"+c+"</td>")
 			if i <= last {
