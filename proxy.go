@@ -134,7 +134,11 @@ func (a *App) proxyV1(w http.ResponseWriter, r *http.Request, style APIStyle) {
 				key = "key-" + strconv.Itoa(keyIdx)
 			}
 		}
-		a.history.record(requestProject(r.Header), model, key, tier, usage, usageMissing)
+		var price *ModelPrice
+		if p, ok := a.config.price(tier, model); ok {
+			price = &p
+		}
+		a.history.record(requestProject(r.Header), model, key, tier, usage, usageMissing, price)
 	}
 	a.logger.Info("request", attrs...)
 }

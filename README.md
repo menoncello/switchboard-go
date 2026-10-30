@@ -153,7 +153,7 @@ Open routes, no authentication:
 - `GET /readyz`
 - `GET /status`: HTML page with the state, cooldown and usage of each key and, with `tiers:` configured, the state and
   cooldown of each tier. Once the usage history has requests it adds a "Uso" section: today's total and the last 7
-  days per day, project, model, key and tier (tokens and requests only, days in the `timezone` zone). It never shows
+  days per day, project, model, key and tier (tokens, requests and cost where `prices` has a price, days in the `timezone` zone). It never shows
   key values. If the proxy has a public URL, restrict the port at the network level.
 
 See [docs/admin-api.md](docs/admin-api.md).

@@ -92,6 +92,11 @@ state_file: "/var/lib/switchboard-go/state.json"
 usage_file: "/var/lib/switchboard-go/usage.json"
 timezone: "America/Sao_Paulo"
 
+# USD per 1M tokens, by tier name and mapped model id (see "Usage history").
+prices:
+  nome-do-tier:
+    id-do-modelo: {input: 0.5, output: 1.5}
+
 tiers:
   - name: "free-provider"
     base_url: "https://api.example.com/v1"
@@ -130,10 +135,10 @@ tiers). Only POST requests a tier served are counted: responses nobody served
 (429, 502, 499, 413, 400), an upstream failure held and returned after every tier
 failed, `GET /v1/models` and requests without a `model` are not.
 A row counts `requests`, `tokens_in`, `tokens_out`, `tokens_cache_in` and
-`no_usage` (2xx POST responses without a `usage` field). The file is JSON:
+`no_usage` (2xx POST responses without a `usage` field), plus `cost_usd` and `priced` (see `prices` below). The file is JSON:
 
 ```json
-{"rows":[{"day":"2026-10-29","project":"sem projeto","model":"glm-5.1","key":"main","tier":"opencode-go","requests":2,"tokens_in":120,"tokens_out":30,"tokens_cache_in":0,"no_usage":0}]}
+{"rows":[{"day":"2026-10-29","project":"sem projeto","model":"glm-5.1","key":"main","tier":"opencode-go","requests":2,"tokens_in":120,"tokens_out":30,"tokens_cache_in":0,"no_usage":0,"cost_usd":0,"priced":0}]}
 ```
 
 The day is computed in `timezone` (an IANA name such as `America/Sao_Paulo`;
@@ -150,10 +155,25 @@ destroy it) and the history starts empty. Without `usage_file` the history stays
 memory and startup (and `validate-config`) logs a warning.
 
 `GET /status` shows this history in a "Uso" section below the tiers: today's
-total (requests and tokens, with the `timezone` zone) and, inside a `<details>`,
+total (requests, tokens and cost, with the `timezone` zone) and, inside a `<details>`,
 one table per day, project, model, key and tier for the last 7 days (today plus
-the 6 before). Only tokens and requests: no price. The section is left out while
+the 6 before), each with a "Custo" column. The section is left out while
 the window has no request.
+
+### Prices and cost
+
+`prices` (top-level, YAML only) gives USD per 1M tokens: `prices.<tier>.<mapped model id>`
+with `input` and `output`. The key is the tier `name` and the model `id` the tier maps
+the client's model to (the model name when `id` is empty); a tier that is not in
+`tiers` (tier 0 included, it has no price) or a negative value is rejected at startup.
+A request costs `(tokens_in * input + tokens_out * output) / 1e6`. Cache tokens have
+no price of their own: they count in `tokens_in` as the response reports them. The cost is
+written to the row when the request is served, so changing `prices` later does not
+rewrite the past. A response without `usage` costs 0 and still counts as priced.
+`priced` counts the requests that had a price. In the report a model without price shows
+`—`; a line mixing priced and unpriced requests shows `US$ x (n/m com preço)`. Prices are
+optional per model. Rows from files written before this feature load with no cost and
+no price.
 
 ## Tiers
 

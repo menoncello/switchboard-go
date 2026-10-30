@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"log"
 	"log/slog"
+	"math"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -331,7 +332,7 @@ func TestStatusUsageSection(t *testing.T) {
 	if strings.Index(body, "<h2>Uso</h2>") < strings.Index(body, "<h2>Tiers</h2>") || !strings.Contains(body, "<h2>Tiers</h2>") {
 		t.Fatalf("usage not below tiers: %s", body)
 	}
-	if want := "Hoje (2026-10-29, America/Sao_Paulo): 3 requests, 30 tokens in, 9 tokens out, 0 tokens cache."; !strings.Contains(body, want) {
+	if want := "Hoje (2026-10-29, America/Sao_Paulo): 3 requests, 30 tokens in, 9 tokens out, 0 tokens cache, custo —."; !strings.Contains(body, want) {
 		t.Fatalf("missing %q in %s", want, body)
 	}
 	for title, cells := range map[string][]string{
@@ -391,7 +392,7 @@ func TestStatusUsageWindowAndOrder(t *testing.T) {
 	add("2026-10-29", "alfa", "m2", "k1", 1, 10, 1, 7)
 	add("2026-10-29", "beta", "m2", "", 3, 30, 3, 0)
 	body := statusBody(app)
-	if !strings.Contains(body, "Hoje (2026-10-29, UTC): 5 requests, 50 tokens in, 5 tokens out, 12 tokens cache.") {
+	if !strings.Contains(body, "Hoje (2026-10-29, UTC): 5 requests, 50 tokens in, 5 tokens out, 12 tokens cache, custo —.") {
 		t.Fatalf("day total: %s", body)
 	}
 	for _, gone := range []string{"p7", "m7", "k7", "2026-10-22"} {
@@ -415,4 +416,155 @@ func TestStatusUsageWindowAndOrder(t *testing.T) {
 	inOrder("Modelo", "m2", "m1")
 	inOrder("Chave", "—", "k1") // empty key shows as a dash
 	inOrder("Tier", "t")
+}
+
+// pricedApp has tier 0 failing over to tier "gratis", which maps client model "a" to "a-id".
+func pricedApp(t *testing.T, tierBody string, usageFile string, prices map[string]map[string]ModelPrice) *App {
+	t.Helper()
+	srv := func(status int, body string) *httptest.Server {
+		s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(status)
+			_, _ = w.Write([]byte(body))
+		}))
+		t.Cleanup(s.Close)
+		return s
+	}
+	t1 := srv(200, tierBody)
+	up := srv(503, `{}`)
+	cfg := Config{ProxyAPIKey: "p", UpstreamAPIKeys: []string{"k"}, UpstreamBaseURL: up.URL, MaxRequestBodyBytes: 1 << 20, RetryExhaustedAfter: time.Hour,
+		UsageFile: usageFile, Prices: prices,
+		Tiers: []TierConfig{{Name: "gratis", BaseURL: t1.URL, APIKey: "kt", Free: true, Styles: []APIStyle{APIStyleOpenAI}, Models: []TierModel{{Name: "a", ID: "a-id"}}}}}
+	return newApp(cfg)
+}
+
+var gratisPrices = map[string]map[string]ModelPrice{"gratis": {"a-id": {Input: 1, Output: 2}}}
+
+func postModel(app *App, model string) {
+	tierReq(app, http.MethodPost, "/v1/chat/completions", `{"model":"`+model+`"}`, nil)
+}
+
+func TestCostPricedModel(t *testing.T) {
+	app := pricedApp(t, `{"usage":{"prompt_tokens":1000,"completion_tokens":500}}`, "", gratisPrices)
+	postModel(app, "a")
+	r := app.history.snapshot()
+	if len(r) != 1 || r[0].Tier != "gratis" || r[0].Priced != 1 || r[0].CostUSD < 0.0019999 || r[0].CostUSD > 0.0020001 {
+		t.Fatalf("rows: %+v", r)
+	}
+	body := statusBody(app)
+	if !strings.Contains(body, "custo US$ 0.0020.") || !strings.Contains(section(t, body, "Tier"), "<td>US$ 0.0020</td>") {
+		t.Fatalf("status: %s", body)
+	}
+}
+
+func TestCostNoPriceAndTier0(t *testing.T) {
+	app := pricedApp(t, `{"usage":{"prompt_tokens":1000,"completion_tokens":500}}`, "", map[string]map[string]ModelPrice{"gratis": {"outro": {Input: 1, Output: 2}}})
+	postModel(app, "a") // tier gratis, no price for a-id
+	if r := app.history.snapshot(); len(r) != 1 || r[0].Priced != 0 || r[0].CostUSD != 0 || r[0].TokensIn != 1000 {
+		t.Fatalf("rows: %+v", r)
+	}
+	if s := section(t, statusBody(app), "Tier"); !strings.Contains(s, "<td>—</td></tr>") {
+		t.Fatalf("tier section: %s", s)
+	}
+	t0 := historyApp(t, 200, usageBody, "")
+	post(t0, "")
+	if r := t0.history.snapshot(); len(r) != 1 || r[0].Priced != 0 {
+		t.Fatalf("tier 0: %+v", r)
+	}
+	if s := section(t, statusBody(t0), "Tier"); !strings.Contains(s, "<td>—</td></tr>") {
+		t.Fatalf("tier 0 section: %s", s)
+	}
+}
+
+func TestCostNoUsagePriced(t *testing.T) {
+	app := pricedApp(t, `{}`, "", gratisPrices)
+	postModel(app, "a")
+	if r := app.history.snapshot(); len(r) != 1 || r[0].Priced != 1 || r[0].CostUSD != 0 || r[0].NoUsage != 1 {
+		t.Fatalf("rows: %+v", r)
+	}
+}
+
+func TestCostMixedLine(t *testing.T) {
+	h := &usageHistory{loc: time.UTC, now: time.Now, logger: slog.Default(), rows: map[usageKey]*usageCounts{}}
+	u := usageTokens{found: true, in: 1000, out: 500}
+	h.record("", "m", "", "t", u, false, &ModelPrice{Input: 1, Output: 2})
+	h.record("", "m", "", "t", u, false, nil)
+	if got := (usageLine{Requests: 2, Priced: 1, CostUSD: 0.002}).Cost(); got != "US$ 0.0020 (1/2 com preço)" {
+		t.Fatal(got)
+	}
+	if r := h.snapshot(); len(r) != 1 || r[0].Requests != 2 || r[0].Priced != 1 {
+		t.Fatalf("rows: %+v", r)
+	}
+}
+
+func TestCostSurvivesRestartAndPriceChange(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "usage.json")
+	app := pricedApp(t, `{"usage":{"prompt_tokens":1000,"completion_tokens":500}}`, path, gratisPrices)
+	postModel(app, "a")
+	app.history.flush()
+	app2 := pricedApp(t, `{}`, path, map[string]map[string]ModelPrice{"gratis": {"a-id": {Input: 100, Output: 100}}})
+	if r := app2.history.snapshot(); len(r) != 1 || r[0].Priced != 1 || r[0].CostUSD < 0.0019999 || r[0].CostUSD > 0.0020001 {
+		t.Fatalf("rows: %+v", r)
+	}
+	if !strings.Contains(statusBody(app2), "custo US$ 0.0020.") {
+		t.Fatal("cost missing from report after restart")
+	}
+}
+
+func TestUsageFileWithoutCostFields(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "usage.json")
+	day := time.Now().UTC().Format("2006-01-02")
+	data := `{"rows":[{"day":"` + day + `","project":"p","model":"m","key":"k","tier":"t","requests":2,"tokens_in":5}]}`
+	if err := os.WriteFile(path, []byte(data), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	app := historyApp(t, 200, usageBody, path)
+	if r := app.history.snapshot(); len(r) != 1 || r[0].Requests != 2 || r[0].CostUSD != 0 || r[0].Priced != 0 {
+		t.Fatalf("rows: %+v", r)
+	}
+	if !strings.Contains(statusBody(app), "custo —.") {
+		t.Fatal("expected custo —")
+	}
+}
+
+func TestValidateConfigPrices(t *testing.T) {
+	cfg := Config{ProxyAPIKey: "p", UpstreamAPIKeys: []string{"u"}, UpstreamBaseURL: "http://x", MaxRequestBodyBytes: 1,
+		Tiers: []TierConfig{{Name: "gratis", BaseURL: "http://t", APIKey: "k", Free: true, Models: []TierModel{{Name: "a"}}}}}
+	for name, tc := range map[string]struct {
+		prices map[string]map[string]ModelPrice
+		ok     bool
+	}{
+		"ok":         {map[string]map[string]ModelPrice{"gratis": {"a": {Input: 1, Output: 2}}}, true},
+		"zero":       {map[string]map[string]ModelPrice{"gratis": {"a": {}}}, true},
+		"neg input":  {map[string]map[string]ModelPrice{"gratis": {"a": {Input: -1}}}, false},
+		"neg output": {map[string]map[string]ModelPrice{"gratis": {"a": {Output: -1}}}, false},
+		"unknown":    {map[string]map[string]ModelPrice{"nope": {"a": {}}}, false},
+		"inf":        {map[string]map[string]ModelPrice{"gratis": {"a": {Input: math.Inf(1)}}}, false},
+		"tier 0":     {map[string]map[string]ModelPrice{tier0Name: {"a": {}}}, false},
+	} {
+		cfg.Prices = tc.prices
+		if err := validateConfig(cfg); (err == nil) != tc.ok {
+			t.Fatalf("%s: %v", name, err)
+		}
+	}
+}
+
+func TestMergeConfigPrices(t *testing.T) {
+	p := map[string]map[string]ModelPrice{"t": {"a": {Input: 1}}}
+	dst := Config{Prices: p}
+	mergeConfig(&dst, Config{MinContext: -1, UpstreamResponseHeaderTimeout: -1, RetryExhaustedAfter: -1})
+	if dst.Prices["t"]["a"].Input != 1 {
+		t.Fatalf("prices lost: %v", dst.Prices)
+	}
+	mergeConfig(&dst, Config{Prices: map[string]map[string]ModelPrice{"u": {"b": {Output: 2}}}, MinContext: -1, UpstreamResponseHeaderTimeout: -1, RetryExhaustedAfter: -1})
+	if len(dst.Prices) != 1 || dst.Prices["u"]["b"].Output != 2 {
+		t.Fatalf("prices not taken: %v", dst.Prices)
+	}
+}
+
+func TestLoadConfigPrices(t *testing.T) {
+	tiersYAML(t, "prices:\n  a:\n    m-id: {input: 1.5, output: 2}\ntiers:\n"+tierOK)
+	cfg, err := loadConfig()
+	if err != nil || cfg.Prices["a"]["m-id"] != (ModelPrice{1.5, 2}) {
+		t.Fatalf("prices=%v err=%v", cfg.Prices, err)
+	}
 }

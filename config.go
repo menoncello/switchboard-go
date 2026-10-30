@@ -1,9 +1,11 @@
 package main
 
 import (
+	"cmp"
 	"errors"
 	"fmt"
 	"log"
+	"math"
 	"os"
 	"path/filepath"
 	"slices"
@@ -58,9 +60,35 @@ type Config struct {
 	UsageFile string
 	Timezone  string
 
+	// Prices is USD per 1M tokens by tier name and mapped model ID. YAML only.
+	Prices map[string]map[string]ModelPrice
+
 	// Tiers are extra free upstreams for failover; the upstream above is the
 	// implicit tier 0 and is not listed here.
 	Tiers []TierConfig
+}
+
+// ModelPrice is USD per 1M input and output tokens.
+type ModelPrice struct {
+	Input  float64 `yaml:"input"`
+	Output float64 `yaml:"output"`
+}
+
+// price returns the price of model (the client's name) in tier, looked up by the mapped ID.
+func (c Config) price(tier, model string) (ModelPrice, bool) {
+	for _, t := range c.Tiers {
+		if t.Name != tier {
+			continue
+		}
+		for _, m := range t.Models {
+			if m.Name == model {
+				id := cmp.Or(m.ID, m.Name)
+				p, ok := c.Prices[tier][id]
+				return p, ok
+			}
+		}
+	}
+	return ModelPrice{}, false
 }
 
 type TierConfig struct {
@@ -160,11 +188,12 @@ type yamlConfig struct {
 	Limits struct {
 		MaxRequestBodyBytes int64 `yaml:"max_request_body_bytes"`
 	} `yaml:"limits"`
-	MinContext *int       `yaml:"min_context"`
-	StateFile  string     `yaml:"state_file"`
-	UsageFile  string     `yaml:"usage_file"`
-	Timezone   string     `yaml:"timezone"`
-	Tiers      []yamlTier `yaml:"tiers"`
+	MinContext *int                             `yaml:"min_context"`
+	StateFile  string                           `yaml:"state_file"`
+	UsageFile  string                           `yaml:"usage_file"`
+	Timezone   string                           `yaml:"timezone"`
+	Prices     map[string]map[string]ModelPrice `yaml:"prices"`
+	Tiers      []yamlTier                       `yaml:"tiers"`
 }
 
 type yamlTier struct {
@@ -273,7 +302,7 @@ func loadYAMLConfig(path string) (Config, error) {
 	if err != nil {
 		return Config{}, err
 	}
-	return Config{Tiers: tiers, MinContext: minContext, StateFile: strings.TrimSpace(yc.StateFile), UsageFile: strings.TrimSpace(yc.UsageFile), Timezone: strings.TrimSpace(yc.Timezone), ListenAddr: yc.Server.ListenAddr, UpstreamBaseURL: yc.Upstream.BaseURL, ProxyAPIKey: yc.Server.ProxyAPIKey, UpstreamAPIKeys: yc.Upstream.APIKeys, MaxRequestBodyBytes: yc.Limits.MaxRequestBodyBytes, RetryExhaustedAfter: retry, UpstreamResponseHeaderTimeout: headerTimeout, SMTP: SMTPConfig{Host: yc.SMTP.Host, Port: yc.SMTP.Port, Username: yc.SMTP.Username, Password: yc.SMTP.Password, From: yc.SMTP.From, To: yc.SMTP.To, TLS: yc.SMTP.TLS, StartTLS: yc.SMTP.StartTLS}, Telegram: TelegramConfig{BotToken: yc.Telegram.BotToken, ChatID: yc.Telegram.ChatID}}, nil
+	return Config{Tiers: tiers, MinContext: minContext, StateFile: strings.TrimSpace(yc.StateFile), UsageFile: strings.TrimSpace(yc.UsageFile), Timezone: strings.TrimSpace(yc.Timezone), Prices: yc.Prices, ListenAddr: yc.Server.ListenAddr, UpstreamBaseURL: yc.Upstream.BaseURL, ProxyAPIKey: yc.Server.ProxyAPIKey, UpstreamAPIKeys: yc.Upstream.APIKeys, MaxRequestBodyBytes: yc.Limits.MaxRequestBodyBytes, RetryExhaustedAfter: retry, UpstreamResponseHeaderTimeout: headerTimeout, SMTP: SMTPConfig{Host: yc.SMTP.Host, Port: yc.SMTP.Port, Username: yc.SMTP.Username, Password: yc.SMTP.Password, From: yc.SMTP.From, To: yc.SMTP.To, TLS: yc.SMTP.TLS, StartTLS: yc.SMTP.StartTLS}, Telegram: TelegramConfig{BotToken: yc.Telegram.BotToken, ChatID: yc.Telegram.ChatID}}, nil
 }
 
 func mergeConfig(dst *Config, src Config) {
@@ -303,6 +332,9 @@ func mergeConfig(dst *Config, src Config) {
 	}
 	if src.Timezone != "" {
 		dst.Timezone = src.Timezone
+	}
+	if len(src.Prices) > 0 {
+		dst.Prices = src.Prices
 	}
 	if src.MinContext >= 0 {
 		dst.MinContext = src.MinContext
@@ -467,7 +499,24 @@ func validateConfig(cfg Config) error {
 			return fmt.Errorf("timezone %q: %w", cfg.Timezone, err)
 		}
 	}
-	return validateTiers(cfg.Tiers)
+	if err := validateTiers(cfg.Tiers); err != nil {
+		return err
+	}
+	return validatePrices(cfg)
+}
+
+func validatePrices(cfg Config) error {
+	for tier, models := range cfg.Prices {
+		if !slices.ContainsFunc(cfg.Tiers, func(t TierConfig) bool { return t.Name == tier }) {
+			return fmt.Errorf("prices: tier %q is not in tiers (tier 0 has no price)", tier)
+		}
+		for id, p := range models {
+			if !(p.Input >= 0 && p.Output >= 0) || math.IsInf(p.Input, 0) || math.IsInf(p.Output, 0) { // also rejects NaN
+				return fmt.Errorf("prices: tier %q model %q: input and output must be finite and >= 0", tier, id)
+			}
+		}
+	}
+	return nil
 }
 
 func validateTiers(tiers []TierConfig) error {

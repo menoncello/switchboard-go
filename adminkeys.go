@@ -236,11 +236,11 @@ var statusTmpl = template.Must(template.New("status").Funcs(template.FuncMap{
 {{range .Tiers}}<tr><td>{{.Name}}</td><td>{{.State}}</td><td>{{if .RemainingSeconds}}{{.RemainingSeconds}}s{{else}}—{{end}}</td></tr>
 {{end}}</table>{{end}}{{with .Usage}}
 <h2>Uso</h2>
-<p>Hoje ({{.Today}}, {{.Timezone}}): {{.Total.Requests}} requests, {{.Total.TokensIn}} tokens in, {{.Total.TokensOut}} tokens out, {{.Total.TokensCacheIn}} tokens cache.</p>
+<p>Hoje ({{.Today}}, {{.Timezone}}): {{.Total.Requests}} requests, {{.Total.TokensIn}} tokens in, {{.Total.TokensOut}} tokens out, {{.Total.TokensCacheIn}} tokens cache, custo {{.Total.Cost}}.</p>
 <details><summary>Últimos 7 dias</summary>
 {{range .Dims}}<h3>{{.Title}}</h3>
-<table><tr><th>{{.Title}}</th><th>Requests</th><th>Tokens in</th><th>Tokens out</th><th>Tokens cache</th><th>Sem usage</th></tr>
-{{range .Rows}}<tr><td>{{.Label}}</td><td>{{.Requests}}</td><td>{{.TokensIn}}</td><td>{{.TokensOut}}</td><td>{{.TokensCacheIn}}</td><td>{{.NoUsage}}</td></tr>
+<table><tr><th>{{.Title}}</th><th>Requests</th><th>Tokens in</th><th>Tokens out</th><th>Tokens cache</th><th>Sem usage</th><th>Custo</th></tr>
+{{range .Rows}}<tr><td>{{.Label}}</td><td>{{.Requests}}</td><td>{{.TokensIn}}</td><td>{{.TokensOut}}</td><td>{{.TokensCacheIn}}</td><td>{{.NoUsage}}</td><td>{{.Cost}}</td></tr>
 {{end}}</table>
 {{end}}</details>{{end}}</body></html>
 `))
@@ -261,6 +261,20 @@ type statusPage struct {
 type usageLine struct {
 	Label                                                 string
 	Requests, TokensIn, TokensOut, TokensCacheIn, NoUsage int
+	CostUSD                                               float64
+	Priced                                                int
+}
+
+// Cost is "—" without priced requests, the amount when all are priced, else the
+// amount and how many were.
+func (l usageLine) Cost() string {
+	switch {
+	case l.Priced == 0:
+		return "—"
+	case l.Priced == l.Requests:
+		return fmt.Sprintf("US$ %.4f", l.CostUSD)
+	}
+	return fmt.Sprintf("US$ %.4f (%d/%d com preço)", l.CostUSD, l.Priced, l.Requests)
 }
 
 type usageDim struct {
@@ -315,6 +329,8 @@ func (a *App) usageReport() *usageReport {
 			l.TokensOut += r.TokensOut
 			l.TokensCacheIn += r.TokensCacheIn
 			l.NoUsage += r.NoUsage
+			l.CostUSD += r.CostUSD
+			l.Priced += r.Priced
 		}
 		lines := make([]usageLine, 0, len(sums))
 		for _, l := range sums {

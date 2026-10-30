@@ -30,6 +30,9 @@ type usageCounts struct {
 	TokensOut     int `json:"tokens_out"`
 	TokensCacheIn int `json:"tokens_cache_in"`
 	NoUsage       int `json:"no_usage"`
+	// CostUSD is fixed at request time; Priced counts requests that had a price.
+	CostUSD float64 `json:"cost_usd"`
+	Priced  int     `json:"priced"`
 }
 
 // usageRow is one line of the usage file: a dimension and its totals.
@@ -111,10 +114,12 @@ func (h *usageHistory) load() {
 		c.TokensOut += r.TokensOut
 		c.TokensCacheIn += r.TokensCacheIn
 		c.NoUsage += r.NoUsage
+		c.CostUSD += r.CostUSD
+		c.Priced += r.Priced
 	}
 }
 
-func (h *usageHistory) record(project, model, key, tier string, u usageTokens, noUsage bool) {
+func (h *usageHistory) record(project, model, key, tier string, u usageTokens, noUsage bool, price *ModelPrice) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	k := usageKey{h.now().In(h.loc).Format("2006-01-02"), project, model, key, tier}
@@ -128,6 +133,12 @@ func (h *usageHistory) record(project, model, key, tier string, u usageTokens, n
 		c.TokensIn += u.in
 		c.TokensOut += u.out
 		c.TokensCacheIn += u.cache
+		if price != nil {
+			c.CostUSD += (float64(u.in)*price.Input + float64(u.out)*price.Output) / 1e6
+		}
+	}
+	if price != nil {
+		c.Priced++
 	}
 	if noUsage {
 		c.NoUsage++
