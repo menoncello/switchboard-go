@@ -3,7 +3,7 @@ title: 'Provedores da config fora do OpenRouter, pela documentação'
 type: 'feature'
 ticket: 3
 created: '2026-10-30'
-status: 'built'
+status: done
 baseline_revision: '5ab36bf2a7845a6da54cbecac3aebe051f2c998c'
 route: 'full'
 route_source: 'auto'
@@ -112,3 +112,18 @@ Limite não tem campo na config, então não há "limite novo" por comparação:
 **Verification:** `go test ./... && go vet ./...` ok; `git diff` fora de `_bmad-output` só em `docs/catalog-agent.md`. O verify real (páginas reais e uma página trocada por ilegível) é do Eduardo (`hitl`) e não foi feito.
 
 **Residual risks:** o documento nunca foi executado por um agente; a linha de exemplo `exemplo-zai` da tabela precisa ser trocada pelos tiers reais, senão todo tier fora do OpenRouter sai `sem página na tabela`.
+
+## Code Review
+
+### 2026-10-30
+Code review complete. 0 `decision-needed`, 4 `patch`, 1 `defer`, 17 rejected.
+
+- [x] [Review][Patch] Sem regra para casar nome de modelo da página com id da config; modelo já mapeado sai como novo [docs/catalog-agent.md:103-105]
+- [x] [Review][Patch] Redirecionamento para outro host não conta como página ilegível; itens citam a URL da tabela com conteúdo de outra página [docs/catalog-agent.md:100]
+- [x] [Review][Patch] Passos do Orca colam o documento antes de preencher a tabela; editar depois não chega ao agente [docs/catalog-agent.md:254-257]
+- [x] [Review][Patch] Uma URL por tier: linha duplicada ou várias URLs na mesma linha sem regra [docs/catalog-agent.md:36-47]
+- [x] [Review][Defer] Verify de ponta a ponta (tier real e página ilegível) nunca foi observado; a tabela só tem a linha de exemplo — deferred: hitl, é do Eduardo rodar uma vez com um tier real
+
+#### Rejected
+- `false`: passos 5/6/7 citados de forma consistente (linhas 67 e 235); `ticket: 3` é o id interno, a ref é 4.3.
+- `low`: `base_url` vazio/tier 0 (erro de config, tier 0 fora de `tiers`), linha `exemplo-zai` (nome diferente dos reais e há instrução de ignorar), limites repetidos a cada rodada (dedup é da 4.4), URL vazia/timeout/página truncada (cobertos por "não abre"/"vazia"), vários preços por modelo e gratuidade de trial (cobertos por "não verificado" e pelo passo 4), modelo descontinuado, escopo do limite, placeholder `<model id or tier>`, URL com `)`.

@@ -16,3 +16,6 @@
 
 ## Deferred from: code review of story-teto-diario-em-dinheiro-para-tiers-pagos-plan (2026-10-30)
 - `include_usage` é injetado em todo request OpenAI com `stream: true` num tier pago, inclusive caminhos como `/v1/responses` (`withIncludeUsage` em proxy.go). Severidade média, não verificada. Resolve ao ver se o upstream aceita `stream_options.include_usage` nesse caminho; se rejeitar, limitar a `/chat/completions`.
+
+## Deferred from: code review of story-provedores-da-config-fora-do-openrouter-pela-documentacao-plan (2026-10-30)
+- Verify de ponta a ponta da 4.3 (hitl): rodar o agente com um tier real na tabela e com a página trocada por uma ilegível. Hoje a tabela só tem `exemplo-zai`, então nada disso foi observado.
