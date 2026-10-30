@@ -33,6 +33,13 @@ Ask the person for these two paths when they are not already set:
 
 ## Run steps
 
+0. Routing guard, start of the run. Before anything else, compute the SHA-256
+   of the bytes of three files, in hexadecimal: the config, the `state_file` and
+   the `usage_file`. Take the last two paths from the config. A file you cannot
+   reach (empty path in the config, or no access) is recorded as
+   `não alcançável`, with no hash. If the config itself cannot be read, stop
+   here and follow the "Config unreadable" case in Edge cases. Keep these as the
+   "início" hashes. Only read the files; never change them.
 1. Read the config and take only `tiers` and `prices`.
    - `tiers[].name`, `tiers[].base_url`, `tiers[].free`.
    - `tiers[].models.<name>.id`: the model id the tier maps to. When `id` is
@@ -41,7 +48,7 @@ Ask the person for these two paths when they are not already set:
 2. Pick the OpenRouter tiers: those whose `base_url` host is exactly
    `openrouter.ai` (case-insensitive, port ignored; subdomains such as
    `api.openrouter.ai` do not count). If there is none, skip to the "no
-   OpenRouter tier" case. The implicit tier 0 (`upstream.base_url`) is not in
+   OpenRouter tier" case (the run still goes through steps 5 and 6). The implicit tier 0 (`upstream.base_url`) is not in
    `tiers` and is out of scope for this version.
 3. Fetch `GET https://openrouter.ai/api/v1/models`. Each model has an `id` and
    `pricing.prompt` / `pricing.completion`, USD per token as strings. Multiply by
@@ -69,8 +76,15 @@ Ask the person for these two paths when they are not already set:
      A change of free state (both prices 0 versus not) goes only under
      "Gratuidade", never under "Preço".
 5. Write the proposal (format and file name below), re-read it once to check
-   that every item has its source URL, and finish. Do not retry the run on your
-   own.
+   that every item has its source URL, and go on to step 6. Do not retry the
+   run on your own.
+6. Routing guard, end of the run. After the proposal is on disk, compute the
+   same three hashes again (the "fim" hashes) and append the "Roteamento"
+   section to the proposal; then finish. If the config no longer opens at this
+   point, its "fim" hash is `ilegível`. If `state_file` or `usage_file` was
+   reachable at the start but is not now (or the reverse), write `não
+   alcançável` on that side only. Never revert or fix anything, whatever the hashes
+   show.
 
 ## Proposal format
 
@@ -80,7 +94,7 @@ never overwrite an earlier one. If the file already exists (a re-run in the
 same minute), append `-2`, `-3`, ... before `.md`.
 
 The proposal is Markdown for a person. The title carries the date and time, and
-the five sections below always appear, in this order, with these headings
+the six sections below always appear, in this order, with these headings
 (in Portuguese, since the person reads them in Portuguese):
 
 ```markdown
@@ -95,7 +109,28 @@ the five sections below always appear, in this order, with these headings
 ## Limites
 
 ## Provedores novos
+
+## Roteamento
+
+- config: início <sha256> / fim <sha256>
+- state_file: início <sha256> / fim <sha256>
+- usage_file: início não alcançável / fim não alcançável
+- roteamento inalterado: sim
 ```
+
+"Roteamento" is not a list of items and has no source URLs. It has four lines,
+as above:
+
+- Each hash is the SHA-256 of the file bytes, in hexadecimal. A file the agent
+  cannot reach is `não alcançável` on the side where it is unreachable (both
+  sides when it is unreachable at both ends), with no hash.
+- `roteamento inalterado: sim` when the config hash at the end equals the one at
+  the start; `não` otherwise, and also when the config is `ilegível` at the end.
+  This line looks only at the config hash. The proxy rewrites `state_file` and
+  `usage_file` by itself, so their hashes may differ and the line stays `sim`;
+  those two are informational.
+- The "fim" hashes are computed after the proposal is written, so the agent
+  appends this section last.
 
 Each item is one line that ends with its source URL. Under "Preço" and
 "Gratuidade" the item starts with the tier name, because one model can be
@@ -137,14 +172,20 @@ Examples:
 
 | Case | What you write |
 |------|----------------|
-| Normal run: an OpenRouter tier exists and the API answers | The proposal with the five sections; every item has a URL. |
-| No OpenRouter tier: no `base_url` has the host `openrouter.ai` | The proposal with the five sections empty and the note "nenhum tier OpenRouter na config". |
-| OpenRouter unavailable: the request fails, the status is not 2xx, or a 2xx response has an unparsable body or no `data` list | The proposal with the note "OpenRouter indisponível" and the reason (error message or status). The sections stay empty; do not invent items. |
+| Normal run: an OpenRouter tier exists and the API answers | The proposal with the six sections; every item has a URL; "Roteamento" with the three hashes at start and end and `roteamento inalterado: sim`. |
+| No OpenRouter tier: no `base_url` has the host `openrouter.ai` | The proposal with the five item sections empty, the note "nenhum tier OpenRouter na config" and "Roteamento". |
+| OpenRouter unavailable: the request fails, the status is not 2xx, or a 2xx response has an unparsable body or no `data` list | The proposal with the note "OpenRouter indisponível" and the reason (error message or status). The item sections stay empty; do not invent items. "Roteamento" is still written. |
 | Config unreadable or unparsable, or `catalog-proposals/` missing or not writable | Write nothing and do not create anything. Report the error in chat and end the run. |
+| The config changes during the run (its hash at the end differs from the start) | "Roteamento" with both config hashes and `roteamento inalterado: não`. The run ends; revert nothing. |
+| Only `state_file` or `usage_file` change during the run | The hashes of that line differ; `roteamento inalterado: sim`. |
+| `state_file` or `usage_file` has an empty path in the config or is not reachable | `não alcançável` in place of the hash, on both sides of that line. |
+| The config disappears or does not open at the end of the run | Its "fim" hash is `ilegível` and `roteamento inalterado: não`. |
 
 The two notes ("nenhum tier OpenRouter na config" and "OpenRouter indisponível")
-go on a line right under the title. In the first three cases the run ends
-normally and the config stays as it was. In the last case nothing is written.
+go on a line right under the title. In every case but "Config unreadable" the
+run ends normally and the proposal stays, with its "Roteamento" section, even
+when it says `roteamento inalterado: não`. In the "Config unreadable" case
+nothing is written, so there is no "Roteamento" section either.
 
 ## Setting it up in Orca
 
@@ -154,5 +195,12 @@ normally and the config stays as it was. In the last case nothing is written.
 3. Give the agent the config path as **read-only** (mount or permission with no
    write access) and write access only to the `catalog-proposals/` folder
    itself, never to `state_file` or `usage_file`.
-4. Run it once and open the file in `catalog-proposals/` to check the format.
+4. Run it once and open the file in `catalog-proposals/` to check the format,
+   including the "Roteamento" section.
    Scheduling is not part of this version.
+
+The read-only config is one of three layers that prove the routing stayed the
+same: the hashes in the proposal, a Go test that fails when proxy code mentions
+`catalog-proposals` (`catalog_guard_test.go`), and this read-only access. The
+hashes only report a change after it happened; read-only access is what stops
+the agent from making it.
