@@ -3,7 +3,7 @@ title: 'Alerta SMTP no primeiro uso de tier pago do dia'
 type: 'feature'
 ticket: 7
 created: '2026-10-30'
-status: 'built'
+status: 'done'
 baseline_revision: '0ff00ded635fd687aff09584f37bab33db424bf0'
 route: 'full'
 route_source: 'auto'
@@ -109,3 +109,17 @@ O dia fica marcado antes do envio: o contrato é "uma vez por dia"; reenviar em 
 **Commands:**
 - `go vet ./...` -- expected: sem aviso
 - `go test -race -count=1 ./...` -- expected: verde, com os testes novos
+
+## Code Review
+
+### 2026-10-30
+0 decision-needed, 6 patch, 0 defer, 17 rejected.
+
+- [x] [Review][Patch] Asserir dia e modelo no corpo do e-mail de alerta (incluindo o dia seguinte) [history_test.go:wantAlerts, TestPaidFirstUseAlert]
+- [x] [Review][Patch] Testar `firstUse` com fuso não UTC (01:00 UTC = 22:00 local do dia anterior) [history_test.go]
+- [x] [Review][Patch] Testar que falha retida de tier pago não envia alerta nem grava `alerts` [history_test.go]
+- [x] [Review][Patch] Documentar que "uma vez por dia após reinício" exige `usage_file` e que um crash antes do flush de 3 s repete o e-mail [docs/configuration.md, docs/smtp.md]
+- [x] [Review][Patch] Usar `%q` para o modelo no corpo do e-mail (vem do cliente) [notify.go:24]
+- [x] [Review][Patch] Fechar os apps de `TestPaidFirstUseAlert` e capturar `old` de `sendMail` uma só vez [history_test.go:alertApp]
+
+**Rejected:** EC: virada de dia entre record e firstUse (low, só muda o rótulo, o alerta sai uma vez); marcador com data futura (false, `>=` suprimiria alertas por dias); `usage_file` corrompido zera alertas (low, as linhas se perdem igual); dia marcado sem SMTP/sem `usage_file` (low, exigiria mudar a interface do sender); alertas obsoletos (false, uma entrada por tier). Blind: negativos com espera de 100 ms (low, redesenho de teste); plano desatualizado (low, bookkeeping). Verification: nota sobre `markDirty` e esperas fixas (low, sem defeito). Intent: stub de `sendMail` em vez de servidor SMTP (false, é o ponto de troca existente); tier 0 nunca alerta (false, `paidTier` só olha `Tiers` sem `free`); semântica de "atendida" (false, `!held` já exclui falhas).
