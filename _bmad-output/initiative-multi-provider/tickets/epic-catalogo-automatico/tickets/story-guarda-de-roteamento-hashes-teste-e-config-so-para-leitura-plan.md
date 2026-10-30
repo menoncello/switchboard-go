@@ -3,7 +3,7 @@ title: 'Guarda de roteamento: hashes, teste e config só para leitura'
 type: 'feature'
 ticket: 2
 created: '2026-10-30'
-status: 'built'
+status: 'done'
 baseline_revision: '01cf68914e7355eada0ca1858a324ce12f3b3ba4'
 route: 'full'
 route_source: 'auto'
@@ -55,9 +55,9 @@ deferred: []
 ## Tasks & Acceptance
 
 **Execution:**
-- [ ] `catalog_guard_test.go` -- `TestProxyDoesNotReferenceCatalogProposals`: percorrer a raiz com `filepath.WalkDir`, pular diretórios `.*` e `_*` e arquivos `_test.go`, ler cada `.go` e falhar com `arquivo:linha` se achar `catalog-proposals` -- prova que o proxy não lê as propostas
-- [ ] `docs/catalog-agent.md` -- (a) passo novo no início da rodada: hash SHA-256 de config, `state_file`, `usage_file`; (b) passo final: refazer os hashes depois de gravar a proposta; (c) seção "Roteamento" no formato, com linhas de início/fim e `roteamento inalterado: sim|não` só pela config; (d) bordas da matriz; (e) "cinco seções" vira seis; (f) passo do Eduardo no Orca: config só para leitura, com a explicação do porquê -- guarda de roteamento e documentação
-- [ ] `go test ./... && go vet ./...` -- rodar -- confirma que o código atual passa
+- [x] `catalog_guard_test.go` -- `TestProxyDoesNotReferenceCatalogProposals`: percorrer a raiz com `filepath.WalkDir`, pular diretórios `.*` e `_*` e arquivos `_test.go`, ler cada `.go` e falhar com `arquivo:linha` se achar `catalog-proposals` -- prova que o proxy não lê as propostas
+- [x] `docs/catalog-agent.md` -- (a) passo novo no início da rodada: hash SHA-256 de config, `state_file`, `usage_file`; (b) passo final: refazer os hashes depois de gravar a proposta; (c) seção "Roteamento" no formato, com linhas de início/fim e `roteamento inalterado: sim|não` só pela config; (d) bordas da matriz; (e) "cinco seções" vira seis; (f) passo do Eduardo no Orca: config só para leitura, com a explicação do porquê -- guarda de roteamento e documentação
+- [x] `go test ./... && go vet ./...` -- rodar -- confirma que o código atual passa
 
 **Acceptance Criteria:**
 - Given um `.go` do proxy fora de `_test.go` que cite `catalog-proposals`, when `go test` roda, then o teste falha apontando o arquivo; given o código atual, then passa.
@@ -120,3 +120,17 @@ A prova de "roteamento idêntico" tem três camadas (decisão do épico): hashes
 **Verification:** `go test ./... && go vet ./...` ok; sonda `zz_probe.go` com `catalog-proposals` fez o teste falhar e foi removida. O verify real (rodar no Orca e mudar a config no meio da rodada) é do Eduardo (`hitl`) e não foi feito.
 
 **Residual risks:** o documento nunca foi executado por um agente; a matriz de bordas das linhas de hash é coberta só pela doc, sem teste automatizado possível.
+
+## Code Review
+
+### 2026-10-30
+**Code review complete.** 0 `decision-needed`, 5 `patch`, 1 `defer`, 11 rejected.
+
+- [x] [Review][Patch] O teste de guarda passa sem varrer nenhum arquivo; contar os `.go` varridos e falhar se for 0 [catalog_guard_test.go:12-45]
+- [x] [Review][Patch] A doc manda calcular SHA-256 sem nomear ferramenta nem fallback; nomear `shasum -a 256` (ou `sha256sum`) e, sem ferramenta, `não alcançável`, nunca um hash inventado [docs/catalog-agent.md passos 0 e 6]
+- [x] [Review][Patch] A linha da tabela de bordas diz `não alcançável` nos dois lados, mas o passo 6 diz só no lado inacessível; alinhar [docs/catalog-agent.md:181 vs :125]
+- [x] [Review][Patch] "roteamento inalterado: sim" só compara hash de início e fim (A→B→A passa; o passo 0 e a leitura do passo 1 são separados); dizer isso na doc [docs/catalog-agent.md:125-128]
+- [x] [Review][Patch] Sem linha de borda para falha ao anexar a seção "Roteamento" no passo 6 [docs/catalog-agent.md]
+- [x] [Review][Defer] Plano com `status: built` mas tarefas desmarcadas e Implementation Notes vazias — resolvido ao fechar: status done e tarefas marcadas
+
+**Rejected:** casar só a string literal (inerente à checagem em texto, o ticket pede a citação literal); "não alcançável" agrupa vazio/ausente/permissão (simplificação deliberada); o teste pula dirs `_`/`.` (o Go ignora esses diretórios); linha de 1 MiB no Scanner (falha alta, arquivo gerado raro); caminho relativo e caminho só com espaços (raros, exigem regra nova); hash de arquivo meio escrito (informativo por desenho); código com span partido (grep mostra os spans inteiros).

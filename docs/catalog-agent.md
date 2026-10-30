@@ -34,10 +34,11 @@ Ask the person for these two paths when they are not already set:
 ## Run steps
 
 0. Routing guard, start of the run. Before anything else, compute the SHA-256
-   of the bytes of three files, in hexadecimal: the config, the `state_file` and
-   the `usage_file`. Take the last two paths from the config. A file you cannot
-   reach (empty path in the config, or no access) is recorded as
-   `não alcançável`, with no hash. If the config itself cannot be read, stop
+   of the bytes of three files, in hexadecimal, with `shasum -a 256` (fallback
+   `sha256sum`): the config, the `state_file` and the `usage_file`. Take the last
+   two paths from the config. A file you cannot reach (empty path in the config,
+   or no access) is recorded as `não alcançável`, with no hash. If neither tool
+   is available, record `não alcançável` for that hash; never invent a hash. If the config itself cannot be read, stop
    here and follow the "Config unreadable" case in Edge cases. Keep these as the
    "início" hashes. Only read the files; never change them.
 1. Read the config and take only `tiers` and `prices`.
@@ -79,8 +80,8 @@ Ask the person for these two paths when they are not already set:
    that every item has its source URL, and go on to step 6. Do not retry the
    run on your own.
 6. Routing guard, end of the run. After the proposal is on disk, compute the
-   same three hashes again (the "fim" hashes) and append the "Roteamento"
-   section to the proposal; then finish. If the config no longer opens at this
+   same three hashes again (the "fim" hashes), with the same tool, and append
+   the "Roteamento" section to the proposal; then finish. If the config no longer opens at this
    point, its "fim" hash is `ilegível`. If `state_file` or `usage_file` was
    reachable at the start but is not now (or the reverse), write `não
    alcançável` on that side only. Never revert or fix anything, whatever the hashes
@@ -126,6 +127,9 @@ as above:
   sides when it is unreachable at both ends), with no hash.
 - `roteamento inalterado: sim` when the config hash at the end equals the one at
   the start; `não` otherwise, and also when the config is `ilegível` at the end.
+  `sim` only means the two hashes are equal: a change made and reverted in the
+  middle of the run (A to B to A) is not detected, because the start hash is
+  taken separately from the step-1 read.
   This line looks only at the config hash. The proxy rewrites `state_file` and
   `usage_file` by itself, so their hashes may differ and the line stays `sim`;
   those two are informational.
@@ -178,7 +182,8 @@ Examples:
 | Config unreadable or unparsable, or `catalog-proposals/` missing or not writable | Write nothing and do not create anything. Report the error in chat and end the run. |
 | The config changes during the run (its hash at the end differs from the start) | "Roteamento" with both config hashes and `roteamento inalterado: não`. The run ends; revert nothing. |
 | Only `state_file` or `usage_file` change during the run | The hashes of that line differ; `roteamento inalterado: sim`. |
-| `state_file` or `usage_file` has an empty path in the config or is not reachable | `não alcançável` in place of the hash, on both sides of that line. |
+| `state_file` or `usage_file` has an empty path in the config or is not reachable | `não alcançável` in place of the hash: on both sides of that line when the path is empty in the config, only on the unreachable side otherwise. |
+| Appending "Roteamento" fails in step 6 (disk full, permission) | Report the error in chat and treat the proposal as incomplete: no "Roteamento" section, so no routing claim. |
 | The config disappears or does not open at the end of the run | Its "fim" hash is `ilegível` and `roteamento inalterado: não`. |
 
 The two notes ("nenhum tier OpenRouter na config" and "OpenRouter indisponível")

@@ -11,6 +11,7 @@ import (
 
 // The proxy must never read the catalog agent's proposals directory.
 func TestProxyDoesNotReferenceCatalogProposals(t *testing.T) {
+	scanned := 0
 	err := filepath.WalkDir(".", func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
 			return err
@@ -25,6 +26,7 @@ func TestProxyDoesNotReferenceCatalogProposals(t *testing.T) {
 		if !strings.HasSuffix(name, ".go") || strings.HasSuffix(name, "_test.go") {
 			return nil
 		}
+		scanned++
 		f, err := os.Open(path)
 		if err != nil {
 			return err
@@ -41,5 +43,8 @@ func TestProxyDoesNotReferenceCatalogProposals(t *testing.T) {
 	})
 	if err != nil {
 		t.Fatal(err)
+	}
+	if scanned == 0 {
+		t.Fatal("no non-test .go files scanned; the guard checked nothing")
 	}
 }
