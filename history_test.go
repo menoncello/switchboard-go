@@ -454,6 +454,44 @@ func TestCostPricedModel(t *testing.T) {
 	if !strings.Contains(body, "custo US$ 0.0020.") || !strings.Contains(section(t, body, "Tier"), "<td>US$ 0.0020</td>") {
 		t.Fatalf("status: %s", body)
 	}
+	postModel(app, "a") // record accumulates
+	if r := app.history.snapshot(); len(r) != 1 || r[0].Requests != 2 || r[0].Priced != 2 || r[0].CostUSD < 0.0039999 || r[0].CostUSD > 0.0040001 {
+		t.Fatalf("rows after second post: %+v", r)
+	}
+}
+
+func TestCostMixedLineInStatus(t *testing.T) {
+	app := pricedApp(t, `{"usage":{"prompt_tokens":1000,"completion_tokens":500}}`, "", gratisPrices)
+	postModel(app, "a")
+	postModel(app, "a")
+	app.history.record("", "a", "", "gratis", usageTokens{found: true, in: 1000, out: 500}, false, nil) // same line, no price
+	body := statusBody(app)
+	const cost = "US$ 0.0040 (2/3 com preço)"
+	if !strings.Contains(body, "custo "+cost+".") || !strings.Contains(section(t, body, "Modelo"), "<td>"+cost+"</td>") {
+		t.Fatalf("status: %s", body)
+	}
+}
+
+func TestConfigPrice(t *testing.T) {
+	cfg := Config{
+		Tiers:  []TierConfig{{Name: "t", Models: []TierModel{{Name: "plain"}, {Name: "a", ID: "a-id"}}}, {Name: "bare", Models: []TierModel{{Name: "x"}}}},
+		Prices: map[string]map[string]ModelPrice{"t": {"plain": {Input: 1, Output: 2}, "a-id": {Input: 3, Output: 4}}},
+	}
+	for name, tc := range map[string]struct {
+		tier, model string
+		want        ModelPrice
+		ok          bool
+	}{
+		"empty id falls back to name": {"t", "plain", ModelPrice{1, 2}, true},
+		"explicit id":                 {"t", "a", ModelPrice{3, 4}, true},
+		"unknown model":               {"t", "nope", ModelPrice{}, false},
+		"unknown tier":                {"nope", "a", ModelPrice{}, false},
+		"tier without prices":         {"bare", "x", ModelPrice{}, false},
+	} {
+		if got, ok := cfg.price(tc.tier, tc.model); got != tc.want || ok != tc.ok {
+			t.Fatalf("%s: got %v %v", name, got, ok)
+		}
+	}
 }
 
 func TestCostNoPriceAndTier0(t *testing.T) {
@@ -489,6 +527,9 @@ func TestCostMixedLine(t *testing.T) {
 	h.record("", "m", "", "t", u, false, &ModelPrice{Input: 1, Output: 2})
 	h.record("", "m", "", "t", u, false, nil)
 	if got := (usageLine{Requests: 2, Priced: 1, CostUSD: 0.002}).Cost(); got != "US$ 0.0020 (1/2 com preço)" {
+		t.Fatal(got)
+	}
+	if got := (usageLine{Requests: 1, Priced: 1, CostUSD: 0.00000123}).Cost(); got != "US$ 0.000001" {
 		t.Fatal(got)
 	}
 	if r := h.snapshot(); len(r) != 1 || r[0].Requests != 2 || r[0].Priced != 1 {
@@ -535,6 +576,7 @@ func TestValidateConfigPrices(t *testing.T) {
 	}{
 		"ok":         {map[string]map[string]ModelPrice{"gratis": {"a": {Input: 1, Output: 2}}}, true},
 		"zero":       {map[string]map[string]ModelPrice{"gratis": {"a": {}}}, true},
+		"unmapped":   {map[string]map[string]ModelPrice{"gratis": {"b": {}}}, false},
 		"neg input":  {map[string]map[string]ModelPrice{"gratis": {"a": {Input: -1}}}, false},
 		"neg output": {map[string]map[string]ModelPrice{"gratis": {"a": {Output: -1}}}, false},
 		"unknown":    {map[string]map[string]ModelPrice{"nope": {"a": {}}}, false},
@@ -545,6 +587,19 @@ func TestValidateConfigPrices(t *testing.T) {
 		if err := validateConfig(cfg); (err == nil) != tc.ok {
 			t.Fatalf("%s: %v", name, err)
 		}
+	}
+}
+
+func TestLoadConfigPricesMissingKey(t *testing.T) {
+	for name, price := range map[string]string{"output": "{input: 1}", "input": "{output: 1}", "typo": "{input: 1, outpt: 2}"} {
+		tiersYAML(t, "prices:\n  a:\n    x/m1: "+price+"\ntiers:\n"+tierOK)
+		if _, err := loadConfig(); err == nil || !strings.Contains(err.Error(), `tier "a" model "x/m1"`) {
+			t.Fatalf("%s: err=%v", name, err)
+		}
+	}
+	tiersYAML(t, "prices:\n  a:\n    x/m1: {input: 0, output: 0}\ntiers:\n"+tierOK)
+	if _, err := loadConfig(); err != nil {
+		t.Fatalf("explicit zero: %v", err)
 	}
 }
 
@@ -562,9 +617,9 @@ func TestMergeConfigPrices(t *testing.T) {
 }
 
 func TestLoadConfigPrices(t *testing.T) {
-	tiersYAML(t, "prices:\n  a:\n    m-id: {input: 1.5, output: 2}\ntiers:\n"+tierOK)
+	tiersYAML(t, "prices:\n  a:\n    x/m1: {input: 1.5, output: 2}\ntiers:\n"+tierOK)
 	cfg, err := loadConfig()
-	if err != nil || cfg.Prices["a"]["m-id"] != (ModelPrice{1.5, 2}) {
+	if err != nil || cfg.Prices["a"]["x/m1"] != (ModelPrice{1.5, 2}) {
 		t.Fatalf("prices=%v err=%v", cfg.Prices, err)
 	}
 }

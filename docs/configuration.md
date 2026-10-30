@@ -163,9 +163,11 @@ the window has no request.
 ### Prices and cost
 
 `prices` (top-level, YAML only) gives USD per 1M tokens: `prices.<tier>.<mapped model id>`
-with `input` and `output`. The key is the tier `name` and the model `id` the tier maps
+with `input` and `output`, both required (an explicit `0` is valid, a missing or misspelled
+key is rejected). The key is the tier `name` and the model `id` the tier maps
 the client's model to (the model name when `id` is empty); a tier that is not in
-`tiers` (tier 0 included, it has no price) or a negative value is rejected at startup.
+`tiers` (tier 0 included, it has no price), an id that no model of the tier maps to, or a
+negative value is rejected at startup.
 A request costs `(tokens_in * input + tokens_out * output) / 1e6`. Cache tokens have
 no price of their own: they count in `tokens_in` as the response reports them. The cost is
 written to the row when the request is served, so changing `prices` later does not

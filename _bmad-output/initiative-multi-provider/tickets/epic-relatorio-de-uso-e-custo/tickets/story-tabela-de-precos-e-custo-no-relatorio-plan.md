@@ -3,7 +3,7 @@ title: 'Tabela de preços e custo no relatório'
 type: 'feature'
 ticket: 5
 created: '2026-10-29'
-status: built
+status: done
 baseline_revision: '1b57f89460e474e4f92a27c1f5a455dcfd3d4bef'
 route: 'full'
 route_source: 'auto'
@@ -112,3 +112,27 @@ O custo é gravado na linha em vez de recalculado a partir de tokens: o preço �
 **Commands:**
 - `go vet ./...` -- expected: sem aviso
 - `go test -race ./...` -- expected: verde, com os testes novos
+
+## Code Review
+
+### 2026-10-30
+0 `decision-needed`, 5 `patch`, 0 `defer`, 16 rejected.
+
+- [x] [Review][Patch] `input` ou `output` faltando em `prices` vira 0 e subestima o custo; `ModelPrice` com `*float64` e `validatePrices` exigindo as duas chaves (decidido: opção 1) [config.go:212]
+- [x] [Review][Patch] `validatePrices` aceita id de modelo que o tier não mapeia (typo mostra `—` para sempre) [config.go:285]
+- [x] [Review][Patch] Sem teste da soma de custo e `Priced` entre várias linhas em `usageReport`/`record` (2 requests com preço + 1 sem; segundo post em `TestCostPricedModel`) [history_test.go]
+- [x] [Review][Patch] Sem teste de `Config.price` com `ID` vazio, `ID` explícito, modelo e tier desconhecidos [history_test.go]
+- [x] [Review][Patch] `%.4f` mostra `US$ 0.0000` para custo pequeno e não nulo; usar mais casas abaixo de 0.0001 [adminkeys.go:168]
+
+#### Rejected
+- Sem usage conta como com preço, `US$ 0.0000` (blind): contrato do intent manda assim e a doc diz.
+- Cache de tokens sem preço, Anthropic subestima (edge): contrato do intent; o conserto edita o intent.
+- `price()` copia `Config` (blind): cópia desprezível.
+- Ordem de erro de `validatePrices` não fixa (blind): raro, ninguém depende.
+- Plano com tarefas sem marcar e Code Map desatualizado (blind): artefato do fluxo, sem efeito no código.
+- `/status` não aberto no navegador (blind): não é defeito de código.
+- `docs/admin-api.md` sem atualização (blind): a página não descreve a seção de uso. Linhas longas em README/docs: cosmético.
+- Modelo truncado em 128 bytes antes de `price()` (edge): nome de modelo de tier com mais de 128 bytes não é realista.
+- Preço enorme estoura para Inf e quebra `flush` (edge, verification-gap): exige preço acima de 1e302.
+- `Priced > Requests` e `cost_usd` negativo em `usage_file` (edge): só arquivo editado à mão.
+- Teste do tier 0 com `prices` e validação pelo caminho YAML (intent): cobertos pelos testes existentes e pelo `validateConfig` no startup.

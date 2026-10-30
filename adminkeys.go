@@ -268,13 +268,17 @@ type usageLine struct {
 // Cost is "—" without priced requests, the amount when all are priced, else the
 // amount and how many were.
 func (l usageLine) Cost() string {
+	f := "%.4f"
+	if l.CostUSD > 0 && l.CostUSD < 0.0001 {
+		f = "%.6f" // a tiny cost must not read as zero
+	}
 	switch {
 	case l.Priced == 0:
 		return "—"
 	case l.Priced == l.Requests:
-		return fmt.Sprintf("US$ %.4f", l.CostUSD)
+		return fmt.Sprintf("US$ "+f, l.CostUSD)
 	}
-	return fmt.Sprintf("US$ %.4f (%d/%d com preço)", l.CostUSD, l.Priced, l.Requests)
+	return fmt.Sprintf("US$ "+f+" (%d/%d com preço)", l.CostUSD, l.Priced, l.Requests)
 }
 
 type usageDim struct {
