@@ -3,7 +3,7 @@ title: 'Histórico de uso persistido em usage_file'
 type: 'feature'
 ticket: 3
 created: '2026-10-29'
-status: built
+status: done
 baseline_revision: '778f6252dae1b7cf35ca74894564096c5143a366'
 route: 'full'
 route_source: 'auto'
@@ -133,3 +133,20 @@ Linha do arquivo (uma por dimensão): `{"day":"2026-10-29","project":"sem projet
 **Follow-up recomendado:** false.
 **Verificação:** `go vet ./...` e `go test -race ./...` verdes. O SIGTERM real não foi enviado; só o `close()` e a leitura de `main.go` cobrem a saída.
 **Risco residual:** stream que termina depois dos 10 s do `Shutdown` não entra no arquivo; o modelo vem do cliente e as linhas não têm teto (comentado como `shortcut:`).
+
+## Code Review
+
+### 2026-10-29
+2 `decision-needed`, 7 `patch`, 0 `defer`, 22 rejected (lentes: blind-hunter, edge-case-hunter, verification-gap, intent-alignment).
+
+- [x] [Review][Decision] Um `usage_file` corrompido ou ilegível é sobrescrito pelo próximo flush — `load()` começa vazio e o `flush()` troca o arquivo, perdendo até 90 dias. Options: (a) renomear para `<usage_file>.bad` e começar vazio; (b) manter o arquivo e não gravar até ele carregar; (c) deixar como está. Recommended: (a) — preserva os dados para recuperação com um `os.Rename`. [history.go:load]
+- [x] [Review][Decision] Respostas 429/5xx do upstream seguradas (`last.tier`) e `GET /v1/models` (modelo vazio) entram no histórico como request — infla `requests` e contradiz o texto de `docs/configuration.md` ("sem tier que atendeu não conta"). Options: (a) gravar só resposta que um tier atendeu (pular segurada, não-POST e modelo vazio); (b) contar tudo e corrigir a doc; (c) pular só o `GET /v1/models`. Recommended: (a) — bate com a doc e com o sentido do relatório. [proxy.go:136, proxy.go:215]
+- [x] [Review][Patch] `flush()` segura `h.mu` durante `writeFileAtomic`; `record()` bloqueia na request com disco lento [history.go:flush]
+- [x] [Review][Patch] Sem teste: YAML `usage_file`/`timezone` (load e merge) e `newApp` com `Timezone` (inclui inválido → UTC); `TestHistoryDayByTimezone` troca o `app.history` [history_test.go, main_test.go]
+- [x] [Review][Patch] Sem teste de que a escrita é atrasada: `TestHistoryDelayedWrite` passaria com escrita síncrona [history_test.go]
+- [x] [Review][Patch] Sem teste das dimensões no `proxyV1`: `key-<idx>`, chave vazia de tier extra, corte do modelo, GET [history_test.go]
+- [x] [Review][Patch] Sem teste da saída por SIGTERM (`Shutdown`, `close()`, `<-done`) [main.go, history_test.go]
+- [x] [Review][Patch] Condição de `no_usage` duplicada em `proxyV1`; calcular uma vez [proxy.go:136]
+- [x] [Review][Patch] Trocar `timezone` entre reinícios mistura dias de dois fusos no mesmo arquivo; documentar [docs/configuration.md]
+
+**Rejected:** versão de schema no arquivo (low, especulativo); tokens `partial` somados sem contador (low, contador novo é de 3.4); plano com tarefas desmarcadas (low, burocracia); `X-Project` sem corte (falso, `requestProject` limita tamanho e charset); `log.Fatal` pula `close()` (falso, falha no bind antes de qualquer request); fuso inválido cai em UTC calado (low, `loadConfig` valida na partida); `Day` malformado, contagens negativas e tokens negativos (low, só arquivo editado à mão); `record` depois do `close()` (low, só depois dos 10 s do `Shutdown`); garantia de flush no SIGTERM (low, coberta pelo teste do F7); colisão do helper `post` (falso); `Chdir` sem `t.Parallel` (low); ausência de leitor do histórico para R10/R13 (fora do escopo, plano exclui `/status` e relatório).
