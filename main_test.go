@@ -1391,8 +1391,9 @@ func TestLoadConfigWithoutTiers(t *testing.T) {
 
 func TestLoadConfigTiersRejected(t *testing.T) {
 	cases := map[string]struct{ tier, want string }{
-		"paid":             {strings.Replace(tierOK, "free: true", "free: false", 1), "free must be true"},
-		"free absent":      {strings.Replace(tierOK, "    free: true\n", "", 1), "free must be true"},
+		"paid no cap":      {strings.Replace(tierOK, "free: true", "free: false", 1), "needs daily_cap"},
+		"free absent":      {strings.Replace(tierOK, "    free: true\n", "", 1), "needs daily_cap"},
+		"free with cap":    {tierOK + "    daily_cap: 5\n", "daily_cap is only for paid tiers"},
 		"no base_url":      {strings.Replace(tierOK, "base_url: https://a", "base_url: \"\"", 1), "base_url is required"},
 		"no api_key":       {strings.Replace(tierOK, "api_key: secret-a", "api_key: \"\"", 1), "api_key is required"},
 		"no name":          {strings.Replace(tierOK, "name: a", "name: \"\"", 1), "name is required"},
@@ -1405,6 +1406,7 @@ func TestLoadConfigTiersRejected(t *testing.T) {
 		"models not map":   {strings.Replace(tierOK, "    models:\n      m1: {id: x/m1, context: 100, tools: true}\n", "    models: [a]\n", 1), "must be a map"},
 		"bad cooldown":     {tierOK + "    cooldown: soon\n", "parse tiers[0].cooldown"},
 		"neg cooldown":     {strings.Replace(tierOK, "    free: true\n", "    free: true\n    cooldown: -1s\n", 1), "cooldown must be >= 0"},
+		"reserved name":    {strings.Replace(tierOK, "name: a", "name: opencode-go", 1), "reserved for tier 0"},
 		"dup name trimmed": {tierOK + strings.Replace(tierOK, "name: a", "name: \"a \"", 1), "duplicate name"},
 	}
 	for name, c := range cases {
@@ -1997,6 +1999,59 @@ func TestRequestLogModelIsTruncated(t *testing.T) {
 	got := lines(t)
 	if len(got) != 1 || got[0]["model"] != strings.Repeat("a", 127) {
 		t.Fatalf("lines: %v", got)
+	}
+}
+
+func TestRequestLogProjectHeader(t *testing.T) {
+	var leaked atomic.Bool
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if len(r.Header.Values("X-Project")) > 0 {
+			leaked.Store(true)
+		}
+		_, _ = w.Write([]byte(`{}`))
+	})
+	s0, s1 := httptest.NewServer(handler), httptest.NewServer(handler)
+	defer s0.Close()
+	defer s1.Close()
+	app := newApp(Config{ProxyAPIKey: "p", UpstreamAPIKeys: []string{"k"}, UpstreamBaseURL: s0.URL, MaxRequestBodyBytes: 1 << 20, RetryExhaustedAfter: time.Hour, Tiers: []TierConfig{
+		{Name: "t1", BaseURL: s1.URL, APIKey: "tk", Free: true, Styles: []APIStyle{APIStyleOpenAI}, Models: []TierModel{{Name: "a"}}},
+	}})
+	lines := captureLog(app)
+	cases := []struct{ model, header, want string }{
+		{"glm-5.1", "teste", "teste"},
+		{"glm-5.1", "", noProject},
+		{"glm-5.1", strings.Repeat("a", 64), strings.Repeat("a", 64)},
+		{"glm-5.1", strings.Repeat("a", 65), noProject},
+		{"glm-5.1", "com espaço", noProject},
+		{"glm-5.1", "a/b", noProject},
+		{"a", "teste", "teste"}, // served by tier 1 after tier 0 is skipped
+	}
+	for i, c := range cases {
+		if c.model == "a" {
+			app.cooldowns.set(tier0CooldownKey, time.Hour)
+		}
+		hdr := map[string]string{}
+		if c.header != "" {
+			hdr["X-Project"] = c.header
+		}
+		if rec := tierReq(app, http.MethodPost, "/v1/chat/completions", `{"model":"`+c.model+`"}`, hdr); rec.Code != http.StatusOK {
+			t.Fatalf("case %d: code %d", i, rec.Code)
+		}
+	}
+	got := lines(t)
+	if len(got) != len(cases) {
+		t.Fatalf("lines: %v", got)
+	}
+	for i, c := range cases {
+		if got[i]["project"] != c.want {
+			t.Fatalf("case %d: project %v, want %q", i, got[i]["project"], c.want)
+		}
+		if got[i]["model"] != c.model || got[i]["status"] != float64(200) {
+			t.Fatalf("case %d: other fields changed: %v", i, got[i])
+		}
+	}
+	if leaked.Load() {
+		t.Fatal("X-Project reached an upstream")
 	}
 }
 
@@ -2916,6 +2971,14 @@ func TestLoadConfigStateFile(t *testing.T) {
 	}
 }
 
+func TestLoadConfigUsageFileAndTimezone(t *testing.T) {
+	tiersYAML(t, "usage_file: /x/usage.json\ntimezone: America/Sao_Paulo\n")
+	cfg, err := loadConfig()
+	if err != nil || cfg.UsageFile != "/x/usage.json" || cfg.Timezone != "America/Sao_Paulo" {
+		t.Fatalf("cfg=%q %q err=%v", cfg.UsageFile, cfg.Timezone, err)
+	}
+}
+
 // fakeTelegram records sendMessage calls (path and body) and answers with status.
 func fakeTelegram(t *testing.T, status int) chan [2]string {
 	t.Helper()
@@ -3114,5 +3177,239 @@ func TestLoadConfigTelegram(t *testing.T) {
 	}
 	if s := safeConfigSummary(cfg); !strings.Contains(s, "telegram_configured=true") || strings.Contains(s, "TOK") {
 		t.Fatalf("bad summary: %s", s)
+	}
+}
+
+func TestRequestLogTokens(t *testing.T) {
+	sseAnthropic := "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":12,\"output_tokens\":1}}}\n\n" +
+		"event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"delta\":{\"text\":\"oi\"}}\n\n" +
+		"event: message_delta\ndata: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":3}}\n\n" +
+		"event: message_delta\ndata: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":5}}\n\n"
+	sseOpenAI := "data: {\"choices\":[{\"delta\":{\"content\":\"a\"}}],\"usage\":null}\n\n" +
+		"data: {\"choices\":[],\"usage\":{\"prompt_tokens\":11,\"completion_tokens\":7}}\n\n" +
+		"data: [DONE]\n\n"
+	cases := []struct {
+		name, path, ctype, body string
+		status                  int
+		in, out                 float64
+		missing                 bool
+	}{
+		{"json openai", "/v1/chat/completions", "application/json", `{"usage":{"prompt_tokens":11,"completion_tokens":7}}`, 200, 11, 7, false},
+		{"json anthropic", "/v1/messages", "application/json", `{"usage":{"input_tokens":12,"output_tokens":5}}`, 200, 12, 5, false},
+		{"stream anthropic", "/v1/messages", "text/event-stream", sseAnthropic, 200, 12, 5, false},
+		{"stream openai", "/v1/chat/completions", "text/event-stream", sseOpenAI, 200, 11, 7, false},
+		{"json without usage", "/v1/chat/completions", "application/json", `{"choices":[]}`, 200, 0, 0, true},
+		{"json malformed", "/v1/chat/completions", "application/json", `{"usage":`, 200, 0, 0, true},
+		{"stream without usage", "/v1/chat/completions", "text/event-stream", "data: {\"choices\":[]}\n\ndata: [DONE]\n\n", 200, 0, 0, true},
+		{"non 2xx", "/v1/chat/completions", "application/json", `{"usage":{"prompt_tokens":1,"completion_tokens":1}}`, 401, 0, 0, false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", c.ctype)
+				w.WriteHeader(c.status)
+				_, _ = w.Write([]byte(c.body))
+			}))
+			defer up.Close()
+			app := newApp(Config{ProxyAPIKey: "p", UpstreamAPIKeys: []string{"k"}, UpstreamBaseURL: up.URL, MaxRequestBodyBytes: 1 << 20, RetryExhaustedAfter: time.Hour})
+			lines := captureLog(app)
+			rec := tierReq(app, http.MethodPost, c.path, `{"model":"m"}`, nil)
+			if rec.Code != c.status || rec.Body.String() != c.body {
+				t.Fatalf("client got %d %q", rec.Code, rec.Body.String())
+			}
+			got := lines(t)
+			if len(got) != 1 {
+				t.Fatalf("lines: %v", got)
+			}
+			l := got[0]
+			if l["tokens_in"] != nilIf0(c.in) || l["tokens_out"] != nilIf0(c.out) {
+				t.Fatalf("tokens: %v", l)
+			}
+			if _, has := l["usage_missing"]; has != c.missing || (has && l["usage_missing"] != true) {
+				t.Fatalf("usage_missing: %v", l)
+			}
+		})
+	}
+}
+
+// nilIf0 is the log value of a token count: absent (nil) when there is none.
+func nilIf0(v float64) any {
+	if v == 0 {
+		return nil
+	}
+	return v
+}
+
+func TestSSEUsageScannerSplitEvent(t *testing.T) {
+	ev := "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":4,\"completion_tokens\":9}}\n\n"
+	for cut := 1; cut < len(ev); cut++ {
+		var s sseUsageScanner
+		_, _ = s.Write([]byte(ev[:cut]))
+		_, _ = s.Write([]byte(ev[cut:]))
+		if got := s.result(); !got.found || got.in != 4 || got.out != 9 {
+			t.Fatalf("cut %d: %+v", cut, got)
+		}
+	}
+	// last line without a trailing newline
+	var s sseUsageScanner
+	_, _ = s.Write([]byte(strings.TrimSpace(ev)))
+	if got := s.result(); !got.found || got.in != 4 || got.out != 9 {
+		t.Fatalf("no newline: %+v", got)
+	}
+}
+
+func TestStreamReachesClientBeforeUpstreamEnds(t *testing.T) {
+	first := "data: {\"choices\":[{\"delta\":{\"content\":\"a\"}}]}\n\n"
+	rest := "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":2,\"completion_tokens\":3}}\n\ndata: [DONE]\n\n"
+	release := make(chan struct{})
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte(first))
+		w.(http.Flusher).Flush()
+		<-release
+		_, _ = w.Write([]byte(rest))
+	}))
+	defer up.Close()
+	app := newApp(Config{ProxyAPIKey: "p", UpstreamAPIKeys: []string{"k"}, UpstreamBaseURL: up.URL, MaxRequestBodyBytes: 1 << 20, RetryExhaustedAfter: time.Hour})
+	lines := captureLog(app)
+	front := httptest.NewServer(app)
+	defer front.Close()
+	req, _ := http.NewRequest(http.MethodPost, front.URL+"/v1/chat/completions", strings.NewReader(`{"model":"m"}`))
+	req.Header.Set("Authorization", "Bearer p")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	buf := make([]byte, len(first))
+	if _, err := io.ReadFull(resp.Body, buf); err != nil || string(buf) != first {
+		close(release)
+		t.Fatalf("first event: %q, %v", buf, err)
+	}
+	close(release) // the upstream was still open while the client already had the first event
+	tail, err := io.ReadAll(resp.Body)
+	if err != nil || string(buf)+string(tail) != first+rest {
+		t.Fatalf("body %q, %v", string(buf)+string(tail), err)
+	}
+	var got []map[string]any
+	for i := 0; i < 100 && len(got) == 0; i++ { // the log is written after the handler returns
+		time.Sleep(10 * time.Millisecond)
+		got = lines(t)
+	}
+	if len(got) != 1 || got[0]["tokens_in"] != float64(2) || got[0]["tokens_out"] != float64(3) {
+		t.Fatalf("log: %v", got)
+	}
+}
+
+// usageApp is an app whose tier 0 is the server answering with handler.
+func usageApp(t *testing.T, handler http.HandlerFunc) (*App, func(*testing.T) []map[string]any) {
+	t.Helper()
+	up := httptest.NewServer(handler)
+	t.Cleanup(up.Close)
+	app := newApp(Config{ProxyAPIKey: "p", UpstreamAPIKeys: []string{"k"}, UpstreamBaseURL: up.URL, MaxRequestBodyBytes: 1 << 20, RetryExhaustedAfter: time.Hour})
+	return app, captureLog(app)
+}
+
+func TestRequestLogTokensFallbackTier(t *testing.T) {
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"usage":{"prompt_tokens":11,"completion_tokens":7}}`))
+	})
+	s0, s1 := httptest.NewServer(handler), httptest.NewServer(handler)
+	defer s0.Close()
+	defer s1.Close()
+	app := newApp(Config{ProxyAPIKey: "p", UpstreamAPIKeys: []string{"k"}, UpstreamBaseURL: s0.URL, MaxRequestBodyBytes: 1 << 20, RetryExhaustedAfter: time.Hour, Tiers: []TierConfig{
+		{Name: "t1", BaseURL: s1.URL, APIKey: "tk", Free: true, Styles: []APIStyle{APIStyleOpenAI}, Models: []TierModel{{Name: "a"}}},
+	}})
+	lines := captureLog(app)
+	app.cooldowns.set(tier0CooldownKey, time.Hour)
+	if rec := tierReq(app, http.MethodPost, "/v1/chat/completions", `{"model":"a"}`, nil); rec.Code != http.StatusOK {
+		t.Fatalf("code %d", rec.Code)
+	}
+	got := lines(t)
+	if len(got) != 1 || got[0]["tier"] != "t1" || got[0]["tokens_in"] != float64(11) || got[0]["tokens_out"] != float64(7) {
+		t.Fatalf("log: %v", got)
+	}
+}
+
+func TestRequestLogUsageAboveMaxBody(t *testing.T) {
+	body := `{"usage":{"prompt_tokens":1,"completion_tokens":1},"pad":"` + strings.Repeat("x", maxUsageBody) + `"}`
+	app, lines := usageApp(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(body))
+	})
+	if rec := tierReq(app, http.MethodPost, "/v1/chat/completions", `{"model":"m"}`, nil); rec.Code != 200 || rec.Body.String() != body {
+		t.Fatalf("client got %d, %d bytes", rec.Code, rec.Body.Len())
+	}
+	got := lines(t)
+	_, in := got[0]["tokens_in"]
+	_, out := got[0]["tokens_out"]
+	if len(got) != 1 || got[0]["usage_missing"] != true || in || out {
+		t.Fatalf("log: %v", got)
+	}
+}
+
+func TestRequestLogNoUsageFieldsOnErrors(t *testing.T) {
+	for _, status := range []int{http.StatusTooManyRequests, http.StatusBadGateway} {
+		app, lines := usageApp(t, func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(status)
+			_, _ = w.Write([]byte(`{"usage":{"prompt_tokens":1,"completion_tokens":1}}`))
+		})
+		tierReq(app, http.MethodPost, "/v1/chat/completions", `{"model":"m"}`, nil)
+		got := lines(t)
+		if len(got) != 1 {
+			t.Fatalf("%d: lines %v", status, got)
+		}
+		for _, k := range []string{"tokens_in", "tokens_out", "tokens_cache_in", "usage_missing", "usage_partial"} {
+			if _, has := got[0][k]; has {
+				t.Fatalf("%d: unexpected %s: %v", status, k, got[0])
+			}
+		}
+	}
+}
+
+func TestRequestLogUsageMissingOnlyForPost(t *testing.T) {
+	app, lines := usageApp(t, func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"data":[]}`))
+	})
+	if rec := tierReq(app, http.MethodGet, "/v1/models", "", nil); rec.Code != 200 {
+		t.Fatalf("code %d", rec.Code)
+	}
+	got := lines(t)
+	if _, has := got[0]["usage_missing"]; len(got) != 1 || has {
+		t.Fatalf("log: %v", got)
+	}
+}
+
+func TestRequestLogCacheTokens(t *testing.T) {
+	cases := []struct{ name, path, body string }{
+		{"anthropic", "/v1/messages", `{"usage":{"input_tokens":3,"output_tokens":5,"cache_creation_input_tokens":100,"cache_read_input_tokens":20}}`},
+		{"openai", "/v1/chat/completions", `{"usage":{"prompt_tokens":3,"completion_tokens":5,"prompt_tokens_details":{"cached_tokens":120}}}`},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			app, lines := usageApp(t, func(w http.ResponseWriter, r *http.Request) { _, _ = w.Write([]byte(c.body)) })
+			tierReq(app, http.MethodPost, c.path, `{"model":"m"}`, nil)
+			got := lines(t)
+			if len(got) != 1 || got[0]["tokens_in"] != float64(3) || got[0]["tokens_out"] != float64(5) || got[0]["tokens_cache_in"] != float64(120) {
+				t.Fatalf("log: %v", got)
+			}
+			if _, has := got[0]["usage_partial"]; has {
+				t.Fatalf("usage_partial on a complete body: %v", got[0])
+			}
+		})
+	}
+}
+
+func TestRequestLogStreamCutKeepsPartialUsage(t *testing.T) {
+	app, lines := usageApp(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":12,\"output_tokens\":1,\"cache_read_input_tokens\":40}}}\n\n"))
+		w.(http.Flusher).Flush()
+		panic(http.ErrAbortHandler) // drops the connection mid-stream
+	})
+	tierReq(app, http.MethodPost, "/v1/messages", `{"model":"m"}`, nil)
+	got := lines(t)
+	if len(got) != 1 || got[0]["tokens_in"] != float64(12) || got[0]["tokens_out"] != float64(1) || got[0]["tokens_cache_in"] != float64(40) || got[0]["usage_partial"] != true {
+		t.Fatalf("log: %v", got)
 	}
 }

@@ -25,7 +25,7 @@ OpenAI/Anthropic-compatible app -> http://127.0.0.1:8080/v1 -> OpenCode Go
 - Automatic failover when an upstream key is exhausted
 - Automatic retry of exhausted keys after a configurable cooldown, so a
   replenished account recovers without a restart or manual reset
-- Optional YAML config, Docker, admin status, and SMTP alerts
+- Optional YAML config, Docker, admin status, and SMTP alerts (including the first use of a paid tier each day)
 
 ## Install
 
@@ -152,8 +152,9 @@ Open routes, no authentication:
 - `GET /healthz`
 - `GET /readyz`
 - `GET /status`: HTML page with the state, cooldown and usage of each key and, with `tiers:` configured, the state and
-  cooldown of each tier. It never shows key values. If the proxy has a public URL, restrict the port at
-  the network level.
+  cooldown of each tier (paid tiers also show the day's spend and `daily_cap`). Once the usage history has requests it adds a "Uso" section: today's total and the last 7
+  days per day, project, model, key and tier (tokens, requests and cost where `prices` has a price, days in the `timezone` zone). It never shows
+  key values. If the proxy has a public URL, restrict the port at the network level.
 
 See [docs/admin-api.md](docs/admin-api.md).
 

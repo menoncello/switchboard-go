@@ -23,6 +23,7 @@ func main() {
 		log.Println(safeConfigSummary(cfg))
 		warnIneligibleTiers(cfg)
 		warnNoStateFile(cfg)
+		warnNoUsageFile(cfg)
 		return
 	}
 	cfg, err := loadConfig()
@@ -31,18 +32,32 @@ func main() {
 	}
 	warnIneligibleTiers(cfg)
 	warnNoStateFile(cfg)
+	warnNoUsageFile(cfg)
 	a := newApp(cfg)
+	if err := a.startupErr(); err != nil {
+		log.Fatal(err)
+	}
 	srv := &http.Server{Addr: cfg.ListenAddr, Handler: a, ReadHeaderTimeout: 10 * time.Second, ReadTimeout: 65 * time.Second, WriteTimeout: 0, IdleTimeout: 120 * time.Second}
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
+	done := make(chan struct{})
 	go func() {
+		defer close(done)
 		<-ctx.Done()
-		shut, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		defer cancel()
-		_ = srv.Shutdown(shut)
+		shutdown(srv, a)
 	}()
 	log.Printf("startup listen_addr=%s upstream_base_url=%s upstream_keys=%d smtp_configured=%t config_source=%s max_request_body_bytes=%d retry_exhausted_after=%s response_header_timeout=%s", cfg.ListenAddr, cfg.UpstreamBaseURL, len(cfg.UpstreamAPIKeys), cfg.SMTP.Host != "" && cfg.SMTP.From != "" && cfg.SMTP.To != "", defaultString(cfg.ConfigSourcePath, "none"), cfg.MaxRequestBodyBytes, cfg.RetryExhaustedAfter, cfg.UpstreamResponseHeaderTimeout)
 	if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		log.Fatal(err)
 	}
+	<-done
+}
+
+// shutdown stops the server, then flushes the usage history so nothing recorded
+// during the drain is lost.
+func shutdown(srv *http.Server, a *App) {
+	shut, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	_ = srv.Shutdown(shut)
+	a.history.close()
 }

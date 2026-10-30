@@ -1,15 +1,18 @@
 package main
 
 import (
+	"cmp"
 	"errors"
 	"fmt"
 	"log"
+	"math"
 	"os"
 	"path/filepath"
 	"slices"
 	"strconv"
 	"strings"
 	"time"
+	_ "time/tzdata" // the binary must not depend on the OS zoneinfo
 
 	yaml "gopkg.in/yaml.v3"
 )
@@ -52,14 +55,69 @@ type Config struct {
 	// they survive a restart; empty keeps them in memory only. YAML only.
 	StateFile string
 
+	// UsageFile is where the usage history is saved (JSON); empty keeps it in memory only.
+	// Timezone is the IANA name that decides the history day (empty is UTC). YAML only.
+	UsageFile string
+	Timezone  string
+
+	// Prices is USD per 1M tokens by tier name and mapped model ID. YAML only.
+	Prices map[string]map[string]ModelPrice
+
 	// Tiers are extra free upstreams for failover; the upstream above is the
 	// implicit tier 0 and is not listed here.
 	Tiers []TierConfig
 }
 
+// ModelPrice is USD per 1M input and output tokens.
+type ModelPrice struct {
+	Input, Output float64
+}
+
+// yamlPrice is ModelPrice as written in YAML: pointers tell a missing key from an explicit 0.
+type yamlPrice struct {
+	Input  *float64 `yaml:"input"`
+	Output *float64 `yaml:"output"`
+}
+
+func convertPrices(in map[string]map[string]yamlPrice) (map[string]map[string]ModelPrice, error) {
+	var out map[string]map[string]ModelPrice
+	for tier, models := range in {
+		if out == nil {
+			out = map[string]map[string]ModelPrice{}
+		}
+		out[tier] = map[string]ModelPrice{}
+		for id, p := range models {
+			if p.Input == nil || p.Output == nil {
+				return nil, fmt.Errorf("prices: tier %q model %q: input and output are both required", tier, id)
+			}
+			out[tier][id] = ModelPrice{*p.Input, *p.Output}
+		}
+	}
+	return out, nil
+}
+
+// price returns the price of model (the client's name) in tier, looked up by the mapped ID.
+func (c Config) price(tier, model string) (ModelPrice, bool) {
+	for _, t := range c.Tiers {
+		if t.Name != tier {
+			continue
+		}
+		for _, m := range t.Models {
+			if m.Name == model {
+				id := cmp.Or(m.ID, m.Name)
+				p, ok := c.Prices[tier][id]
+				return p, ok
+			}
+		}
+	}
+	return ModelPrice{}, false
+}
+
 type TierConfig struct {
 	Name, BaseURL, APIKey string
 	Free                  bool
+	// DailyCap is the USD spent per day (the usage_file day) after which a paid tier is skipped.
+	DailyCap float64
 	// Cooldown is how long the tier is skipped after a failure status; nil means
 	// RetryExhaustedAfter, 0 means failover only for the request that failed.
 	Cooldown *time.Duration
@@ -154,9 +212,12 @@ type yamlConfig struct {
 	Limits struct {
 		MaxRequestBodyBytes int64 `yaml:"max_request_body_bytes"`
 	} `yaml:"limits"`
-	MinContext *int       `yaml:"min_context"`
-	StateFile  string     `yaml:"state_file"`
-	Tiers      []yamlTier `yaml:"tiers"`
+	MinContext *int                            `yaml:"min_context"`
+	StateFile  string                          `yaml:"state_file"`
+	UsageFile  string                          `yaml:"usage_file"`
+	Timezone   string                          `yaml:"timezone"`
+	Prices     map[string]map[string]yamlPrice `yaml:"prices"`
+	Tiers      []yamlTier                      `yaml:"tiers"`
 }
 
 type yamlTier struct {
@@ -164,6 +225,7 @@ type yamlTier struct {
 	BaseURL  string    `yaml:"base_url"`
 	APIKey   string    `yaml:"api_key"`
 	Free     bool      `yaml:"free"`
+	DailyCap float64   `yaml:"daily_cap"`
 	Cooldown string    `yaml:"cooldown"`
 	Styles   []string  `yaml:"styles"`
 	Models   yaml.Node `yaml:"models"`
@@ -172,7 +234,7 @@ type yamlTier struct {
 func convertTiers(in []yamlTier) ([]TierConfig, error) {
 	var out []TierConfig
 	for i, yt := range in {
-		t := TierConfig{Name: yt.Name, BaseURL: yt.BaseURL, APIKey: yt.APIKey, Free: yt.Free}
+		t := TierConfig{Name: yt.Name, BaseURL: yt.BaseURL, APIKey: yt.APIKey, Free: yt.Free, DailyCap: yt.DailyCap}
 		if s := strings.TrimSpace(yt.Cooldown); s != "" {
 			d, err := time.ParseDuration(s)
 			if err != nil {
@@ -265,7 +327,11 @@ func loadYAMLConfig(path string) (Config, error) {
 	if err != nil {
 		return Config{}, err
 	}
-	return Config{Tiers: tiers, MinContext: minContext, StateFile: strings.TrimSpace(yc.StateFile), ListenAddr: yc.Server.ListenAddr, UpstreamBaseURL: yc.Upstream.BaseURL, ProxyAPIKey: yc.Server.ProxyAPIKey, UpstreamAPIKeys: yc.Upstream.APIKeys, MaxRequestBodyBytes: yc.Limits.MaxRequestBodyBytes, RetryExhaustedAfter: retry, UpstreamResponseHeaderTimeout: headerTimeout, SMTP: SMTPConfig{Host: yc.SMTP.Host, Port: yc.SMTP.Port, Username: yc.SMTP.Username, Password: yc.SMTP.Password, From: yc.SMTP.From, To: yc.SMTP.To, TLS: yc.SMTP.TLS, StartTLS: yc.SMTP.StartTLS}, Telegram: TelegramConfig{BotToken: yc.Telegram.BotToken, ChatID: yc.Telegram.ChatID}}, nil
+	prices, err := convertPrices(yc.Prices)
+	if err != nil {
+		return Config{}, err
+	}
+	return Config{Tiers: tiers, MinContext: minContext, StateFile: strings.TrimSpace(yc.StateFile), UsageFile: strings.TrimSpace(yc.UsageFile), Timezone: strings.TrimSpace(yc.Timezone), Prices: prices, ListenAddr: yc.Server.ListenAddr, UpstreamBaseURL: yc.Upstream.BaseURL, ProxyAPIKey: yc.Server.ProxyAPIKey, UpstreamAPIKeys: yc.Upstream.APIKeys, MaxRequestBodyBytes: yc.Limits.MaxRequestBodyBytes, RetryExhaustedAfter: retry, UpstreamResponseHeaderTimeout: headerTimeout, SMTP: SMTPConfig{Host: yc.SMTP.Host, Port: yc.SMTP.Port, Username: yc.SMTP.Username, Password: yc.SMTP.Password, From: yc.SMTP.From, To: yc.SMTP.To, TLS: yc.SMTP.TLS, StartTLS: yc.SMTP.StartTLS}, Telegram: TelegramConfig{BotToken: yc.Telegram.BotToken, ChatID: yc.Telegram.ChatID}}, nil
 }
 
 func mergeConfig(dst *Config, src Config) {
@@ -289,6 +355,15 @@ func mergeConfig(dst *Config, src Config) {
 	}
 	if src.StateFile != "" {
 		dst.StateFile = src.StateFile
+	}
+	if src.UsageFile != "" {
+		dst.UsageFile = src.UsageFile
+	}
+	if src.Timezone != "" {
+		dst.Timezone = src.Timezone
+	}
+	if len(src.Prices) > 0 {
+		dst.Prices = src.Prices
 	}
 	if src.MinContext >= 0 {
 		dst.MinContext = src.MinContext
@@ -444,7 +519,87 @@ func validateConfig(cfg Config) error {
 	if cfg.UsageCacheTTL < 0 {
 		return errors.New("USAGE_CACHE_TTL must be >= 0")
 	}
-	return validateTiers(cfg.Tiers)
+	if cfg.Timezone != "" {
+		_, err := time.LoadLocation(cfg.Timezone)
+		if err == nil && cfg.Timezone == "Local" {
+			err = errors.New("depends on the host time zone, use an IANA name")
+		}
+		if err != nil {
+			return fmt.Errorf("timezone %q: %w", cfg.Timezone, err)
+		}
+	}
+	if err := validateTiers(cfg.Tiers); err != nil {
+		return err
+	}
+	if err := validatePrices(cfg); err != nil {
+		return err
+	}
+	return validatePaidTiers(cfg)
+}
+
+// validatePaidTiers requires a finite daily_cap > 0, usage_file and a price for every model of a paid tier,
+// and rejects daily_cap on a free one.
+func validatePaidTiers(cfg Config) error {
+	for _, t := range cfg.Tiers {
+		if t.Free {
+			if t.DailyCap != 0 {
+				return fmt.Errorf("tier %q: daily_cap is only for paid tiers (remove it or drop free: true)", t.Name)
+			}
+			continue
+		}
+		if !(t.DailyCap > 0) || math.IsInf(t.DailyCap, 0) { // also rejects NaN
+			return fmt.Errorf("tier %q: a tier without free: true needs daily_cap, finite and > 0 (USD per day)", t.Name)
+		}
+		if strings.TrimSpace(cfg.UsageFile) == "" {
+			return fmt.Errorf("tier %q: a tier without free: true needs usage_file (the daily spend is read from it)", t.Name)
+		}
+		for _, m := range t.Models {
+			id := cmp.Or(m.ID, m.Name)
+			p, ok := cfg.Prices[t.Name][id]
+			if !ok {
+				return fmt.Errorf("tier %q model %q: a tier without free: true needs a price in prices", t.Name, id)
+			}
+			if p.Input <= 0 && p.Output <= 0 {
+				return fmt.Errorf("tier %q model %q: a tier without free: true needs input or output price > 0 (the cap would never accrue)", t.Name, id)
+			}
+		}
+	}
+	return nil
+}
+
+// maxPrice is the highest input or output price (USD per 1M tokens) in prices: the
+// worst-case cost charged to a paid tier response with no usage.
+func (c Config) maxPrice() float64 {
+	var m float64
+	for _, models := range c.Prices {
+		for _, p := range models {
+			m = max(m, p.Input, p.Output)
+		}
+	}
+	return m
+}
+
+// paidTier reports whether name is a configured tier without free: true.
+func (c Config) paidTier(name string) bool {
+	return slices.ContainsFunc(c.Tiers, func(t TierConfig) bool { return t.Name == name && !t.Free })
+}
+
+func validatePrices(cfg Config) error {
+	for tier, models := range cfg.Prices {
+		i := slices.IndexFunc(cfg.Tiers, func(t TierConfig) bool { return t.Name == tier })
+		if i < 0 {
+			return fmt.Errorf("prices: tier %q is not in tiers (tier 0 has no price)", tier)
+		}
+		for id, p := range models {
+			if !slices.ContainsFunc(cfg.Tiers[i].Models, func(m TierModel) bool { return cmp.Or(m.ID, m.Name) == id }) {
+				return fmt.Errorf("prices: tier %q model %q: no model of the tier maps to this id", tier, id)
+			}
+			if !(p.Input >= 0 && p.Output >= 0) || math.IsInf(p.Input, 0) || math.IsInf(p.Output, 0) { // also rejects NaN
+				return fmt.Errorf("prices: tier %q model %q: input and output must be finite and >= 0", tier, id)
+			}
+		}
+	}
+	return nil
 }
 
 func validateTiers(tiers []TierConfig) error {
@@ -453,6 +608,9 @@ func validateTiers(tiers []TierConfig) error {
 		name := strings.TrimSpace(t.Name)
 		if name == "" {
 			return fmt.Errorf("tiers[%d]: name is required", i)
+		}
+		if name == tier0Name {
+			return fmt.Errorf("tier %q: name is reserved for tier 0", t.Name)
 		}
 		if names[name] {
 			return fmt.Errorf("tier %q: duplicate name", t.Name)
@@ -463,9 +621,6 @@ func validateTiers(tiers []TierConfig) error {
 		}
 		if strings.TrimSpace(t.APIKey) == "" {
 			return fmt.Errorf("tier %q: api_key is required", t.Name)
-		}
-		if !t.Free {
-			return fmt.Errorf("tier %q: free must be true (only free tiers are allowed)", t.Name)
 		}
 		if t.Cooldown != nil && *t.Cooldown < 0 {
 			return fmt.Errorf("tier %q: cooldown must be >= 0", t.Name)
@@ -522,5 +677,11 @@ func warnIneligibleTiers(cfg Config) {
 func warnNoStateFile(cfg Config) {
 	if cfg.StateFile == "" {
 		log.Printf("warning: state_file is not set; tier cooldowns and exhausted keys are lost on restart")
+	}
+}
+
+func warnNoUsageFile(cfg Config) {
+	if cfg.UsageFile == "" {
+		log.Printf("warning: usage_file is not set; the usage history is kept in memory and lost on restart")
 	}
 }

@@ -53,8 +53,10 @@ docker run --rm \
   switchboard-go
 ```
 
-with `state_file: "/state/state.json"` in `config.yaml`. The proxy writes a
-temporary file next to it and renames it, so mount the directory, not the file.
+with `state_file: "/state/state.json"` in `config.yaml`. The usage history can use
+the same volume with `usage_file: "/state/usage.json"`. The proxy writes a
+temporary file next to each of them and renames it, so mount the directory, not
+the file.
 
 The Docker image uses a multi-stage Go build and a distroless non-root runtime
 image.

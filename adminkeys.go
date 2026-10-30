@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"cmp"
 	"context"
 	"encoding/json"
 	"errors"
@@ -12,6 +13,7 @@ import (
 	"math"
 	"net/http"
 	"net/url"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -230,14 +232,24 @@ var statusTmpl = template.Must(template.New("status").Funcs(template.FuncMap{
 {{if .UsageError}}<td colspan="3">erro de uso: {{.UsageError}}</td>{{else}}<td>{{pct .Usage.Rolling}}</td><td>{{pct .Usage.Weekly}}</td><td>{{pct .Usage.Monthly}}</td>{{end}}</tr>
 {{end}}</table>
 {{if .Tiers}}<h2>Tiers</h2>
-<table><tr><th>Tier</th><th>Estado</th><th>Cooldown</th></tr>
-{{range .Tiers}}<tr><td>{{.Name}}</td><td>{{.State}}</td><td>{{if .RemainingSeconds}}{{.RemainingSeconds}}s{{else}}—{{end}}</td></tr>
-{{end}}</table>{{end}}</body></html>
+<table><tr><th>Tier</th><th>Estado</th><th>Cooldown</th><th>Gasto / teto do dia</th></tr>
+{{range .Tiers}}<tr><td>{{.Name}}</td><td>{{.State}}</td><td>{{if .RemainingSeconds}}{{.RemainingSeconds}}s{{else}}—{{end}}</td><td>{{if .Cap}}{{.Spend}}{{else}}—{{end}}</td></tr>
+{{end}}</table>{{end}}{{with .Usage}}
+<h2>Uso</h2>
+<p>Hoje ({{.Today}}, {{.Timezone}}): {{.Total.Requests}} requests, {{.Total.TokensIn}} tokens in, {{.Total.TokensOut}} tokens out, {{.Total.TokensCacheIn}} tokens cache, custo {{.Total.Cost}}.</p>
+<details><summary>Últimos 7 dias</summary>
+{{range .Dims}}<h3>{{.Title}}</h3>
+<table><tr><th>{{.Title}}</th><th>Requests</th><th>Tokens in</th><th>Tokens out</th><th>Tokens cache</th><th>Sem usage</th><th>Custo</th></tr>
+{{range .Rows}}<tr><td>{{.Label}}</td><td>{{.Requests}}</td><td>{{.TokensIn}}</td><td>{{.TokensOut}}</td><td>{{.TokensCacheIn}}</td><td>{{.NoUsage}}</td><td>{{.Cost}}</td></tr>
+{{end}}</table>
+{{end}}</details>{{end}}</body></html>
 `))
 
 type tierRow struct {
 	Name, State      string
 	RemainingSeconds int
+	Cap              float64 // paid tiers only
+	Spend            string  // "US$ x / US$ y"
 }
 
 // statusPage is the keys report plus, when the config has extra tiers, one row per
@@ -245,6 +257,116 @@ type tierRow struct {
 type statusPage struct {
 	KeysReportResponse
 	Tiers []tierRow
+	Usage *usageReport
+}
+
+type usageLine struct {
+	Label                                                 string
+	Requests, TokensIn, TokensOut, TokensCacheIn, NoUsage int
+	CostUSD                                               float64
+	Priced                                                int
+}
+
+// Cost is "—" without priced requests, the amount when all are priced, else the
+// amount and how many were.
+func (l usageLine) Cost() string {
+	f := "%.4f"
+	if l.CostUSD > 0 && l.CostUSD < 0.0001 {
+		f = "%.6f" // a tiny cost must not read as zero
+	}
+	switch {
+	case l.Priced == 0:
+		return "—"
+	case l.Priced == l.Requests:
+		return fmt.Sprintf("US$ "+f, l.CostUSD)
+	}
+	return fmt.Sprintf("US$ "+f+" (%d/%d com preço)", l.CostUSD, l.Priced, l.Requests)
+}
+
+type usageDim struct {
+	Title string
+	Rows  []usageLine
+}
+
+// usageReport is the usage section of /status: today's total and the last 7 days
+// per dimension. Only names already stored in the history, never key values.
+type usageReport struct {
+	Timezone, Today string
+	Total           usageLine
+	Dims            []usageDim
+}
+
+func (a *App) usageReport() *usageReport {
+	today, rows := a.history.window(7)
+	if len(rows) == 0 {
+		return nil
+	}
+	rep := &usageReport{Timezone: a.history.loc.String(), Today: today}
+	dims := []struct {
+		title string
+		by    func(usageRow) string
+	}{
+		{"Dia", func(r usageRow) string { return r.Day }},
+		{"Projeto", func(r usageRow) string {
+			if r.Project == "" {
+				return noProject
+			}
+			return r.Project
+		}},
+		{"Modelo", func(r usageRow) string { return r.Model }},
+		{"Chave", func(r usageRow) string {
+			if r.Key == "" {
+				return "—"
+			}
+			return r.Key
+		}},
+		{"Tier", func(r usageRow) string { return r.Tier }},
+	}
+	for i, d := range dims {
+		sums := map[string]*usageLine{}
+		for _, r := range rows {
+			l := sums[d.by(r)]
+			if l == nil {
+				l = &usageLine{Label: d.by(r)}
+				sums[d.by(r)] = l
+			}
+			l.Requests += r.Requests
+			l.TokensIn += r.TokensIn
+			l.TokensOut += r.TokensOut
+			l.TokensCacheIn += r.TokensCacheIn
+			l.NoUsage += r.NoUsage
+			l.CostUSD += r.CostUSD
+			l.Priced += r.Priced
+		}
+		lines := make([]usageLine, 0, len(sums))
+		for _, l := range sums {
+			lines = append(lines, *l)
+		}
+		slices.SortFunc(lines, func(x, y usageLine) int {
+			if i == 0 { // days: newest first
+				return strings.Compare(y.Label, x.Label)
+			}
+			return cmp.Or(cmp.Compare(y.Requests, x.Requests), strings.Compare(x.Label, y.Label))
+		})
+		rep.Dims = append(rep.Dims, usageDim{d.title, lines})
+		if i == 0 {
+			for _, l := range lines {
+				if l.Label == today {
+					rep.Total = l
+				}
+			}
+		}
+	}
+	return rep
+}
+
+func (a *App) tierConfig(name string) *TierConfig {
+	for i := range a.config.Tiers {
+		if a.config.Tiers[i].Name == name {
+			return &a.config.Tiers[i]
+		}
+	}
+	return nil
 }
 
 func (a *App) tierRows() []tierRow {
@@ -257,6 +379,7 @@ func (a *App) tierRows() []tierRow {
 	}
 	rows := make([]tierRow, len(names))
 	for i, n := range names {
+		var capped bool
 		rows[i] = tierRow{Name: n, State: "ok"}
 		if n == tier0CooldownKey {
 			rows[i].Name = "OpenCode Go (tier 0)"
@@ -268,8 +391,18 @@ func (a *App) tierRows() []tierRow {
 				d = kd
 			}
 		}
+		if t := a.tierConfig(n); t != nil && !t.Free {
+			spent := a.history.spent(n)
+			rows[i].Cap, rows[i].Spend = t.DailyCap, fmt.Sprintf("US$ %.4f / US$ %.4f", spent, t.DailyCap)
+			if capped = spent >= t.DailyCap; capped {
+				d = max(d, a.history.untilMidnight())
+			}
+		}
 		if d > 0 {
 			rows[i].State, rows[i].RemainingSeconds = "cooldown", int(math.Ceil(d.Seconds()))
+			if capped {
+				rows[i].State = "teto"
+			}
 		}
 	}
 	return rows
@@ -277,7 +410,7 @@ func (a *App) tierRows() []tierRow {
 
 func (a *App) handleStatusPage(w http.ResponseWriter, r *http.Request) {
 	var buf bytes.Buffer
-	if err := statusTmpl.Execute(&buf, statusPage{a.buildKeysReport(r.Context()), a.tierRows()}); err != nil {
+	if err := statusTmpl.Execute(&buf, statusPage{a.buildKeysReport(r.Context()), a.tierRows(), a.usageReport()}); err != nil {
 		log.Printf("status page render failed: %v", err)
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return

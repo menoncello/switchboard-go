@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"maps"
 	"math"
 	"net/http"
 	"slices"
@@ -33,6 +34,29 @@ func truncateModel(model string) string {
 		cut--
 	}
 	return model[:cut]
+}
+
+// projectHeader names the project in the request log; the proxy consumes it and never forwards it.
+const projectHeader = "X-Project"
+
+const (
+	maxProjectLen = 64
+	noProject     = "sem projeto"
+)
+
+// requestProject returns the X-Project value when it is 1 to maxProjectLen characters of [A-Za-z0-9._-], else noProject.
+func requestProject(h http.Header) string {
+	v := h.Get(projectHeader)
+	if v == "" || len(v) > maxProjectLen {
+		return noProject
+	}
+	for i := 0; i < len(v); i++ {
+		c := v[i]
+		if !(c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' || c == '.' || c == '_' || c == '-') {
+			return noProject
+		}
+	}
+	return v
 }
 
 type APIStyle int
@@ -77,7 +101,7 @@ func (a *App) proxyV1(w http.ResponseWriter, r *http.Request, style APIStyle) {
 	// Limit with the original writer so net/http still sees an oversized body and closes the connection.
 	r.Body = http.MaxBytesReader(w, r.Body, a.config.MaxRequestBodyBytes)
 	rec := &statusRecorder{ResponseWriter: w}
-	model, tier, keyIdx := a.serveProxy(rec, r, style)
+	model, tier, keyIdx, usage, held := a.serveProxy(rec, r, style)
 	if rec.status == 0 {
 		rec.status = http.StatusOK
 	}
@@ -86,17 +110,53 @@ func (a *App) proxyV1(w http.ResponseWriter, r *http.Request, style APIStyle) {
 		apiStyle = "anthropic"
 	}
 	model = truncateModel(model)
-	attrs := []any{"model", model, "api_style", apiStyle, "tier", tier}
+	usageMissing := !usage.found && rec.status/100 == 2 && r.Method == http.MethodPost // GET /v1/models has no usage by nature
+	attrs := []any{"model", model, "api_style", apiStyle, "tier", tier, "project", requestProject(r.Header)}
 	if keyIdx >= 0 {
 		attrs = append(attrs, "key_index", keyIdx, "key_name", a.config.keyName(keyIdx))
 	}
 	attrs = append(attrs, "status", rec.status, "latency_ms", time.Since(start).Milliseconds())
+	if usage.found {
+		attrs = append(attrs, "tokens_in", usage.in, "tokens_out", usage.out)
+		if usage.cache > 0 {
+			attrs = append(attrs, "tokens_cache_in", usage.cache)
+		}
+		if usage.partial {
+			attrs = append(attrs, "usage_partial", true)
+		}
+	} else if tier != "" && usageMissing {
+		attrs = append(attrs, "usage_missing", true)
+	}
+	// Only a POST a tier served counts: not held failures, GET /v1/models or a request without model.
+	if tier != "" && !held && r.Method == http.MethodPost && model != "" {
+		key := ""
+		if keyIdx >= 0 {
+			if key = a.config.keyName(keyIdx); key == "" {
+				key = "key-" + strconv.Itoa(keyIdx)
+			}
+		}
+		var price *ModelPrice
+		if p, ok := a.config.price(tier, model); ok {
+			price = &p
+		}
+		var worst float64
+		if usageMissing && a.config.paidTier(tier) {
+			worst = a.config.maxPrice()
+		}
+		a.history.record(requestProject(r.Header), model, key, tier, usage, usageMissing, price, worst)
+		if a.config.paidTier(tier) {
+			if day, first := a.history.firstUse(tier); first {
+				a.sender.NotifyPaidFirstUse(tier, model, day)
+			}
+		}
+	}
 	a.logger.Info("request", attrs...)
 }
 
 // serveProxy does the work of proxyV1 and returns what the log line needs: the
-// top-level model, the tier that answered ("" when none did) and the tier 0 key index (-1 when tier 0 did not answer).
-func (a *App) serveProxy(w http.ResponseWriter, r *http.Request, style APIStyle) (model, tier string, keyIdx int) {
+// top-level model, the tier that answered ("" when none did), the tier 0 key index (-1 when tier 0 did not answer)
+// and the tokens the response reported.
+func (a *App) serveProxy(w http.ResponseWriter, r *http.Request, style APIStyle) (model, tier string, keyIdx int, usage usageTokens, held bool) {
 	keyIdx = -1
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
@@ -127,7 +187,7 @@ func (a *App) serveProxy(w http.ResponseWriter, r *http.Request, style APIStyle)
 			if reqErr != nil {
 				if orig.Err() != nil {
 					w.WriteHeader(statusClientClosed)
-					return model, "", -1
+					return model, "", -1, usageTokens{}, false
 				}
 				// Connection error or timeout: no cooldown, no key rotation, on to the extra tiers.
 				last.err = reqErr
@@ -152,17 +212,16 @@ func (a *App) serveProxy(w http.ResponseWriter, r *http.Request, style APIStyle)
 				break
 			}
 			a.telegram.rearm()
-			copyResponse(w, resp)
-			return model, tier0Name, idx
+			return model, tier0Name, idx, copyResponse(w, resp), false
 		}
 	}
-	if name, ok := a.proxyTiers(orig, w, r, fields, model, style, needTools, &last); ok {
+	if name, tokens, ok := a.proxyTiers(orig, w, r, fields, model, style, needTools, &last); ok {
 		a.telegram.rearm()
-		return model, name, -1
+		return model, name, -1, tokens, false
 	}
 	if orig.Err() != nil {
 		w.WriteHeader(statusClientClosed)
-		return model, "", -1
+		return model, "", -1, usageTokens{}, false
 	}
 	a.telegram.notifyFailure(model)
 	// No tier served it; alert once when every tier 0 key is exhausted.
@@ -170,12 +229,11 @@ func (a *App) serveProxy(w http.ResponseWriter, r *http.Request, style APIStyle)
 		a.sender.NotifyAllExhausted(a.keys.Status())
 	}
 	if last.resp != nil {
-		copyResponse(w, last.resp)
-		return model, last.tier, last.key
+		return model, last.tier, last.key, copyResponse(w, last.resp), true
 	}
 	if last.err != nil {
 		http.Error(w, "upstream unreachable", http.StatusBadGateway) // fixed text: the error would leak the tier URL
-		return model, "", -1
+		return model, "", -1, usageTokens{}, false
 	}
 	// No eligible tier remains. Fail fast locally instead of hammering upstream,
 	// and hint well-behaved clients at the first window via Retry-After.
@@ -183,7 +241,7 @@ func (a *App) serveProxy(w http.ResponseWriter, r *http.Request, style APIStyle)
 		w.Header().Set("Retry-After", strconv.Itoa(secs))
 	}
 	writeAPIError(w, style, http.StatusTooManyRequests, "rate_limit_exceeded", "all upstream keys exhausted")
-	return model, "", -1
+	return model, "", -1, usageTokens{}, false
 }
 
 // heldResponse is the last failure response seen, kept so the client can get it
@@ -227,12 +285,36 @@ func (a *App) localRetryAfter(model string, style APIStyle, needTools bool) (int
 			if _, ok := tierModelID(t, model, style, a.config.MinContext, needTools); !ok {
 				continue
 			}
-			if d := a.cooldowns.remaining(t.Name); d > 0 && d < soonest {
+			d := a.cooldowns.remaining(t.Name)
+			if a.tierCapped(t) {
+				d = max(d, a.history.untilMidnight())
+			}
+			if d > 0 && d < soonest {
 				soonest = d
 			}
 		}
 	}
 	return max(1, int(math.Ceil(soonest.Seconds()))), true
+}
+
+// tierCapped reports whether a paid tier has spent its daily cap.
+func (a *App) tierCapped(t TierConfig) bool {
+	return !t.Free && a.history.spent(t.Name) >= t.DailyCap
+}
+
+// withIncludeUsage returns fields with stream_options.include_usage set to true, keeping other
+// stream_options keys. fields is not changed.
+func withIncludeUsage(fields map[string]json.RawMessage) map[string]json.RawMessage {
+	opts := map[string]json.RawMessage{}
+	_ = json.Unmarshal(fields["stream_options"], &opts) // not an object (or null): start empty
+	if opts == nil {
+		opts = map[string]json.RawMessage{}
+	}
+	opts["include_usage"] = json.RawMessage("true")
+	raw, _ := json.Marshal(opts)
+	out := maps.Clone(fields)
+	out["stream_options"] = raw
+	return out
 }
 
 // isTierFailure reports whether resp means the whole tier is unhealthy and the
@@ -263,18 +345,23 @@ func isTierFailure(resp *http.Response, hasModel bool) bool {
 // cooldown and its response kept in last; a connection error or timeout only
 // records the error in last and moves on, with no cooldown. A request without a top-level string
 // "model" stays on tier 0.
-func (a *App) proxyTiers(ctx context.Context, w http.ResponseWriter, r *http.Request, fields map[string]json.RawMessage, model string, style APIStyle, needTools bool, last *heldResponse) (string, bool) {
+func (a *App) proxyTiers(ctx context.Context, w http.ResponseWriter, r *http.Request, fields map[string]json.RawMessage, model string, style APIStyle, needTools bool, last *heldResponse) (string, usageTokens, bool) {
 	if model == "" {
-		return "", false
+		return "", usageTokens{}, false
 	}
 	for _, t := range a.config.Tiers {
 		id, ok := tierModelID(t, model, style, a.config.MinContext, needTools)
-		if !ok || a.cooldowns.remaining(t.Name) > 0 {
+		if !ok || a.cooldowns.remaining(t.Name) > 0 || a.tierCapped(t) {
 			continue
 		}
 		raw, _ := json.Marshal(id)
-		fields["model"] = raw
-		tierBody, err := json.Marshal(fields)
+		tf := maps.Clone(fields) // per tier: the next tier must not see this tier's edits
+		tf["model"] = raw
+		var stream bool
+		if !t.Free && style == APIStyleOpenAI && json.Unmarshal(fields["stream"], &stream) == nil && stream {
+			tf = withIncludeUsage(tf)
+		}
+		tierBody, err := json.Marshal(tf)
 		if err != nil {
 			continue
 		}
@@ -282,7 +369,7 @@ func (a *App) proxyTiers(ctx context.Context, w http.ResponseWriter, r *http.Req
 		if err != nil {
 			last.err = errors.New("tier upstream unreachable")
 			if ctx.Err() != nil {
-				return "", false
+				return "", usageTokens{}, false
 			}
 			continue
 		}
@@ -295,10 +382,9 @@ func (a *App) proxyTiers(ctx context.Context, w http.ResponseWriter, r *http.Req
 			last.hold(resp, t.Name, -1)
 			continue
 		}
-		copyResponse(w, resp)
-		return t.Name, true
+		return t.Name, copyResponse(w, resp), true
 	}
-	return "", false
+	return "", usageTokens{}, false
 }
 
 // topLevelModel parses body once and returns its fields and the top-level string
@@ -382,7 +468,7 @@ func apiStyleForRequest(r *http.Request) APIStyle {
 
 func copyHeaders(dst, src http.Header) {
 	for k, v := range src {
-		if strings.EqualFold(k, "Authorization") || strings.EqualFold(k, "x-api-key") {
+		if strings.EqualFold(k, "Authorization") || strings.EqualFold(k, "x-api-key") || strings.EqualFold(k, projectHeader) {
 			continue
 		}
 		for _, s := range v {
@@ -405,7 +491,9 @@ func stripHopByHopHeaders(h http.Header) {
 	}
 }
 
-func copyResponse(w http.ResponseWriter, resp *http.Response) {
+// copyResponse relays resp to w and returns the tokens its `usage` reported (found only for a 2xx
+// body without Content-Encoding). Reading usage never changes the bytes or the flushes the client gets.
+func copyResponse(w http.ResponseWriter, resp *http.Response) usageTokens {
 	defer resp.Body.Close()
 	stripHopByHopHeaders(resp.Header)
 	for k, v := range resp.Header {
@@ -418,21 +506,45 @@ func copyResponse(w http.ResponseWriter, resp *http.Response) {
 	flusher, canFlush := w.(http.Flusher)
 	isStream := strings.Contains(strings.ToLower(resp.Header.Get("Content-Type")), "text/event-stream")
 
-	if canFlush && isStream {
+	track := resp.StatusCode/100 == 2 && resp.Header.Get("Content-Encoding") == ""
+	var sse sseUsageScanner
+	var jsonBuf cappedBuffer
+	var readErr error // why the stream ended: nil or io.EOF is a clean end
+	switch {
+	case canFlush && isStream:
 		buf := make([]byte, 4096)
 		for {
 			n, err := resp.Body.Read(buf)
 			if n > 0 {
 				_, _ = w.Write(buf[:n])
 				flusher.Flush()
+				if track {
+					_, _ = sse.Write(buf[:n])
+				}
 			}
 			if err != nil {
+				readErr = err
 				break
 			}
 		}
-	} else {
+	case track && isStream:
+		_, readErr = io.Copy(io.MultiWriter(w, &sse), resp.Body)
+	case track:
+		_, _ = io.Copy(io.MultiWriter(w, &jsonBuf), resp.Body)
+	default:
 		_, _ = io.Copy(w, resp.Body)
 	}
+	switch {
+	case !track:
+		return usageTokens{}
+	case isStream:
+		t := sse.result()
+		t.partial = t.found && readErr != nil && readErr != io.EOF
+		return t
+	case jsonBuf.overflow:
+		return usageTokens{}
+	}
+	return parseUsage(jsonBuf.b.Bytes())
 }
 
 // peekBody returns the first 4096 bytes of resp.Body and leaves the whole body

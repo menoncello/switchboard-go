@@ -87,6 +87,16 @@ min_context: 64000
 # File where tier cooldowns and exhausted tier 0 keys are saved (see below).
 state_file: "/var/lib/switchboard-go/state.json"
 
+# File for the usage history and the IANA time zone that decides the day
+# (default UTC); see "Usage history" below.
+usage_file: "/var/lib/switchboard-go/usage.json"
+timezone: "America/Sao_Paulo"
+
+# USD per 1M tokens, by tier name and mapped model id (see "Usage history").
+prices:
+  nome-do-tier:
+    id-do-modelo: {input: 0.5, output: 1.5}
+
 tiers:
   - name: "free-provider"
     base_url: "https://api.example.com/v1"
@@ -98,6 +108,13 @@ tiers:
         id: "provider/model-a"
         context: 131072
         tools: true
+  # A paid tier: no `free: true`, so it needs daily_cap, usage_file and a price per model.
+  - name: "nome-do-tier"
+    base_url: "https://paid.example.com/v1"
+    api_key: "sk-paid"
+    daily_cap: 5
+    models:
+      id-do-modelo: {context: 131072}
 ```
 
 ## State file
@@ -113,13 +130,73 @@ Entries whose cooldown has ended are not restored. With `retry_exhausted_after: 
 no key is saved, since exhausted keys have no cooldown. A missing or invalid file at
 startup is logged and the proxy starts without state; a write failure is logged
 and does not affect the request. Without `state_file` nothing is saved and
-startup (and `validate-config`) logs a warning. Daily spend is not persisted.
+startup (and `validate-config`) logs a warning. The usage history lives in its own file (see below).
+
+## Usage history
+
+`usage_file` and `timezone` (top-level, YAML only, no environment variable) turn
+on a per-request usage history that survives restarts. Each request served by a
+tier adds to one row per day, project (`X-Project`), model, key and tier
+(a key shows as its `key_name`, or `key-<index>` when unnamed; empty for extra
+tiers). Only POST requests a tier served are counted: responses nobody served
+(429, 502, 499, 413, 400), an upstream failure held and returned after every tier
+failed, `GET /v1/models` and requests without a `model` are not.
+A row counts `requests`, `tokens_in`, `tokens_out`, `tokens_cache_in` and
+`no_usage` (2xx POST responses without a `usage` field), plus `cost_usd` and `priced` (see `prices` below). The file is JSON:
+
+```json
+{"rows":[{"day":"2026-10-29","project":"sem projeto","model":"glm-5.1","key":"main","tier":"opencode-go","requests":2,"tokens_in":120,"tokens_out":30,"tokens_cache_in":0,"no_usage":0,"cost_usd":0,"priced":0}]}
+```
+
+The day is computed in `timezone` (an IANA name such as `America/Sao_Paulo`;
+default UTC; an invalid name is rejected at startup). Rows store only the day
+string, so changing `timezone` between restarts mixes days computed in two zones
+in the same file. Rows older than 90 days are
+dropped when the file is loaded and written. The file is written a few seconds
+(3 s) after the first request that changed it, not on every request, and again on
+shutdown (SIGINT/SIGTERM). The write goes to a temporary file in the same
+directory and is renamed, so the directory must be writable; a write failure is
+logged and does not affect the request. A missing or invalid file at startup is
+logged, the file is renamed to `<usage_file>.bad` (so the next write does not
+destroy it) and the history starts empty. Without `usage_file` the history stays in
+memory and startup (and `validate-config`) logs a warning.
+
+The first request a paid tier (`free` not set) serves each day sends one SMTP
+email (the `smtp` config) naming the tier and the model. The day it was sent is
+saved per tier under `alerts` in `usage_file` (`{"rows":[...],"alerts":{"tier":"2026-10-29"}}`),
+so a restart does not repeat it, as long as `usage_file` is set (without it the
+mark lives only in memory). The file is written up to 3 s after the request, so a
+crash before that write can repeat the email on restart. The day is marked before
+sending, so a failed send is only logged and is not retried that day. Free tiers
+never send it.
+
+`GET /status` shows this history in a "Uso" section below the tiers: today's
+total (requests, tokens and cost, with the `timezone` zone) and, inside a `<details>`,
+one table per day, project, model, key and tier for the last 7 days (today plus
+the 6 before), each with a "Custo" column. The section is left out while
+the window has no request.
+
+### Prices and cost
+
+`prices` (top-level, YAML only) gives USD per 1M tokens: `prices.<tier>.<mapped model id>`
+with `input` and `output`, both required (an explicit `0` is valid, a missing or misspelled
+key is rejected). The key is the tier `name` and the model `id` the tier maps
+the client's model to (the model name when `id` is empty); a tier that is not in
+`tiers` (tier 0 included, it has no price), an id that no model of the tier maps to, or a
+negative value is rejected at startup.
+A request costs `(tokens_in * input + tokens_out * output) / 1e6`. Cache tokens have
+no price of their own: they count in `tokens_in` as the response reports them. The cost is
+written to the row when the request is served, so changing `prices` later does not
+rewrite the past. A response without `usage` costs 0 on a free tier and the worst case on a paid tier (see "Paid tiers"); both still count as priced.
+`priced` counts the requests that had a price. In the report a model without price shows
+`—`; a line mixing priced and unpriced requests shows `US$ x (n/m com preço)`. Prices are
+optional per model on free tiers (a paid tier needs a price for every model, see "Paid tiers"). Rows from files written before this feature load with no cost and
+no price.
 
 ## Tiers
 
 `tiers:` lists extra upstreams used for failover. The `upstream:` block above
-stays as the implicit tier 0 and is not listed here (it is exempt from the
-`free` rule). Without `tiers:` there is nothing to fail over to: a tier 0 failure status (see below) still puts tier 0 in cooldown, and until it ends the proxy answers the local `429`. Tiers are read from
+stays as the implicit tier 0 and is not listed here (it has no `free` or `daily_cap`). Without `tiers:` there is nothing to fail over to: a tier 0 failure status (see below) still puts tier 0 in cooldown, and until it ends the proxy answers the local `429`. Tiers are read from
 the YAML file only, not from environment variables.
 
 A request goes to tier 0 first, then to the tiers in order. Each tier that fails
@@ -174,12 +251,33 @@ To try it by hand, run
 | `name` | Yes | Unique tier name, used in error messages. |
 | `base_url` | Yes | Tier base URL (only checked for being non-empty). |
 | `api_key` | Yes | Tier key. Never printed by `validate-config` or in logs. |
-| `free` | Yes | Must be `true`. A tier without `free: true` is rejected at startup. |
+| `free` | No | `true` marks a free tier. Without it the tier is paid and needs `daily_cap`, `usage_file` and a price for each model (see "Paid tiers"). |
+| `daily_cap` | Paid tiers | USD the tier may spend per day (finite, > 0, YAML only). Rejected on a `free: true` tier. |
 | `styles` | No | List of `openai` and/or `anthropic`. Absent means OpenAI only. |
 | `cooldown` | No | Duration (`time.ParseDuration`, for example `10m`, >= 0) the tier is skipped after a failure. Absent means `retry_exhausted_after`; `0` means no cooldown. |
 | `models` | Yes | Map of model name to an object with optional `id` (defaults to the model name), `context` (>= 0, the context window in tokens; absent counts as 0) and `tools` (`true` when the model supports tool calling; absent is `false`). At least one; names must be unique. |
 
 `validate-config` shows only the number of tiers (`tiers=N`).
+
+### Paid tiers
+
+A tier without `free: true` is accepted only with a finite `daily_cap` > 0 (USD), a
+`usage_file` and an entry in `prices` for every model it maps (by mapped `id`, or the name
+when `id` is empty); anything missing is rejected at startup with the tier named.
+The day's spend of a tier is the sum of `cost_usd` of today's rows of that tier in the usage
+history, with the day taken in `timezone`, as in the report, so it survives a restart. When it
+reaches `daily_cap` the tier is skipped and the request goes to the next tier. If no tier is
+left, the local `429` carries a `Retry-After` up to the next midnight in `timezone` (at least 1 second),
+when that is shorter than the other waiting times. `/status` shows `US$ spent / US$ cap` for the
+tier, and the state `teto` with the seconds to midnight while the cap holds.
+
+The cost of a request is only known when it ends, so a request already in flight can take the
+tier past the cap. For OpenAI-style requests with `stream: true` sent to a paid tier, the proxy
+adds `stream_options.include_usage: true` (other `stream_options` keys are kept) so the provider
+reports usage; free tiers and Anthropic-style requests get the body unchanged. A 2xx response
+from a paid tier with no `usage` is charged the highest `input` or `output` price in the whole
+`prices` map, as USD (the cost of 1M tokens, a deliberate worst case), and counts in "Sem usage".
+Free tiers keep cost 0 in that case.
 
 ### API styles
 
@@ -228,7 +326,7 @@ Every proxied request writes one JSON line to stderr when its response ends
 (for a stream, after the last event):
 
 ```json
-{"time":"...","level":"INFO","msg":"request","model":"glm-5.1","api_style":"openai","tier":"opencode-go","key_index":0,"key_name":"main","status":200,"latency_ms":412}
+{"time":"...","level":"INFO","msg":"request","model":"glm-5.1","api_style":"openai","tier":"opencode-go","project":"sem projeto","key_index":0,"key_name":"main","tokens_in":1204,"tokens_out":87,"status":200,"latency_ms":412}
 ```
 
 - `model`: top-level `model` of the request body, empty if there is none;
@@ -236,15 +334,40 @@ Every proxied request writes one JSON line to stderr when its response ends
 - `api_style`: `openai` or `anthropic`.
 - `tier`: `opencode-go` for tier 0, the tier `name` for an extra tier, empty when
   no tier answered (local `429`, `502` when no tier was reachable, `499` when the client cancelled).
+- `project`: the optional `X-Project` request header, up to 64 characters of
+  `[A-Za-z0-9._-]`. Absent, longer or with another character it logs `sem projeto`
+  and the request goes on. The proxy never forwards `X-Project` to the upstream.
 - `key_index` and `key_name`: only for tier 0 (`key_name` can be empty).
 - `status`: the status the client received.
 - `latency_ms`: from before the body is read to the last byte sent to the client.
+- `tokens_in` and `tokens_out`: the token counts from the `usage` field of the
+  upstream response (OpenAI `prompt_tokens`/`completion_tokens`, Anthropic
+  `input_tokens`/`output_tokens`), for a JSON body and for a stream. In a stream
+  they come from the last `usage` seen (Anthropic: `input_tokens` from
+  `message_start`, cumulative `output_tokens` from the last `message_delta`).
+  The proxy never changes the request to get them and never estimates them.
+- `tokens_cache_in`: only when above 0, the cache tokens of the response added
+  together (Anthropic `cache_creation_input_tokens` + `cache_read_input_tokens`,
+  OpenAI `prompt_tokens_details.cached_tokens`). They are not part of `tokens_in`.
+- `usage_partial`: `true` when a stream broke before its end and the tokens are
+  what had arrived (Anthropic: `output_tokens` can still be the `message_start`
+  placeholder).
+- `usage_missing`: `true` when the response was `2xx` from a tier but carried no
+  usable `usage` (absent, malformed, a compressed body with `Content-Encoding`,
+  or a JSON body above 1 MiB). A `usage` of 0 input and 0 output counts as
+  missing. An OpenAI stream without `stream_options.include_usage` in the request
+  has no `usage` either, and the proxy does not alter the request to add it.
+  Only `POST` requests are flagged (a `GET /v1/models` is not).
+  The line then has no `tokens_*`.
+  Responses that are not `2xx` and requests no tier answered (local `429`, `502`,
+  `499`, `413`, `400`) have neither `tokens_*` nor `usage_missing`.
 
 Requests rejected while reading the body (`413` too large, `400` read failure)
 are logged too, with empty `model` and `tier` and no key fields.
 
-The key value, `Authorization`, `x-api-key` and the request body and headers are
-never logged.
+The key value, `Authorization`, `x-api-key` and the request body are never
+logged. The only request header logged is `X-Project`, and only as `project`
+after validation.
 
 ## Environment variables
 
