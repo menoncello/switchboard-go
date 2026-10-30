@@ -6,16 +6,16 @@
 - `config.go:96`: `yamlConfig` não tem `usage_url` nem `usage_cache_ttl`; só por variável de ambiente.
 
 ## Deferred from: code review of story-failover-por-status-do-upstream-com-cooldown-por-tier-plan (2026-10-29)
-- 404 de modelo inexistente em um tier não segue ao próximo tier (proxy.go:213-223). Epic R7 diz que 404 segue ao próximo; o verify da story só pede "sem cooldown". Severidade medium não verificada; decidir a intenção resolve.
+- 404 de modelo inexistente em um tier não segue ao próximo tier (`isTierFailure`, proxy.go:320-340). Epic R7 diz que 404 segue ao próximo; o verify da story só pede "sem cooldown". Severidade medium não verificada; decidir a intenção resolve. Segue aberto em 2026-10-30: 404 que cita o modelo com "not found" etc. continua sem passar ao próximo tier (`main_test.go:2148-2175`).
 
 ## Deferred from: code review of story-estilos-de-api-por-tier-plan (2026-10-29)
-- `proxy.go:352`: `apiStyleForRequest` testa `HasPrefix(path, "/complete")` e classifica `/v1/completions` (OpenAI legado) como anthropic; a request sai com `x-api-key` e pula tiers só OpenAI. Pré-existente.
+- `proxy.go:458`: `apiStyleForRequest` testa `HasPrefix(path, "/complete")` e classifica `/v1/completions` (OpenAI legado) como anthropic; a request sai com `x-api-key` e pula tiers só OpenAI. Pré-existente.
 
 ## Deferred from: code review of story-refactor-sweep-plan (2026-10-29)
-- `deferred-work.md`: referências de linha dos itens de 404 (`proxy.go:213-223`) e `apiStyleForRequest` (`proxy.go:352`, hoje `proxy.go:372`) estão defasadas; atualizar na story que tratar esses itens. Pré-existente.
+- `deferred-work.md`: referências de linha dos itens de 404 (`proxy.go:213-223`) e `apiStyleForRequest` (`proxy.go:352`, hoje `proxy.go:458`) estavam defasadas; as referências dos itens foram atualizadas na story 3.8. Pré-existente.
 
 ## Deferred from: code review of story-refactor-sweep-plan (2026-10-29), item SMTP
 - Aviso SMTP na troca de tier: hoje o SMTP só dispara quando todas as chaves do tier 0 esgotam. Citado pelo sweep como fora de escopo; pede story nova.
 
 ## Deferred from: code review of story-teto-diario-em-dinheiro-para-tiers-pagos-plan (2026-10-30)
-- `include_usage` é injetado em todo request OpenAI com `stream: true` num tier pago, inclusive caminhos como `/v1/responses` (proxy.go:355-358). Severidade média, não verificada. Resolve ao ver se o upstream aceita `stream_options.include_usage` nesse caminho; se rejeitar, limitar a `/chat/completions`.
+- `include_usage` é injetado em todo request OpenAI com `stream: true` num tier pago, inclusive caminhos como `/v1/responses` (proxy.go:360-363). Severidade média, não verificada. Resolve ao ver se o upstream aceita `stream_options.include_usage` nesse caminho; se rejeitar, limitar a `/chat/completions`.
