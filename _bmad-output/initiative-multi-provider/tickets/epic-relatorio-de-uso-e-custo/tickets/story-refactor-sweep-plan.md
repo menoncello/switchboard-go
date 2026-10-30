@@ -3,7 +3,7 @@ title: 'Refactor sweep'
 type: 'chore'
 ticket: 8
 created: '2026-10-30'
-status: 'built'
+status: 'done'
 baseline_revision: '540398f3046d5422ca0557b6046c36fc259ea8c7'
 route: 'oneshot'
 route_source: 'auto'
@@ -61,3 +61,19 @@ Oneshot: edição de uma linha por item em `_bmad-output/initiative-multi-provid
 **Follow-up recomendado:** false.
 **Verificação:** `go build ./...` e `go test -race -count=1 ./...` verdes; nenhum `*.go` mudou.
 **Risco residual:** o `include_usage` em `/v1/responses` segue sem verificação e o 404 de modelo inexistente segue sem passar ao próximo tier; ambos precisam de story própria.
+
+## Code Review
+
+### 2026-10-30
+1 `decision-needed`, 1 `patch`, 0 `defer`, 8 rejected.
+
+- [x] [Review][Patch] (decidido: símbolos no lugar de linhas) Referências por número de linha em `deferred-work.md` vão defasar de novo — hoje os números estão corretos (`proxy.go:320-340`, `:458`, `:360-363`), mas a próxima edição de `proxy.go` os quebra, o defeito que esta story corrige. Options: (a) trocar por símbolos (`isTierFailure`, `apiStyleForRequest`, bloco `include_usage`, nome do teste); (b) manter linhas e aceitar nova defasagem. Recommended: (a) — não precisa de manutenção.
+- [x] [Review][Patch] Item meta do sweep (2026-10-29) já resolvido segue na lista de pendências [deferred-work.md:14-15]
+
+**Rejected**
+- R1/R8: nota de que `include_usage` segue adiado — o item já está em `deferred-work.md`; corrigir exige editar a intent section.
+- R4: verificação não checa o entregável — números conferidos em `proxy.go`, sem `TODO`/`FIXME` em `*.go`.
+- R5: "único achado" vs outros itens — falso; os outros são de outros épicos e o SMTP na troca de tier está parked (epic.md:73).
+- R6: `deferred: []` vs risco residual — itens já estão em `deferred-work.md`.
+- R7: "etc.", slug repetido, `ticket: 8` — cosmético.
+- R10: diff só de documentação, alegações sem evidência no diff — descritivo, e as alegações foram verificadas.
