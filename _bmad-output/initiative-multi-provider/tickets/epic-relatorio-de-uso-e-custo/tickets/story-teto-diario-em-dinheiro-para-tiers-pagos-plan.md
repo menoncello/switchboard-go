@@ -3,7 +3,7 @@ title: 'Teto diário em dinheiro para tiers pagos'
 type: 'feature'
 ticket: 6
 created: '2026-10-30'
-status: 'built'
+status: 'done'
 baseline_revision: '761f852a6ed944d19ed872430008239eefd622bc'
 route: 'full'
 route_source: 'auto'
@@ -122,3 +122,26 @@ deferred: []
 **Commands:**
 - `go vet ./...` -- expected: sem aviso
 - `go test -race -count=1 ./...` -- expected: verde, com os testes novos
+
+## Code Review
+
+### 2026-10-30 — 4 lentes (blind-hunter, edge-case-hunter, verification-gap, intent-alignment)
+Achados: 2 decision-needed, 6 patch, 1 defer, 16 rejeitados.
+
+- [x] [Review][Decision] Teto estourado por requests concorrentes — a checagem é antes do despacho e o custo só entra no fim, então N requests/streams paralelos passam pelo mesmo gasto antigo. Options: (a) aceitar, já documentado; (b) reservar o pior caso em voo sob `h.mu`; (c) só orientar teto menor na doc. Recommended: (a) — o excesso é limitado pela concorrência e a reserva acrescenta estado em voo. Resolvido: (a), excesso aceito e documentado.
+- [x] [Review][Decision] `usage_file` ilegível zera o gasto do dia e o teto deixa de valer — `history.go:77-100` move o arquivo para `.bad` e começa vazio. Options: (a) falhar a partida se há tier pago e o arquivo não leu; (b) tratar tiers pagos como no teto até a virada; (c) aceitar e só logar. Recommended: (a) — o teto é o propósito do recurso. Resolvido: (a), virou patch aplicado (`startupErr` em `server.go`).
+- [x] [Review][Patch] Preço 0 aceito em tier pago: o teto nunca acumula [config.go:556-561]
+- [x] [Review][Patch] Falta teste de `spent` isolando um tier do outro [history_test.go]
+- [x] [Review][Patch] Falta teste de `withIncludeUsage` com `stream_options` null, string e `include_usage:false` [history_test.go]
+- [x] [Review][Patch] Tier pago chamado `opencode-go` colide com o tier 0 [config.go validateTiers]
+- [x] [Review][Patch] Condição redundante na asserção de `TestValidatePaidTier` [history_test.go:708]
+- [x] [Review][Defer] `include_usage` injetado em qualquer caminho OpenAI, p.ex. `/v1/responses` [proxy.go:355-358] — deferred: severidade média não verificada; resolve ao ver se o upstream aceita `stream_options.include_usage` nesse caminho.
+
+**Rejected**
+- stream pago cancelado paga o pior caso (low): o conserto edita o intent; já no log de triagem anterior.
+- preço máximo global, custo fantasma no `CostUSD`, extra chunk de usage, `include_usage:false` sobrescrito (false): o intent manda isso.
+- pior caso em resposta não 2xx (false): `usageMissing` exige 2xx (`proxy.go:113`).
+- alerta SMTP no primeiro uso (false): o plano o atribui a outra story.
+- `Retry-After` é o mínimo entre tiers (false): coberto pela doc e por teste.
+- spend perdido em crash, request que cruza a meia-noite, estado `teto` escondendo cooldown, célula abaixo do teto sem teste, exemplo da doc, testes raros (low): raro e o conserto acrescenta complexidade, ou só descreve.
+- metadados do plano dizem `quick` (false): não é defeito do código.

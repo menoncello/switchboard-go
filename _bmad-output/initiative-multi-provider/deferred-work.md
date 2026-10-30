@@ -16,3 +16,6 @@
 
 ## Deferred from: code review of story-refactor-sweep-plan (2026-10-29), item SMTP
 - Aviso SMTP na troca de tier: hoje o SMTP só dispara quando todas as chaves do tier 0 esgotam. Citado pelo sweep como fora de escopo; pede story nova.
+
+## Deferred from: code review of story-teto-diario-em-dinheiro-para-tiers-pagos-plan (2026-10-30)
+- `include_usage` é injetado em todo request OpenAI com `stream: true` num tier pago, inclusive caminhos como `/v1/responses` (proxy.go:355-358). Severidade média, não verificada. Resolve ao ver se o upstream aceita `stream_options.include_usage` nesse caminho; se rejeitar, limitar a `/chat/completions`.
