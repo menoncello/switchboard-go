@@ -1391,8 +1391,9 @@ func TestLoadConfigWithoutTiers(t *testing.T) {
 
 func TestLoadConfigTiersRejected(t *testing.T) {
 	cases := map[string]struct{ tier, want string }{
-		"paid":             {strings.Replace(tierOK, "free: true", "free: false", 1), "free must be true"},
-		"free absent":      {strings.Replace(tierOK, "    free: true\n", "", 1), "free must be true"},
+		"paid no cap":      {strings.Replace(tierOK, "free: true", "free: false", 1), "needs daily_cap"},
+		"free absent":      {strings.Replace(tierOK, "    free: true\n", "", 1), "needs daily_cap"},
+		"free with cap":    {tierOK + "    daily_cap: 5\n", "daily_cap is only for paid tiers"},
 		"no base_url":      {strings.Replace(tierOK, "base_url: https://a", "base_url: \"\"", 1), "base_url is required"},
 		"no api_key":       {strings.Replace(tierOK, "api_key: secret-a", "api_key: \"\"", 1), "api_key is required"},
 		"no name":          {strings.Replace(tierOK, "name: a", "name: \"\"", 1), "name is required"},

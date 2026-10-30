@@ -108,6 +108,13 @@ tiers:
         id: "provider/model-a"
         context: 131072
         tools: true
+  # A paid tier: no `free: true`, so it needs daily_cap, usage_file and a price per model.
+  - name: "nome-do-tier"
+    base_url: "https://paid.example.com/v1"
+    api_key: "sk-paid"
+    daily_cap: 5
+    models:
+      id-do-modelo: {context: 131072}
 ```
 
 ## State file
@@ -171,17 +178,16 @@ negative value is rejected at startup.
 A request costs `(tokens_in * input + tokens_out * output) / 1e6`. Cache tokens have
 no price of their own: they count in `tokens_in` as the response reports them. The cost is
 written to the row when the request is served, so changing `prices` later does not
-rewrite the past. A response without `usage` costs 0 and still counts as priced.
+rewrite the past. A response without `usage` costs 0 on a free tier and the worst case on a paid tier (see "Paid tiers"); both still count as priced.
 `priced` counts the requests that had a price. In the report a model without price shows
 `—`; a line mixing priced and unpriced requests shows `US$ x (n/m com preço)`. Prices are
-optional per model. Rows from files written before this feature load with no cost and
+optional per model on free tiers (a paid tier needs a price for every model, see "Paid tiers"). Rows from files written before this feature load with no cost and
 no price.
 
 ## Tiers
 
 `tiers:` lists extra upstreams used for failover. The `upstream:` block above
-stays as the implicit tier 0 and is not listed here (it is exempt from the
-`free` rule). Without `tiers:` there is nothing to fail over to: a tier 0 failure status (see below) still puts tier 0 in cooldown, and until it ends the proxy answers the local `429`. Tiers are read from
+stays as the implicit tier 0 and is not listed here (it has no `free` or `daily_cap`). Without `tiers:` there is nothing to fail over to: a tier 0 failure status (see below) still puts tier 0 in cooldown, and until it ends the proxy answers the local `429`. Tiers are read from
 the YAML file only, not from environment variables.
 
 A request goes to tier 0 first, then to the tiers in order. Each tier that fails
@@ -236,12 +242,33 @@ To try it by hand, run
 | `name` | Yes | Unique tier name, used in error messages. |
 | `base_url` | Yes | Tier base URL (only checked for being non-empty). |
 | `api_key` | Yes | Tier key. Never printed by `validate-config` or in logs. |
-| `free` | Yes | Must be `true`. A tier without `free: true` is rejected at startup. |
+| `free` | No | `true` marks a free tier. Without it the tier is paid and needs `daily_cap`, `usage_file` and a price for each model (see "Paid tiers"). |
+| `daily_cap` | Paid tiers | USD the tier may spend per day (finite, > 0, YAML only). Rejected on a `free: true` tier. |
 | `styles` | No | List of `openai` and/or `anthropic`. Absent means OpenAI only. |
 | `cooldown` | No | Duration (`time.ParseDuration`, for example `10m`, >= 0) the tier is skipped after a failure. Absent means `retry_exhausted_after`; `0` means no cooldown. |
 | `models` | Yes | Map of model name to an object with optional `id` (defaults to the model name), `context` (>= 0, the context window in tokens; absent counts as 0) and `tools` (`true` when the model supports tool calling; absent is `false`). At least one; names must be unique. |
 
 `validate-config` shows only the number of tiers (`tiers=N`).
+
+### Paid tiers
+
+A tier without `free: true` is accepted only with a finite `daily_cap` > 0 (USD), a
+`usage_file` and an entry in `prices` for every model it maps (by mapped `id`, or the name
+when `id` is empty); anything missing is rejected at startup with the tier named.
+The day's spend of a tier is the sum of `cost_usd` of today's rows of that tier in the usage
+history, with the day taken in `timezone`, as in the report, so it survives a restart. When it
+reaches `daily_cap` the tier is skipped and the request goes to the next tier. If no tier is
+left, the local `429` carries a `Retry-After` up to the next midnight in `timezone` (at least 1 second),
+when that is shorter than the other waiting times. `/status` shows `US$ spent / US$ cap` for the
+tier, and the state `teto` with the seconds to midnight while the cap holds.
+
+The cost of a request is only known when it ends, so a request already in flight can take the
+tier past the cap. For OpenAI-style requests with `stream: true` sent to a paid tier, the proxy
+adds `stream_options.include_usage: true` (other `stream_options` keys are kept) so the provider
+reports usage; free tiers and Anthropic-style requests get the body unchanged. A 2xx response
+from a paid tier with no `usage` is charged the highest `input` or `output` price in the whole
+`prices` map, as USD (the cost of 1M tokens, a deliberate worst case), and counts in "Sem usage".
+Free tiers keep cost 0 in that case.
 
 ### API styles
 

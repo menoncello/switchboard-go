@@ -116,6 +116,8 @@ func (c Config) price(tier, model string) (ModelPrice, bool) {
 type TierConfig struct {
 	Name, BaseURL, APIKey string
 	Free                  bool
+	// DailyCap is the USD spent per day (the usage_file day) after which a paid tier is skipped.
+	DailyCap float64
 	// Cooldown is how long the tier is skipped after a failure status; nil means
 	// RetryExhaustedAfter, 0 means failover only for the request that failed.
 	Cooldown *time.Duration
@@ -223,6 +225,7 @@ type yamlTier struct {
 	BaseURL  string    `yaml:"base_url"`
 	APIKey   string    `yaml:"api_key"`
 	Free     bool      `yaml:"free"`
+	DailyCap float64   `yaml:"daily_cap"`
 	Cooldown string    `yaml:"cooldown"`
 	Styles   []string  `yaml:"styles"`
 	Models   yaml.Node `yaml:"models"`
@@ -231,7 +234,7 @@ type yamlTier struct {
 func convertTiers(in []yamlTier) ([]TierConfig, error) {
 	var out []TierConfig
 	for i, yt := range in {
-		t := TierConfig{Name: yt.Name, BaseURL: yt.BaseURL, APIKey: yt.APIKey, Free: yt.Free}
+		t := TierConfig{Name: yt.Name, BaseURL: yt.BaseURL, APIKey: yt.APIKey, Free: yt.Free, DailyCap: yt.DailyCap}
 		if s := strings.TrimSpace(yt.Cooldown); s != "" {
 			d, err := time.ParseDuration(s)
 			if err != nil {
@@ -528,7 +531,53 @@ func validateConfig(cfg Config) error {
 	if err := validateTiers(cfg.Tiers); err != nil {
 		return err
 	}
-	return validatePrices(cfg)
+	if err := validatePrices(cfg); err != nil {
+		return err
+	}
+	return validatePaidTiers(cfg)
+}
+
+// validatePaidTiers requires a finite daily_cap > 0, usage_file and a price for every model of a paid tier,
+// and rejects daily_cap on a free one.
+func validatePaidTiers(cfg Config) error {
+	for _, t := range cfg.Tiers {
+		if t.Free {
+			if t.DailyCap != 0 {
+				return fmt.Errorf("tier %q: daily_cap is only for paid tiers (remove it or drop free: true)", t.Name)
+			}
+			continue
+		}
+		if !(t.DailyCap > 0) || math.IsInf(t.DailyCap, 0) { // also rejects NaN
+			return fmt.Errorf("tier %q: a tier without free: true needs daily_cap, finite and > 0 (USD per day)", t.Name)
+		}
+		if strings.TrimSpace(cfg.UsageFile) == "" {
+			return fmt.Errorf("tier %q: a tier without free: true needs usage_file (the daily spend is read from it)", t.Name)
+		}
+		for _, m := range t.Models {
+			id := cmp.Or(m.ID, m.Name)
+			if _, ok := cfg.Prices[t.Name][id]; !ok {
+				return fmt.Errorf("tier %q model %q: a tier without free: true needs a price in prices", t.Name, id)
+			}
+		}
+	}
+	return nil
+}
+
+// maxPrice is the highest input or output price (USD per 1M tokens) in prices: the
+// worst-case cost charged to a paid tier response with no usage.
+func (c Config) maxPrice() float64 {
+	var m float64
+	for _, models := range c.Prices {
+		for _, p := range models {
+			m = max(m, p.Input, p.Output)
+		}
+	}
+	return m
+}
+
+// paidTier reports whether name is a configured tier without free: true.
+func (c Config) paidTier(name string) bool {
+	return slices.ContainsFunc(c.Tiers, func(t TierConfig) bool { return t.Name == name && !t.Free })
 }
 
 func validatePrices(cfg Config) error {
@@ -565,9 +614,6 @@ func validateTiers(tiers []TierConfig) error {
 		}
 		if strings.TrimSpace(t.APIKey) == "" {
 			return fmt.Errorf("tier %q: api_key is required", t.Name)
-		}
-		if !t.Free {
-			return fmt.Errorf("tier %q: free must be true (only free tiers are allowed)", t.Name)
 		}
 		if t.Cooldown != nil && *t.Cooldown < 0 {
 			return fmt.Errorf("tier %q: cooldown must be >= 0", t.Name)

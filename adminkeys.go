@@ -232,8 +232,8 @@ var statusTmpl = template.Must(template.New("status").Funcs(template.FuncMap{
 {{if .UsageError}}<td colspan="3">erro de uso: {{.UsageError}}</td>{{else}}<td>{{pct .Usage.Rolling}}</td><td>{{pct .Usage.Weekly}}</td><td>{{pct .Usage.Monthly}}</td>{{end}}</tr>
 {{end}}</table>
 {{if .Tiers}}<h2>Tiers</h2>
-<table><tr><th>Tier</th><th>Estado</th><th>Cooldown</th></tr>
-{{range .Tiers}}<tr><td>{{.Name}}</td><td>{{.State}}</td><td>{{if .RemainingSeconds}}{{.RemainingSeconds}}s{{else}}—{{end}}</td></tr>
+<table><tr><th>Tier</th><th>Estado</th><th>Cooldown</th><th>Gasto / teto do dia</th></tr>
+{{range .Tiers}}<tr><td>{{.Name}}</td><td>{{.State}}</td><td>{{if .RemainingSeconds}}{{.RemainingSeconds}}s{{else}}—{{end}}</td><td>{{if .Cap}}{{.Spend}}{{else}}—{{end}}</td></tr>
 {{end}}</table>{{end}}{{with .Usage}}
 <h2>Uso</h2>
 <p>Hoje ({{.Today}}, {{.Timezone}}): {{.Total.Requests}} requests, {{.Total.TokensIn}} tokens in, {{.Total.TokensOut}} tokens out, {{.Total.TokensCacheIn}} tokens cache, custo {{.Total.Cost}}.</p>
@@ -248,6 +248,8 @@ var statusTmpl = template.Must(template.New("status").Funcs(template.FuncMap{
 type tierRow struct {
 	Name, State      string
 	RemainingSeconds int
+	Cap              float64 // paid tiers only
+	Spend            string  // "US$ x / US$ y"
 }
 
 // statusPage is the keys report plus, when the config has extra tiers, one row per
@@ -358,6 +360,15 @@ func (a *App) usageReport() *usageReport {
 	return rep
 }
 
+func (a *App) tierConfig(name string) *TierConfig {
+	for i := range a.config.Tiers {
+		if a.config.Tiers[i].Name == name {
+			return &a.config.Tiers[i]
+		}
+	}
+	return nil
+}
+
 func (a *App) tierRows() []tierRow {
 	if len(a.config.Tiers) == 0 {
 		return nil
@@ -368,6 +379,7 @@ func (a *App) tierRows() []tierRow {
 	}
 	rows := make([]tierRow, len(names))
 	for i, n := range names {
+		var capped bool
 		rows[i] = tierRow{Name: n, State: "ok"}
 		if n == tier0CooldownKey {
 			rows[i].Name = "OpenCode Go (tier 0)"
@@ -379,8 +391,18 @@ func (a *App) tierRows() []tierRow {
 				d = kd
 			}
 		}
+		if t := a.tierConfig(n); t != nil && !t.Free {
+			spent := a.history.spent(n)
+			rows[i].Cap, rows[i].Spend = t.DailyCap, fmt.Sprintf("US$ %.4f / US$ %.4f", spent, t.DailyCap)
+			if capped = spent >= t.DailyCap; capped {
+				d = max(d, a.history.untilMidnight())
+			}
+		}
 		if d > 0 {
 			rows[i].State, rows[i].RemainingSeconds = "cooldown", int(math.Ceil(d.Seconds()))
+			if capped {
+				rows[i].State = "teto"
+			}
 		}
 	}
 	return rows

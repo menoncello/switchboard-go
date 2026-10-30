@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"maps"
 	"math"
 	"net/http"
 	"slices"
@@ -138,7 +139,11 @@ func (a *App) proxyV1(w http.ResponseWriter, r *http.Request, style APIStyle) {
 		if p, ok := a.config.price(tier, model); ok {
 			price = &p
 		}
-		a.history.record(requestProject(r.Header), model, key, tier, usage, usageMissing, price)
+		var worst float64
+		if usageMissing && a.config.paidTier(tier) {
+			worst = a.config.maxPrice()
+		}
+		a.history.record(requestProject(r.Header), model, key, tier, usage, usageMissing, price, worst)
 	}
 	a.logger.Info("request", attrs...)
 }
@@ -275,12 +280,36 @@ func (a *App) localRetryAfter(model string, style APIStyle, needTools bool) (int
 			if _, ok := tierModelID(t, model, style, a.config.MinContext, needTools); !ok {
 				continue
 			}
-			if d := a.cooldowns.remaining(t.Name); d > 0 && d < soonest {
+			d := a.cooldowns.remaining(t.Name)
+			if a.tierCapped(t) {
+				d = max(d, a.history.untilMidnight())
+			}
+			if d > 0 && d < soonest {
 				soonest = d
 			}
 		}
 	}
 	return max(1, int(math.Ceil(soonest.Seconds()))), true
+}
+
+// tierCapped reports whether a paid tier has spent its daily cap.
+func (a *App) tierCapped(t TierConfig) bool {
+	return !t.Free && a.history.spent(t.Name) >= t.DailyCap
+}
+
+// withIncludeUsage returns fields with stream_options.include_usage set to true, keeping other
+// stream_options keys. fields is not changed.
+func withIncludeUsage(fields map[string]json.RawMessage) map[string]json.RawMessage {
+	opts := map[string]json.RawMessage{}
+	_ = json.Unmarshal(fields["stream_options"], &opts) // not an object (or null): start empty
+	if opts == nil {
+		opts = map[string]json.RawMessage{}
+	}
+	opts["include_usage"] = json.RawMessage("true")
+	raw, _ := json.Marshal(opts)
+	out := maps.Clone(fields)
+	out["stream_options"] = raw
+	return out
 }
 
 // isTierFailure reports whether resp means the whole tier is unhealthy and the
@@ -317,12 +346,17 @@ func (a *App) proxyTiers(ctx context.Context, w http.ResponseWriter, r *http.Req
 	}
 	for _, t := range a.config.Tiers {
 		id, ok := tierModelID(t, model, style, a.config.MinContext, needTools)
-		if !ok || a.cooldowns.remaining(t.Name) > 0 {
+		if !ok || a.cooldowns.remaining(t.Name) > 0 || a.tierCapped(t) {
 			continue
 		}
 		raw, _ := json.Marshal(id)
-		fields["model"] = raw
-		tierBody, err := json.Marshal(fields)
+		tf := maps.Clone(fields) // per tier: the next tier must not see this tier's edits
+		tf["model"] = raw
+		var stream bool
+		if !t.Free && style == APIStyleOpenAI && json.Unmarshal(fields["stream"], &stream) == nil && stream {
+			tf = withIncludeUsage(tf)
+		}
+		tierBody, err := json.Marshal(tf)
 		if err != nil {
 			continue
 		}

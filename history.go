@@ -119,7 +119,7 @@ func (h *usageHistory) load() {
 	}
 }
 
-func (h *usageHistory) record(project, model, key, tier string, u usageTokens, noUsage bool, price *ModelPrice) {
+func (h *usageHistory) record(project, model, key, tier string, u usageTokens, noUsage bool, price *ModelPrice, worstCase float64) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	k := usageKey{h.now().In(h.loc).Format("2006-01-02"), project, model, key, tier}
@@ -141,6 +141,7 @@ func (h *usageHistory) record(project, model, key, tier string, u usageTokens, n
 		c.Priced++
 	}
 	if noUsage {
+		c.CostUSD += worstCase // paid tier with no usage: charge the worst case so the cap cannot be dodged
 		c.NoUsage++
 	}
 	h.dirty = true
@@ -152,6 +153,28 @@ func (h *usageHistory) record(project, model, key, tier string, u usageTokens, n
 			h.flush()
 		})
 	}
+}
+
+// spent is the CostUSD of today's rows of tier (day in h.loc).
+// shortcut: scans every row on each request, fine for 90 days of rows, index by day if it shows up in profiles.
+func (h *usageHistory) spent(tier string) float64 {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	today := h.now().In(h.loc).Format("2006-01-02")
+	var sum float64
+	for k, c := range h.rows {
+		if k.Day == today && k.Tier == tier {
+			sum += c.CostUSD
+		}
+	}
+	return sum
+}
+
+// untilMidnight is the time left until the next midnight in h.loc.
+func (h *usageHistory) untilMidnight() time.Duration {
+	now := h.now().In(h.loc)
+	y, m, d := now.Date()
+	return time.Date(y, m, d+1, 0, 0, 0, 0, h.loc).Sub(now)
 }
 
 func (h *usageHistory) snapshotLocked() []usageRow {

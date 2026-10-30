@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"io"
 	"log"
 	"log/slog"
 	"math"
@@ -10,7 +11,9 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -464,7 +467,7 @@ func TestCostMixedLineInStatus(t *testing.T) {
 	app := pricedApp(t, `{"usage":{"prompt_tokens":1000,"completion_tokens":500}}`, "", gratisPrices)
 	postModel(app, "a")
 	postModel(app, "a")
-	app.history.record("", "a", "", "gratis", usageTokens{found: true, in: 1000, out: 500}, false, nil) // same line, no price
+	app.history.record("", "a", "", "gratis", usageTokens{found: true, in: 1000, out: 500}, false, nil, 0) // same line, no price
 	body := statusBody(app)
 	const cost = "US$ 0.0040 (2/3 com preço)"
 	if !strings.Contains(body, "custo "+cost+".") || !strings.Contains(section(t, body, "Modelo"), "<td>"+cost+"</td>") {
@@ -524,8 +527,8 @@ func TestCostNoUsagePriced(t *testing.T) {
 func TestCostMixedLine(t *testing.T) {
 	h := &usageHistory{loc: time.UTC, now: time.Now, logger: slog.Default(), rows: map[usageKey]*usageCounts{}}
 	u := usageTokens{found: true, in: 1000, out: 500}
-	h.record("", "m", "", "t", u, false, &ModelPrice{Input: 1, Output: 2})
-	h.record("", "m", "", "t", u, false, nil)
+	h.record("", "m", "", "t", u, false, &ModelPrice{Input: 1, Output: 2}, 0)
+	h.record("", "m", "", "t", u, false, nil, 0)
 	if got := (usageLine{Requests: 2, Priced: 1, CostUSD: 0.002}).Cost(); got != "US$ 0.0020 (1/2 com preço)" {
 		t.Fatal(got)
 	}
@@ -621,5 +624,207 @@ func TestLoadConfigPrices(t *testing.T) {
 	cfg, err := loadConfig()
 	if err != nil || cfg.Prices["a"]["x/m1"] != (ModelPrice{1.5, 2}) {
 		t.Fatalf("prices=%v err=%v", cfg.Prices, err)
+	}
+}
+
+// capUpstream is a tier upstream that records the bodies it got and answers status/body.
+type capUpstream struct {
+	srv    *httptest.Server
+	mu     sync.Mutex
+	bodies []string
+}
+
+func newCapUpstream(t *testing.T, status int, ctype, body string) *capUpstream {
+	t.Helper()
+	u := &capUpstream{}
+	u.srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		u.mu.Lock()
+		u.bodies = append(u.bodies, string(b))
+		u.mu.Unlock()
+		w.Header().Set("Content-Type", ctype)
+		w.WriteHeader(status)
+		_, _ = w.Write([]byte(body))
+	}))
+	t.Cleanup(u.srv.Close)
+	return u
+}
+
+func (u *capUpstream) seen() []string {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	return slices.Clone(u.bodies)
+}
+
+// capNow is today 10:00 UTC (not a fixed date: load drops rows older than the retention).
+var capNow = func() time.Time {
+	y, m, d := time.Now().UTC().Date()
+	return time.Date(y, m, d, 10, 0, 0, 0, time.UTC)
+}()
+
+// capApp has tier 0 down and a paid tier "pago" (cap US$ 5, price US$ 1e6 per 1M tokens, so US$ 1 per token: a 10/3 usage costs US$ 13)
+// followed by the free tier "gratis" when free is not nil.
+func capApp(t *testing.T, paid, free *capUpstream, usageFile string, styles ...APIStyle) *App {
+	t.Helper()
+	if styles == nil {
+		styles = []APIStyle{APIStyleOpenAI}
+	}
+	tiers := []TierConfig{{Name: "pago", BaseURL: paid.srv.URL, APIKey: "kp", DailyCap: 5, Styles: styles, Models: []TierModel{{Name: "a", ID: "a-id"}}}}
+	if free != nil {
+		tiers = append(tiers, TierConfig{Name: "gratis", BaseURL: free.srv.URL, APIKey: "kg", Free: true, Styles: styles, Models: []TierModel{{Name: "a", ID: "a-id"}}})
+	}
+	down := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(503) }))
+	t.Cleanup(down.Close)
+	app := newApp(Config{ProxyAPIKey: "p", UpstreamAPIKeys: []string{"k"}, UpstreamBaseURL: down.URL, MaxRequestBodyBytes: 1 << 20, RetryExhaustedAfter: time.Hour,
+		UsageFile: usageFile, Tiers: tiers, Prices: map[string]map[string]ModelPrice{"pago": {"a-id": {Input: 1e6, Output: 1e6}}}})
+	app.history.now = func() time.Time { return capNow }
+	return app
+}
+
+func TestValidatePaidTier(t *testing.T) {
+	base := func() Config {
+		return Config{ProxyAPIKey: "p", UpstreamAPIKeys: []string{"u"}, UpstreamBaseURL: "http://x", MaxRequestBodyBytes: 1, UsageFile: "u.json",
+			Tiers:  []TierConfig{{Name: "pago", BaseURL: "http://t", APIKey: "k", DailyCap: 5, Models: []TierModel{{Name: "a", ID: "a-id"}}}},
+			Prices: map[string]map[string]ModelPrice{"pago": {"a-id": {Input: 1, Output: 2}}}}
+	}
+	for name, tc := range map[string]struct {
+		mod  func(*Config)
+		want string // "" accepts
+	}{
+		"valid":            {func(c *Config) {}, ""},
+		"no cap":           {func(c *Config) { c.Tiers[0].DailyCap = 0 }, "daily_cap"},
+		"negative cap":     {func(c *Config) { c.Tiers[0].DailyCap = -1 }, "daily_cap"},
+		"NaN cap":          {func(c *Config) { c.Tiers[0].DailyCap = math.NaN() }, "daily_cap"},
+		"Inf cap":          {func(c *Config) { c.Tiers[0].DailyCap = math.Inf(1) }, "daily_cap"},
+		"no usage_file":    {func(c *Config) { c.UsageFile = "" }, "usage_file"},
+		"model no price":   {func(c *Config) { c.Prices = nil }, `model "a-id"`},
+		"free with cap":    {func(c *Config) { c.Tiers[0].Free = true }, "only for paid"},
+		"free no cap":      {func(c *Config) { c.Tiers[0].Free, c.Tiers[0].DailyCap = true, 0 }, ""},
+		"id falls to name": {func(c *Config) { c.Tiers[0].Models[0].ID = ""; c.Prices["pago"] = map[string]ModelPrice{"a": {}} }, ""},
+	} {
+		c := base()
+		tc.mod(&c)
+		err := validateConfig(c)
+		if (tc.want == "") != (err == nil) || (err != nil && !strings.Contains(err.Error(), tc.want) && !strings.Contains(err.Error(), `"pago"`)) {
+			t.Fatalf("%s: %v", name, err)
+		}
+		if err != nil && !strings.Contains(err.Error(), tc.want) {
+			t.Fatalf("%s: err %v, want %q", name, err, tc.want)
+		}
+	}
+}
+
+func TestPaidTierCapSkipsToNextTier(t *testing.T) {
+	paid, free := newCapUpstream(t, 200, "application/json", usageBody), newCapUpstream(t, 200, "application/json", `{"from":"free"}`)
+	app := capApp(t, paid, free, "")
+	if rec := tierReq(app, http.MethodPost, "/v1/chat/completions", `{"model":"a"}`, nil); rec.Code != 200 || len(paid.seen()) != 1 {
+		t.Fatalf("first: %d %s", rec.Code, rec.Body)
+	}
+	if s := app.history.spent("pago"); s != 13 {
+		t.Fatalf("spent %v", s)
+	}
+	rec := tierReq(app, http.MethodPost, "/v1/chat/completions", `{"model":"a"}`, nil)
+	if rec.Code != 200 || rec.Body.String() != `{"from":"free"}` || len(paid.seen()) != 1 || len(free.seen()) != 1 {
+		t.Fatalf("second: %d %s paid=%d free=%d", rec.Code, rec.Body, len(paid.seen()), len(free.seen()))
+	}
+	body := statusBody(app)
+	if !strings.Contains(body, "US$ 13.0000 / US$ 5.0000") || !strings.Contains(body, "<td>teto</td><td>50400s</td>") {
+		t.Fatalf("status: %s", body)
+	}
+}
+
+func TestPaidTierCapRetryAfterUntilMidnight(t *testing.T) {
+	paid := newCapUpstream(t, 200, "application/json", usageBody)
+	app := capApp(t, paid, nil, "")
+	app.cooldowns.set(tier0CooldownKey, 100*time.Hour)
+	tierReq(app, http.MethodPost, "/v1/chat/completions", `{"model":"a"}`, nil)
+	rec := tierReq(app, http.MethodPost, "/v1/chat/completions", `{"model":"a"}`, nil)
+	if rec.Code != http.StatusTooManyRequests || rec.Header().Get("Retry-After") != "50400" || len(paid.seen()) != 1 {
+		t.Fatalf("code=%d retry=%q hits=%d", rec.Code, rec.Header().Get("Retry-After"), len(paid.seen()))
+	}
+	app.history.now = func() time.Time { return capNow.Add(14*time.Hour - 500*time.Millisecond) } // under 1s left: minimum 1
+	if rec := tierReq(app, http.MethodPost, "/v1/chat/completions", `{"model":"a"}`, nil); rec.Header().Get("Retry-After") != "1" {
+		t.Fatalf("retry=%q", rec.Header().Get("Retry-After"))
+	}
+	app.history.now = func() time.Time { return capNow.Add(14 * time.Hour) } // next day: spend is 0 again
+	if app.history.spent("pago") != 0 {
+		t.Fatal("spend did not reset")
+	}
+	if rec := tierReq(app, http.MethodPost, "/v1/chat/completions", `{"model":"a"}`, nil); rec.Code != 200 || len(paid.seen()) != 2 {
+		t.Fatalf("after midnight: %d hits=%d", rec.Code, len(paid.seen()))
+	}
+}
+
+func TestPaidTierCapSurvivesRestart(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "usage.json")
+	paid, free := newCapUpstream(t, 200, "application/json", usageBody), newCapUpstream(t, 200, "application/json", `{}`)
+	app := capApp(t, paid, free, path)
+	tierReq(app, http.MethodPost, "/v1/chat/completions", `{"model":"a"}`, nil)
+	app.history.close()
+	app2 := capApp(t, paid, free, path)
+	t.Cleanup(app2.history.close)
+	tierReq(app2, http.MethodPost, "/v1/chat/completions", `{"model":"a"}`, nil)
+	if len(paid.seen()) != 1 || len(free.seen()) != 1 {
+		t.Fatalf("paid=%d free=%d", len(paid.seen()), len(free.seen()))
+	}
+}
+
+func TestPaidTierStreamWithoutUsageChargesMaxPrice(t *testing.T) {
+	paid := newCapUpstream(t, 200, "text/event-stream", "data: [DONE]\n\n")
+	app := capApp(t, paid, nil, "")
+	app.config.Prices["pago"]["other"] = ModelPrice{Input: 2e6, Output: 3e6} // max over the whole map is 3e6
+	rec := tierReq(app, http.MethodPost, "/v1/chat/completions", `{"model":"a","stream":true}`, nil)
+	r := app.history.snapshot()
+	if rec.Code != 200 || len(r) != 1 || r[0].CostUSD != 3e6 || r[0].NoUsage != 1 {
+		t.Fatalf("code=%d rows: %+v", rec.Code, r)
+	}
+	if !strings.Contains(statusBody(app), "<td>1</td><td>US$") {
+		t.Fatal("Sem usage column missing")
+	}
+}
+
+func TestPaidTierStreamIncludeUsage(t *testing.T) {
+	paid := newCapUpstream(t, 503, "application/json", `{}`)
+	free := newCapUpstream(t, 200, "application/json", `{}`)
+	app := capApp(t, paid, free, "")
+	tierReq(app, http.MethodPost, "/v1/chat/completions", `{"model":"a","stream":true,"stream_options":{"x":1}}`, nil)
+	tierReq(app, http.MethodPost, "/v1/chat/completions", `{"model":"a","stream":true}`, nil) // paid tier is in cooldown now
+	pb, fb := paid.seen(), free.seen()
+	if len(pb) != 1 || !strings.Contains(pb[0], `"include_usage":true`) || !strings.Contains(pb[0], `"x":1`) {
+		t.Fatalf("paid body: %v", pb)
+	}
+	if len(fb) != 2 || strings.Contains(fb[0], "include_usage") || !strings.Contains(fb[0], `"stream_options":{"x":1}`) || strings.Contains(fb[1], "stream_options") {
+		t.Fatalf("free bodies (must not inherit the paid edit): %v", fb)
+	}
+}
+
+func TestPaidTierAnthropicBodyUnchanged(t *testing.T) {
+	paid := newCapUpstream(t, 200, "application/json", `{}`)
+	app := capApp(t, paid, nil, "", APIStyleAnthropic)
+	const body = `{"model":"a","stream":true}`
+	tierReq(app, http.MethodPost, "/v1/messages", body, nil)
+	if got := paid.seen(); len(got) != 1 || strings.Contains(got[0], "stream_options") {
+		t.Fatalf("body: %v", got)
+	}
+}
+
+func TestPaidTierCapRetryAfterShorterCooldownWins(t *testing.T) {
+	paid, free := newCapUpstream(t, 200, "application/json", usageBody), newCapUpstream(t, 200, "application/json", `{}`)
+	app := capApp(t, paid, free, "")
+	app.cooldowns.set(tier0CooldownKey, 100*time.Hour)
+	tierReq(app, http.MethodPost, "/v1/chat/completions", `{"model":"a"}`, nil) // paid tier reaches its cap
+	app.cooldowns.set("gratis", 60*time.Second)
+	rec := tierReq(app, http.MethodPost, "/v1/chat/completions", `{"model":"a"}`, nil)
+	if got := rec.Header().Get("Retry-After"); rec.Code != http.StatusTooManyRequests || got != "60" {
+		t.Fatalf("code=%d retry=%q", rec.Code, got)
+	}
+}
+
+func TestLoadConfigPaidTier(t *testing.T) {
+	paid := strings.Replace(tierOK, "free: true", "daily_cap: 5.5", 1)
+	tiersYAML(t, "usage_file: /tmp/usage.json\nprices:\n  a:\n    x/m1: {input: 1, output: 2}\ntiers:\n"+paid)
+	cfg, err := loadConfig()
+	if err != nil || len(cfg.Tiers) != 1 || cfg.Tiers[0].Free || cfg.Tiers[0].DailyCap != 5.5 {
+		t.Fatalf("tiers=%+v err=%v", cfg.Tiers, err)
 	}
 }
