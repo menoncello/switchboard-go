@@ -3,12 +3,14 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"io"
 	"log"
 	"log/slog"
 	"math"
 	"net/http"
 	"net/http/httptest"
+	"net/smtp"
 	"os"
 	"path/filepath"
 	"slices"
@@ -876,4 +878,110 @@ func TestLoadConfigPaidTier(t *testing.T) {
 	if err != nil || len(cfg.Tiers) != 1 || cfg.Tiers[0].Free || cfg.Tiers[0].DailyCap != 5.5 {
 		t.Fatalf("tiers=%+v err=%v", cfg.Tiers, err)
 	}
+}
+
+// alertApp has two paid tiers (p1 serves model a, p2 serves b) and a free one (f serves c); sendMail is replaced
+// by a fake that reports each message on the returned channel (or fails with sendErr).
+func alertApp(t *testing.T, usageFile string, sendErr error) (*App, chan string) {
+	t.Helper()
+	msgs := make(chan string, 16)
+	old := sendMail
+	sendMail = func(addr string, auth smtp.Auth, from string, to []string, msg []byte, useTLS, useStartTLS bool) error {
+		msgs <- string(msg)
+		return sendErr
+	}
+	t.Cleanup(func() { sendMail = old })
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(usageBody))
+	}))
+	t.Cleanup(up.Close)
+	down := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(503) })) // tier 0 fails so the extra tiers answer
+	t.Cleanup(down.Close)
+	tier := func(name, model string, free bool) TierConfig {
+		dailyCap := 5.0
+		if free {
+			dailyCap = 0
+		}
+		return TierConfig{Name: name, BaseURL: up.URL, APIKey: "k" + name, Free: free, DailyCap: dailyCap, Styles: []APIStyle{APIStyleOpenAI}, Models: []TierModel{{Name: model, ID: model + "-id"}}}
+	}
+	prices := map[string]map[string]ModelPrice{"p1": {"a-id": {Input: 1, Output: 1}}, "p2": {"b-id": {Input: 1, Output: 1}}}
+	app := newApp(Config{ProxyAPIKey: "p", UpstreamAPIKeys: []string{"k"}, UpstreamBaseURL: down.URL, MaxRequestBodyBytes: 1 << 20, RetryExhaustedAfter: time.Hour,
+		UsageFile: usageFile, Prices: prices, Tiers: []TierConfig{tier("p1", "a", false), tier("p2", "b", false), tier("f", "c", true)},
+		SMTP: SMTPConfig{Host: "h", Port: 25, From: "f@x", To: "t@x"}})
+	app.history.now = func() time.Time { return capNow }
+	return app, msgs
+}
+
+func wantAlerts(t *testing.T, msgs chan string, want ...string) {
+	t.Helper()
+	for _, w := range want {
+		select {
+		case m := <-msgs:
+			if !strings.Contains(m, w) {
+				t.Fatalf("alert %q does not mention %q", m, w)
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatalf("no alert for %q", w)
+		}
+	}
+	select {
+	case m := <-msgs:
+		t.Fatalf("unexpected alert: %q", m)
+	case <-time.After(100 * time.Millisecond):
+	}
+}
+
+func TestPaidFirstUseAlert(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "usage.json")
+	app, msgs := alertApp(t, path, nil)
+	postModel(app, "a")
+	wantAlerts(t, msgs, `"p1"`)
+	if app.history.alerts["p1"] != capNow.Format("2006-01-02") {
+		t.Fatalf("alerts: %v", app.history.alerts)
+	}
+	postModel(app, "a") // same tier, same day
+	postModel(app, "c") // free tier
+	postModel(app, "zzz")
+	tierReq(app, http.MethodGet, "/v1/models", "", nil)
+	wantAlerts(t, msgs)
+	postModel(app, "b") // another paid tier
+	wantAlerts(t, msgs, `"p2"`)
+	app.history.flush()
+
+	b, _ := os.ReadFile(path)
+	var f struct {
+		Rows   []usageRow        `json:"rows"`
+		Alerts map[string]string `json:"alerts"`
+	}
+	if err := json.Unmarshal(b, &f); err != nil || len(f.Alerts) != 2 || len(f.Rows) != 3 {
+		t.Fatalf("file %s err=%v", b, err)
+	}
+
+	app2, msgs2 := alertApp(t, path, nil) // restart, same day
+	postModel(app2, "a")
+	wantAlerts(t, msgs2)
+	next := capNow.Add(24 * time.Hour)
+	app2.history.now = func() time.Time { return next }
+	postModel(app2, "a")
+	wantAlerts(t, msgs2, `"p1"`)
+}
+
+func TestPaidFirstUseAlertSMTPFailureNotRetried(t *testing.T) {
+	app, msgs := alertApp(t, "", errors.New("boom"))
+	if rec := tierReq(app, http.MethodPost, "/v1/chat/completions", `{"model":"a"}`, nil); rec.Code != 200 {
+		t.Fatalf("code %d", rec.Code)
+	}
+	wantAlerts(t, msgs, `"p1"`)
+	postModel(app, "a")
+	wantAlerts(t, msgs)
+}
+
+func TestUsageFileWithoutAlerts(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "usage.json")
+	if err := os.WriteFile(path, []byte(`{"rows":[]}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	app, msgs := alertApp(t, path, nil)
+	postModel(app, "a")
+	wantAlerts(t, msgs, `"p1"`)
 }

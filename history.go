@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"log/slog"
+	"maps"
 	"os"
 	"slices"
 	"strings"
@@ -56,7 +57,8 @@ type usageHistory struct {
 	flushMu sync.Mutex // serializes flushes; taken before mu
 	mu      sync.Mutex
 	rows    map[usageKey]*usageCounts
-	unread  string // file that held usage history but could not be loaded (the .bad copy when moved aside)
+	alerts  map[string]string // tier -> day (YYYY-MM-DD) of its paid first-use alert
+	unread  string            // file that held usage history but could not be loaded (the .bad copy when moved aside)
 	dirty   bool
 	timer   *time.Timer
 }
@@ -65,7 +67,7 @@ func newUsageHistory(path string, loc *time.Location, logger *slog.Logger) *usag
 	if loc == nil {
 		loc = time.UTC
 	}
-	h := &usageHistory{path: path, loc: loc, now: time.Now, delay: usageFlushDelay, logger: logger, rows: map[usageKey]*usageCounts{}}
+	h := &usageHistory{path: path, loc: loc, now: time.Now, delay: usageFlushDelay, logger: logger, rows: map[usageKey]*usageCounts{}, alerts: map[string]string{}}
 	h.load()
 	return h
 }
@@ -85,7 +87,8 @@ func (h *usageHistory) load() {
 		return
 	}
 	var f struct {
-		Rows []usageRow `json:"rows"`
+		Rows   []usageRow        `json:"rows"`
+		Alerts map[string]string `json:"alerts"`
 	}
 	if err == nil {
 		err = json.Unmarshal(b, &f)
@@ -101,6 +104,9 @@ func (h *usageHistory) load() {
 			h.logger.Warn("usage file not loaded, moved aside, starting empty", "error", err.Error(), "moved_to", bad)
 		}
 		return
+	}
+	for t, d := range f.Alerts {
+		h.alerts[t] = d
 	}
 	cut := h.cutoff()
 	for _, r := range f.Rows {
@@ -147,6 +153,11 @@ func (h *usageHistory) record(project, model, key, tier string, u usageTokens, n
 		c.CostUSD += worstCase // paid tier with no usage: charge the worst case so the cap cannot be dodged
 		c.NoUsage++
 	}
+	h.markDirtyLocked()
+}
+
+// markDirtyLocked flags the file for writing and schedules the delayed flush. h.mu must be held.
+func (h *usageHistory) markDirtyLocked() {
 	h.dirty = true
 	if h.path != "" && h.timer == nil {
 		h.timer = time.AfterFunc(h.delay, func() {
@@ -156,6 +167,19 @@ func (h *usageHistory) record(project, model, key, tier string, u usageTokens, n
 			h.flush()
 		})
 	}
+}
+
+// firstUse returns today (day in h.loc) and true when tier has no alert yet today, and marks it.
+func (h *usageHistory) firstUse(tier string) (string, bool) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	today := h.now().In(h.loc).Format("2006-01-02")
+	if h.alerts[tier] == today {
+		return today, false
+	}
+	h.alerts[tier] = today
+	h.markDirtyLocked()
+	return today, true
 }
 
 // spent is the CostUSD of today's rows of tier (day in h.loc).
@@ -236,8 +260,9 @@ func (h *usageHistory) flush() {
 	}
 	h.dirty = false // a record that lands during the write sets it again
 	b, err := json.Marshal(struct {
-		Rows []usageRow `json:"rows"`
-	}{h.snapshotLocked()})
+		Rows   []usageRow        `json:"rows"`
+		Alerts map[string]string `json:"alerts"`
+	}{h.snapshotLocked(), maps.Clone(h.alerts)})
 	h.mu.Unlock()
 	if err == nil {
 		err = writeFileAtomic(h.path, b)

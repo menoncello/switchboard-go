@@ -161,6 +161,12 @@ logged, the file is renamed to `<usage_file>.bad` (so the next write does not
 destroy it) and the history starts empty. Without `usage_file` the history stays in
 memory and startup (and `validate-config`) logs a warning.
 
+The first request a paid tier (`free` not set) serves each day sends one SMTP
+email (the `smtp` config) naming the tier and the model. The day it was sent is
+saved per tier under `alerts` in `usage_file` (`{"rows":[...],"alerts":{"tier":"2026-10-29"}}`),
+so a restart does not repeat it. The day is marked before sending, so a failed
+send is only logged and is not retried that day. Free tiers never send it.
+
 `GET /status` shows this history in a "Uso" section below the tiers: today's
 total (requests, tokens and cost, with the `timezone` zone) and, inside a `<details>`,
 one table per day, project, model, key and tier for the last 7 days (today plus

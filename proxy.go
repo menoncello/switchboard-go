@@ -144,6 +144,11 @@ func (a *App) proxyV1(w http.ResponseWriter, r *http.Request, style APIStyle) {
 			worst = a.config.maxPrice()
 		}
 		a.history.record(requestProject(r.Header), model, key, tier, usage, usageMissing, price, worst)
+		if a.config.paidTier(tier) {
+			if day, first := a.history.firstUse(tier); first {
+				a.sender.NotifyPaidFirstUse(tier, model, day)
+			}
+		}
 	}
 	a.logger.Info("request", attrs...)
 }
