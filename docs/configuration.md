@@ -228,7 +228,7 @@ Every proxied request writes one JSON line to stderr when its response ends
 (for a stream, after the last event):
 
 ```json
-{"time":"...","level":"INFO","msg":"request","model":"glm-5.1","api_style":"openai","tier":"opencode-go","project":"sem projeto","key_index":0,"key_name":"main","status":200,"latency_ms":412}
+{"time":"...","level":"INFO","msg":"request","model":"glm-5.1","api_style":"openai","tier":"opencode-go","project":"sem projeto","key_index":0,"key_name":"main","tokens_in":1204,"tokens_out":87,"status":200,"latency_ms":412}
 ```
 
 - `model`: top-level `model` of the request body, empty if there is none;
@@ -242,6 +242,17 @@ Every proxied request writes one JSON line to stderr when its response ends
 - `key_index` and `key_name`: only for tier 0 (`key_name` can be empty).
 - `status`: the status the client received.
 - `latency_ms`: from before the body is read to the last byte sent to the client.
+- `tokens_in` and `tokens_out`: the token counts from the `usage` field of the
+  upstream response (OpenAI `prompt_tokens`/`completion_tokens`, Anthropic
+  `input_tokens`/`output_tokens`), for a JSON body and for a stream. In a stream
+  they come from the last `usage` seen (Anthropic: `input_tokens` from
+  `message_start`, cumulative `output_tokens` from the last `message_delta`).
+  The proxy never changes the request to get them and never estimates them.
+- `usage_missing`: `true` when the response was `2xx` from a tier but carried no
+  usable `usage` (absent, malformed, a compressed body with `Content-Encoding`,
+  or a JSON body above 1 MiB). The line then has no `tokens_*`.
+  Responses that are not `2xx` and requests no tier answered (local `429`, `502`,
+  `499`, `413`, `400`) have neither `tokens_*` nor `usage_missing`.
 
 Requests rejected while reading the body (`413` too large, `400` read failure)
 are logged too, with empty `model` and `tier` and no key fields.

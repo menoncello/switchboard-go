@@ -3169,3 +3169,124 @@ func TestLoadConfigTelegram(t *testing.T) {
 		t.Fatalf("bad summary: %s", s)
 	}
 }
+
+func TestRequestLogTokens(t *testing.T) {
+	sseAnthropic := "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":12,\"output_tokens\":1}}}\n\n" +
+		"event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"delta\":{\"text\":\"oi\"}}\n\n" +
+		"event: message_delta\ndata: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":3}}\n\n" +
+		"event: message_delta\ndata: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":5}}\n\n"
+	sseOpenAI := "data: {\"choices\":[{\"delta\":{\"content\":\"a\"}}],\"usage\":null}\n\n" +
+		"data: {\"choices\":[],\"usage\":{\"prompt_tokens\":11,\"completion_tokens\":7}}\n\n" +
+		"data: [DONE]\n\n"
+	cases := []struct {
+		name, path, ctype, body string
+		status                  int
+		in, out                 float64
+		missing                 bool
+	}{
+		{"json openai", "/v1/chat/completions", "application/json", `{"usage":{"prompt_tokens":11,"completion_tokens":7}}`, 200, 11, 7, false},
+		{"json anthropic", "/v1/messages", "application/json", `{"usage":{"input_tokens":12,"output_tokens":5}}`, 200, 12, 5, false},
+		{"stream anthropic", "/v1/messages", "text/event-stream", sseAnthropic, 200, 12, 5, false},
+		{"stream openai", "/v1/chat/completions", "text/event-stream", sseOpenAI, 200, 11, 7, false},
+		{"json without usage", "/v1/chat/completions", "application/json", `{"choices":[]}`, 200, 0, 0, true},
+		{"json malformed", "/v1/chat/completions", "application/json", `{"usage":`, 200, 0, 0, true},
+		{"stream without usage", "/v1/chat/completions", "text/event-stream", "data: {\"choices\":[]}\n\ndata: [DONE]\n\n", 200, 0, 0, true},
+		{"non 2xx", "/v1/chat/completions", "application/json", `{"usage":{"prompt_tokens":1,"completion_tokens":1}}`, 401, 0, 0, false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", c.ctype)
+				w.WriteHeader(c.status)
+				_, _ = w.Write([]byte(c.body))
+			}))
+			defer up.Close()
+			app := newApp(Config{ProxyAPIKey: "p", UpstreamAPIKeys: []string{"k"}, UpstreamBaseURL: up.URL, MaxRequestBodyBytes: 1 << 20, RetryExhaustedAfter: time.Hour})
+			lines := captureLog(app)
+			rec := tierReq(app, http.MethodPost, c.path, `{"model":"m"}`, nil)
+			if rec.Code != c.status || rec.Body.String() != c.body {
+				t.Fatalf("client got %d %q", rec.Code, rec.Body.String())
+			}
+			got := lines(t)
+			if len(got) != 1 {
+				t.Fatalf("lines: %v", got)
+			}
+			l := got[0]
+			if l["tokens_in"] != nilIf0(c.in) || l["tokens_out"] != nilIf0(c.out) {
+				t.Fatalf("tokens: %v", l)
+			}
+			if _, has := l["usage_missing"]; has != c.missing || (has && l["usage_missing"] != true) {
+				t.Fatalf("usage_missing: %v", l)
+			}
+		})
+	}
+}
+
+// nilIf0 is the log value of a token count: absent (nil) when there is none.
+func nilIf0(v float64) any {
+	if v == 0 {
+		return nil
+	}
+	return v
+}
+
+func TestSSEUsageScannerSplitEvent(t *testing.T) {
+	ev := "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":4,\"completion_tokens\":9}}\n\n"
+	for cut := 1; cut < len(ev); cut++ {
+		var s sseUsageScanner
+		_, _ = s.Write([]byte(ev[:cut]))
+		_, _ = s.Write([]byte(ev[cut:]))
+		if got := s.result(); !got.found || got.in != 4 || got.out != 9 {
+			t.Fatalf("cut %d: %+v", cut, got)
+		}
+	}
+	// last line without a trailing newline
+	var s sseUsageScanner
+	_, _ = s.Write([]byte(strings.TrimSpace(ev)))
+	if got := s.result(); !got.found || got.in != 4 || got.out != 9 {
+		t.Fatalf("no newline: %+v", got)
+	}
+}
+
+func TestStreamReachesClientBeforeUpstreamEnds(t *testing.T) {
+	first := "data: {\"choices\":[{\"delta\":{\"content\":\"a\"}}]}\n\n"
+	rest := "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":2,\"completion_tokens\":3}}\n\ndata: [DONE]\n\n"
+	release := make(chan struct{})
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte(first))
+		w.(http.Flusher).Flush()
+		<-release
+		_, _ = w.Write([]byte(rest))
+	}))
+	defer up.Close()
+	app := newApp(Config{ProxyAPIKey: "p", UpstreamAPIKeys: []string{"k"}, UpstreamBaseURL: up.URL, MaxRequestBodyBytes: 1 << 20, RetryExhaustedAfter: time.Hour})
+	lines := captureLog(app)
+	front := httptest.NewServer(app)
+	defer front.Close()
+	req, _ := http.NewRequest(http.MethodPost, front.URL+"/v1/chat/completions", strings.NewReader(`{"model":"m"}`))
+	req.Header.Set("Authorization", "Bearer p")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	buf := make([]byte, len(first))
+	if _, err := io.ReadFull(resp.Body, buf); err != nil || string(buf) != first {
+		close(release)
+		t.Fatalf("first event: %q, %v", buf, err)
+	}
+	close(release) // the upstream was still open while the client already had the first event
+	tail, err := io.ReadAll(resp.Body)
+	if err != nil || string(buf)+string(tail) != first+rest {
+		t.Fatalf("body %q, %v", string(buf)+string(tail), err)
+	}
+	var got []map[string]any
+	for i := 0; i < 100 && len(got) == 0; i++ { // the log is written after the handler returns
+		time.Sleep(10 * time.Millisecond)
+		got = lines(t)
+	}
+	if len(got) != 1 || got[0]["tokens_in"] != float64(2) || got[0]["tokens_out"] != float64(3) {
+		t.Fatalf("log: %v", got)
+	}
+}
