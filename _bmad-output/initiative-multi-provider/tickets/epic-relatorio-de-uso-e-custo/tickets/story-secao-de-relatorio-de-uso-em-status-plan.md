@@ -3,7 +3,7 @@ title: 'Seção de relatório de uso em /status'
 type: 'feature'
 ticket: 4
 created: '2026-10-29'
-status: built
+status: done
 baseline_revision: '56c0cc18d74bba1b2fef3d016d7ec2f21044edc2'
 route: 'full'
 route_source: 'auto'
@@ -108,3 +108,24 @@ Tabela por dimensão = mesma agregação com a chave trocada: uma função receb
 **Follow-up recomendado:** false.
 **Verificação:** `go vet ./...` e `go test -race -count=1 ./...` verdes. Não abri `/status` no navegador; o layout só foi checado pelo HTML nos testes.
 **Risco residual:** `/status` é aberto e agora mostra projeto e modelo vindos do cliente (documentado).
+
+## Code Review
+
+### 2026-10-29
+1 `decision-needed`, 2 `patch`, 0 `defer`, 11 rejected.
+
+- [x] [Review][Decision] Checagem com o proxy rodando não feita — o verify do ticket pede ver a seção em /status; os testes usam httptest e o layout do `<details>` não foi visto. Options: (a) rodar o proxy e abrir /status; (b) aceitar a cobertura de httptest. Recommended: (a) — o verify pede e o layout nunca foi visto.
+- [x] [Review][Patch] Sem teste da virada de dia no fuso configurado: `window`/"Hoje" com Timezone America/Sao_Paulo e relógio 2026-10-30 01:00 UTC, esperando `Hoje (2026-10-29, America/Sao_Paulo): 1 requests` [history_test.go]
+- [x] [Review][Patch] Asserções de `TestStatusUsageSection` não são escopadas por seção e `section()` dá panic se o `<h3>` faltar; usar `section()` e `t.Fatalf` [history_test.go:416]
+
+**Rejected**
+- Linhas de projeto/modelo sem limite: só POST servido por tier é gravado, projeto tem charset e tamanho validados, modelo é truncado; um limite adiciona complexidade.
+- Tier/modelo vazio em célula em branco: falso, `record` só roda com tier e modelo não vazios (proxy.go:131).
+- Teste de escape em X-Project: falso, `requestProject` só aceita `[A-Za-z0-9._-]`.
+- "Hoje" com zeros quando só há dias anteriores: falso, é o comportamento pretendido.
+- Acoplamento `i == 0` em `usageReport`: raro e só de desenvolvimento.
+- Checkboxes do plano e `docs/admin-api.md`: o doc trata de `/admin/status`, não de `/status`; checkboxes são processo.
+- `statusPage` posicional: só compila com tipos iguais, impacto desprezível.
+- Colunas de cache e "sem usage" a mais: intencional, dado já gravado.
+- Seção oculta com janela vazia: documentado em docs/configuration.md.
+- Teste de projeto hostil: falso, mesmo motivo do charset.
