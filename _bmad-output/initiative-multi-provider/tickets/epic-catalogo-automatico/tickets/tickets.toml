@@ -1,0 +1,90 @@
+# Stories do épico catalogo-automatico, em ordem de construção. Uma trilha só: tudo mexe nas instruções do agente em docs/catalog-agent.md.
+# next_id = 9
+
+[[entry]]
+id = 1
+type = "story"
+title = "Tracer: rodada do agente com OpenRouter grava a proposta"
+description = "Cria docs/catalog-agent.md com as instruções do agente: ler tiers e prices da config (só leitura), consultar a API de modelos do OpenRouter e gravar uma proposta em Markdown, um arquivo por rodada com data e hora no nome, em catalog-proposals/, em um diretório que o Eduardo define no agente (padrão: ao lado do state_file, quando o agente o alcança). A proposta traz modelos novos, mudanças de preço e mudanças de gratuidade, cada item com a URL da fonte. Fixa o formato que as demais stories estendem: uma seção por tipo (modelos novos, preço, gratuidade, limites, provedores novos) e, em mudança de gratuidade ou preço, a direção (gratuito para pago, pago para gratuito) com o valor antigo e o novo. Um tier é do OpenRouter quando o host do base_url é openrouter.ai. O Eduardo cria o agente no Orca com essas instruções."
+verify = "O Eduardo roda o agente uma vez no Orca com uma config de exemplo: surge um arquivo em catalog-proposals/ com as seções de modelos novos, preço e gratuidade, cada item com URL, e a config fica intacta."
+covers = ["R9"]
+after = ["2.11", "3.5"]
+hitl = true
+risk = "medium"
+
+[[entry]]
+id = 2
+type = "story"
+title = "Guarda de roteamento: hashes, teste e config só para leitura"
+description = "A rodada calcula o hash da config, do state_file e do usage_file (os que o agente alcança) no início e no fim e grava todos na proposta; a linha \"roteamento inalterado: sim/não\" depende só do hash da config, porque o proxy reescreve o state_file e o usage_file sozinho; um teste em Go falha se código do proxy (fora de _test.go) referenciar o diretório ou os arquivos de proposta; o Eduardo dá ao agente a config só para leitura no Orca e documenta isso em docs/catalog-agent.md."
+verify = "go test: um arquivo .go do proxy que cite catalog-proposals faz o teste falhar e o código atual passa. Uma rodada no Orca grava os hashes e \"roteamento inalterado: sim\"; alterar a config no meio da rodada grava \"não\", e o proxy reescrevendo o state_file não muda a linha."
+covers = ["R9"]
+after = [1]
+hitl = true
+risk = "medium"
+
+[[entry]]
+id = 3
+type = "story"
+title = "Provedores da config fora do OpenRouter, pela documentação"
+description = "docs/catalog-agent.md ganha uma tabela, mantida pelo Eduardo, do nome do tier para a URL da sua página de documentação (a config não muda). O agente lê a página de cada tier da config que não está no OpenRouter, extrai modelos, preço, gratuidade e limites, cita a URL de cada item e marca \"não verificado\" quando a página mudou de formato ou não deu para ler."
+verify = "Uma rodada com um tier fora do OpenRouter grava itens desse tier com URL da página; com a página trocada por uma ilegível, o item sai com a marca \"não verificado\" e a rodada termina."
+covers = ["R9"]
+after = [2]
+hitl = true
+risk = "high"
+
+[[entry]]
+id = 4
+type = "story"
+title = "Limites novos e propostas sem repetição"
+description = "O agente compara com a config atual e com a proposta da rodada anterior: mudança de contexto, tool calling, limite, preço ou disponibilidade vira item; item igual ao já proposto e sem mudança de valor não se repete."
+verify = "Duas rodadas seguidas sem mudança na fonte: a segunda proposta não traz itens. Editando em uma config de exemplo um preço em prices e um limite em tiers (ou na proposta anterior), a rodada seguinte traz só esses dois itens, com o valor antigo e o novo."
+covers = ["R9"]
+after = [3]
+hitl = false
+risk = "medium"
+
+[[entry]]
+id = 5
+type = "story"
+title = "Provedores novos com tier gratuito"
+description = "A proposta ganha uma seção de provedores fora da config que ofereçam tier gratuito, cada um com a URL da fonte, os modelos gratuitos e o que se sabe de limite e de estilo de API; um provedor já proposto sem mudança de valor não se repete."
+verify = "Uma rodada grava a seção com ao menos um provedor que não está na config, cada item com URL, modelos gratuitos e estilo de API ou \"não informado\"."
+covers = ["R9"]
+after = [4]
+hitl = false
+risk = "medium"
+
+[[entry]]
+id = 6
+type = "story"
+title = "Aviso no Telegram quando um modelo deixa de ser gratuito"
+description = "Depois de gravar a proposta, o agente lê bot_token e chat_id da config (só leitura) e envia um Telegram com os modelos que passaram de gratuito a pago, apontando o arquivo da proposta; sem item de gratuidade perdida não envia nada."
+verify = "Com uma proposta que traz um modelo passando de gratuito a pago chega uma mensagem no Telegram com o modelo e o caminho da proposta; uma rodada sem essa mudança não envia mensagem."
+covers = ["R9"]
+after = [5]
+hitl = true
+risk = "low"
+
+[[entry]]
+id = 7
+type = "story"
+title = "Recorrência do agente no Orca"
+description = "docs/catalog-agent.md ganha o intervalo recomendado e o comando do agente; o Eduardo agenda a rodada recorrente no Orca."
+verify = "O Orca dispara uma rodada sem ação do Eduardo e uma proposta nova aparece em catalog-proposals/ com data e hora posteriores à anterior."
+covers = ["R9"]
+after = [6]
+hitl = true
+risk = "low"
+
+[[entry]]
+id = 8
+type = "story"
+title = "Refactor sweep"
+description = "Limpeza do que as stories deixaram para trás, a partir dos planos e achados de revisão que o épico adiou; só cleanup, escopo novo vira story."
+verify = "go build e go test passam, sem comportamento novo, e cada item varrido está nos planos ou achados do épico."
+covers = []
+after = [7]
+hitl = false
+risk = "low"
