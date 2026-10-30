@@ -50,10 +50,11 @@ type usageHistory struct {
 	delay  time.Duration
 	logger *slog.Logger
 
-	mu    sync.Mutex
-	rows  map[usageKey]*usageCounts
-	dirty bool
-	timer *time.Timer
+	flushMu sync.Mutex // serializes flushes; taken before mu
+	mu      sync.Mutex
+	rows    map[usageKey]*usageCounts
+	dirty   bool
+	timer   *time.Timer
 }
 
 func newUsageHistory(path string, loc *time.Location, logger *slog.Logger) *usageHistory {
@@ -79,15 +80,20 @@ func (h *usageHistory) load() {
 		h.logger.Info("no usage file yet, starting with empty usage history")
 		return
 	}
-	if err != nil {
-		h.logger.Warn("usage file not loaded, starting empty", "error", err.Error())
-		return
-	}
 	var f struct {
 		Rows []usageRow `json:"rows"`
 	}
-	if err := json.Unmarshal(b, &f); err != nil {
-		h.logger.Warn("usage file is invalid, starting empty", "error", err.Error())
+	if err == nil {
+		err = json.Unmarshal(b, &f)
+	}
+	if err != nil {
+		// Move the file aside so the first flush does not overwrite what could not be read.
+		bad := h.path + ".bad"
+		if rerr := os.Rename(h.path, bad); rerr != nil {
+			h.logger.Error("usage file could not be moved aside, the next write will replace it", "error", rerr.Error())
+		} else {
+			h.logger.Warn("usage file not loaded, moved aside, starting empty", "error", err.Error(), "moved_to", bad)
+		}
 		return
 	}
 	cut := h.cutoff()
@@ -155,14 +161,16 @@ func (h *usageHistory) snapshot() []usageRow {
 	return h.snapshotLocked()
 }
 
-// flush drops days past retention and writes the file. A failure is only logged
-// and dirty stays set for the next flush.
+// flush drops days past retention and writes the file. The write runs outside
+// h.mu so requests are not blocked by the disk. A failure is only logged and
+// dirty is set again for the next flush.
 func (h *usageHistory) flush() {
 	if h.path == "" {
 		return
 	}
+	h.flushMu.Lock()
+	defer h.flushMu.Unlock()
 	h.mu.Lock()
-	defer h.mu.Unlock()
 	cut := h.cutoff()
 	for k := range h.rows {
 		if k.Day < cut {
@@ -171,19 +179,23 @@ func (h *usageHistory) flush() {
 		}
 	}
 	if !h.dirty {
+		h.mu.Unlock()
 		return
 	}
+	h.dirty = false // a record that lands during the write sets it again
 	b, err := json.Marshal(struct {
 		Rows []usageRow `json:"rows"`
 	}{h.snapshotLocked()})
+	h.mu.Unlock()
 	if err == nil {
 		err = writeFileAtomic(h.path, b)
 	}
 	if err != nil {
 		h.logger.Error("usage file not saved", "error", err.Error())
-		return
+		h.mu.Lock()
+		h.dirty = true
+		h.mu.Unlock()
 	}
-	h.dirty = false
 }
 
 func (h *usageHistory) close() {

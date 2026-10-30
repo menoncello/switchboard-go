@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"encoding/json"
 	"log"
 	"log/slog"
 	"net/http"
@@ -15,12 +16,19 @@ import (
 
 func historyApp(t *testing.T, status int, body, usageFile string) *App {
 	t.Helper()
+	return historyAppWith(t, status, body, func(c *Config) { c.UsageFile = usageFile })
+}
+
+func historyAppWith(t *testing.T, status int, body string, mod func(*Config)) *App {
+	t.Helper()
 	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(status)
 		_, _ = w.Write([]byte(body))
 	}))
 	t.Cleanup(up.Close)
-	return newApp(Config{ProxyAPIKey: "p", UpstreamAPIKeys: []string{"k"}, KeyNames: []string{"main"}, UpstreamBaseURL: up.URL, MaxRequestBodyBytes: 1 << 20, RetryExhaustedAfter: time.Hour, UsageFile: usageFile})
+	cfg := Config{ProxyAPIKey: "p", UpstreamAPIKeys: []string{"k"}, KeyNames: []string{"main"}, UpstreamBaseURL: up.URL, MaxRequestBodyBytes: 1 << 20, RetryExhaustedAfter: time.Hour}
+	mod(&cfg)
+	return newApp(cfg)
 }
 
 const usageBody = `{"usage":{"prompt_tokens":10,"completion_tokens":3}}`
@@ -51,7 +59,7 @@ func TestHistoryNoUsageAndNon2xx(t *testing.T) {
 	if r := app.history.snapshot(); len(r) != 1 || r[0].Requests != 1 || r[0].NoUsage != 1 || r[0].TokensIn != 0 {
 		t.Fatalf("rows: %+v", r)
 	}
-	app = historyApp(t, 500, `{}`, "")
+	app = historyApp(t, 400, `{}`, "") // a 5xx or quota 429 is a tier failure, not recorded
 	post(app, "")
 	if r := app.history.snapshot(); len(r) != 1 || r[0].Requests != 1 || r[0].NoUsage != 0 || r[0].TokensIn != 0 {
 		t.Fatalf("rows: %+v", r)
@@ -105,10 +113,8 @@ func TestHistoryRetention(t *testing.T) {
 
 func TestHistoryDayByTimezone(t *testing.T) {
 	at := time.Date(2026, 10, 30, 1, 0, 0, 0, time.UTC)
-	for tz, want := range map[string]string{"America/Sao_Paulo": "2026-10-29", "": "2026-10-30"} {
-		app := historyApp(t, 200, usageBody, "")
-		loc, _ := time.LoadLocation(tz)
-		app.history = newUsageHistory("", loc, app.logger)
+	for tz, want := range map[string]string{"America/Sao_Paulo": "2026-10-29", "": "2026-10-30", "Marte/Olimpo": "2026-10-30"} {
+		app := historyAppWith(t, 200, usageBody, func(c *Config) { c.Timezone = tz })
 		app.history.now = func() time.Time { return at }
 		post(app, "")
 		if r := app.history.snapshot(); len(r) != 1 || r[0].Day != want {
@@ -161,12 +167,26 @@ func TestHistoryWriteFailureDoesNotAffectRequest(t *testing.T) {
 		t.Fatalf("code %d", code)
 	}
 	app.history.flush()
-	if !strings.Contains(logs.String(), "usage file not saved") {
-		t.Fatalf("log: %q", logs.String())
+	if !strings.Contains(logs.String(), "usage file not saved") || !app.history.dirty {
+		t.Fatalf("log: %q dirty=%v", logs.String(), app.history.dirty)
 	}
 }
 
 func TestHistoryDelayedWrite(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "usage.json")
+	app := historyApp(t, 200, usageBody, path)
+	app.history.delay = time.Hour
+	post(app, "")
+	if _, err := os.Stat(path); err == nil {
+		t.Fatal("file written before the delay")
+	}
+	app.history.close()
+	if _, err := os.Stat(path); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestHistoryTimerFlush(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "usage.json")
 	app := historyApp(t, 200, usageBody, path)
 	app.history.delay = 20 * time.Millisecond
@@ -188,6 +208,81 @@ func TestHistoryCloseFlushes(t *testing.T) {
 	app := historyApp(t, 200, usageBody, path)
 	post(app, "")
 	app.history.close()
+	if _, err := os.Stat(path); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestHistoryInvalidFileMovedAside(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "usage.json")
+	orig := []byte(`{"rows": [oops`)
+	if err := os.WriteFile(path, orig, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	app := historyApp(t, 200, usageBody, path)
+	post(app, "")
+	app.history.flush()
+	if b, err := os.ReadFile(path + ".bad"); err != nil || !bytes.Equal(b, orig) {
+		t.Fatalf(".bad: %q %v", b, err)
+	}
+	b, _ := os.ReadFile(path)
+	if !json.Valid(b) || !strings.Contains(string(b), `"requests":1`) {
+		t.Fatalf("new file: %s", b)
+	}
+}
+
+func TestHistorySkipsHeldFailureAndGET(t *testing.T) {
+	app := historyApp(t, 429, quotaBody, "")
+	if code := post(app, ""); code != http.StatusTooManyRequests {
+		t.Fatalf("code %d", code)
+	}
+	if r := app.history.snapshot(); len(r) != 0 {
+		t.Fatalf("held failure: %+v", r)
+	}
+	app = historyApp(t, 200, usageBody, "")
+	if code := tierReq(app, http.MethodGet, "/v1/models", ``, nil).Code; code != 200 {
+		t.Fatalf("code %d", code)
+	}
+	if r := app.history.snapshot(); len(r) != 0 {
+		t.Fatalf("GET: %+v", r)
+	}
+}
+
+func TestHistoryRowDimensions(t *testing.T) {
+	app := historyApp(t, 200, usageBody, "")
+	app.config.KeyNames = nil
+	post(app, "")
+	if r := app.history.snapshot(); len(r) != 1 || r[0].Key != "key-0" {
+		t.Fatalf("unnamed key: %+v", r)
+	}
+
+	f := newTierFixture(t, false, false)
+	if rec := tierReq(f.app, http.MethodPost, "/v1/chat/completions", `{"model":"a"}`, nil); rec.Code != 200 {
+		t.Fatalf("code %d", rec.Code)
+	}
+	if r := f.app.history.snapshot(); len(r) != 1 || r[0].Key != "" || r[0].Tier != "t1" {
+		t.Fatalf("extra tier: %+v", r)
+	}
+
+	app = historyApp(t, 200, usageBody, "")
+	tierReq(app, http.MethodPost, "/v1/chat/completions", `{"model":"`+strings.Repeat("x", 300)+`"}`, nil)
+	if r := app.history.snapshot(); len(r) != 1 || len(r[0].Model) == 0 || len(r[0].Model) > maxLoggedModel {
+		t.Fatalf("long model: %+v", r)
+	}
+
+	app = historyApp(t, 200, usageBody, "")
+	tierReq(app, http.MethodPost, "/v1/chat/completions", `{"messages":[]}`, nil)
+	if r := app.history.snapshot(); len(r) != 0 {
+		t.Fatalf("no model: %+v", r)
+	}
+}
+
+func TestShutdownFlushesHistory(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "usage.json")
+	app := historyApp(t, 200, usageBody, path)
+	app.history.delay = time.Hour
+	post(app, "")
+	shutdown(&http.Server{}, app)
 	if _, err := os.Stat(path); err != nil {
 		t.Fatal(err)
 	}

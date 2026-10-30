@@ -41,14 +41,20 @@ func main() {
 	go func() {
 		defer close(done)
 		<-ctx.Done()
-		shut, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		defer cancel()
-		_ = srv.Shutdown(shut)
-		a.history.close()
+		shutdown(srv, a)
 	}()
 	log.Printf("startup listen_addr=%s upstream_base_url=%s upstream_keys=%d smtp_configured=%t config_source=%s max_request_body_bytes=%d retry_exhausted_after=%s response_header_timeout=%s", cfg.ListenAddr, cfg.UpstreamBaseURL, len(cfg.UpstreamAPIKeys), cfg.SMTP.Host != "" && cfg.SMTP.From != "" && cfg.SMTP.To != "", defaultString(cfg.ConfigSourcePath, "none"), cfg.MaxRequestBodyBytes, cfg.RetryExhaustedAfter, cfg.UpstreamResponseHeaderTimeout)
 	if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		log.Fatal(err)
 	}
 	<-done
+}
+
+// shutdown stops the server, then flushes the usage history so nothing recorded
+// during the drain is lost.
+func shutdown(srv *http.Server, a *App) {
+	shut, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	_ = srv.Shutdown(shut)
+	a.history.close()
 }

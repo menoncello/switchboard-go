@@ -126,7 +126,9 @@ startup (and `validate-config`) logs a warning. The usage history lives in its o
 on a per-request usage history that survives restarts. Each request served by a
 tier adds to one row per day, project (`X-Project`), model, key and tier
 (a key shows as its `key_name`, or `key-<index>` when unnamed; empty for extra
-tiers). Requests that no tier served (429, 502, 499, 413, 400) are not counted.
+tiers). Only POST requests a tier served are counted: responses nobody served
+(429, 502, 499, 413, 400), an upstream failure held and returned after every tier
+failed, `GET /v1/models` and requests without a `model` are not.
 A row counts `requests`, `tokens_in`, `tokens_out`, `tokens_cache_in` and
 `no_usage` (2xx POST responses without a `usage` field). The file is JSON:
 
@@ -135,13 +137,16 @@ A row counts `requests`, `tokens_in`, `tokens_out`, `tokens_cache_in` and
 ```
 
 The day is computed in `timezone` (an IANA name such as `America/Sao_Paulo`;
-default UTC; an invalid name is rejected at startup). Rows older than 90 days are
+default UTC; an invalid name is rejected at startup). Rows store only the day
+string, so changing `timezone` between restarts mixes days computed in two zones
+in the same file. Rows older than 90 days are
 dropped when the file is loaded and written. The file is written a few seconds
 (3 s) after the first request that changed it, not on every request, and again on
 shutdown (SIGINT/SIGTERM). The write goes to a temporary file in the same
 directory and is renamed, so the directory must be writable; a write failure is
 logged and does not affect the request. A missing or invalid file at startup is
-logged and the history starts empty. Without `usage_file` the history stays in
+logged, the file is renamed to `<usage_file>.bad` (so the next write does not
+destroy it) and the history starts empty. Without `usage_file` the history stays in
 memory and startup (and `validate-config`) logs a warning.
 
 ## Tiers

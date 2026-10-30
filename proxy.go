@@ -100,7 +100,7 @@ func (a *App) proxyV1(w http.ResponseWriter, r *http.Request, style APIStyle) {
 	// Limit with the original writer so net/http still sees an oversized body and closes the connection.
 	r.Body = http.MaxBytesReader(w, r.Body, a.config.MaxRequestBodyBytes)
 	rec := &statusRecorder{ResponseWriter: w}
-	model, tier, keyIdx, usage := a.serveProxy(rec, r, style)
+	model, tier, keyIdx, usage, held := a.serveProxy(rec, r, style)
 	if rec.status == 0 {
 		rec.status = http.StatusOK
 	}
@@ -109,6 +109,7 @@ func (a *App) proxyV1(w http.ResponseWriter, r *http.Request, style APIStyle) {
 		apiStyle = "anthropic"
 	}
 	model = truncateModel(model)
+	usageMissing := !usage.found && rec.status/100 == 2 && r.Method == http.MethodPost // GET /v1/models has no usage by nature
 	attrs := []any{"model", model, "api_style", apiStyle, "tier", tier, "project", requestProject(r.Header)}
 	if keyIdx >= 0 {
 		attrs = append(attrs, "key_index", keyIdx, "key_name", a.config.keyName(keyIdx))
@@ -122,17 +123,18 @@ func (a *App) proxyV1(w http.ResponseWriter, r *http.Request, style APIStyle) {
 		if usage.partial {
 			attrs = append(attrs, "usage_partial", true)
 		}
-	} else if tier != "" && rec.status/100 == 2 && r.Method == http.MethodPost { // GET /v1/models has no usage by nature
+	} else if tier != "" && usageMissing {
 		attrs = append(attrs, "usage_missing", true)
 	}
-	if tier != "" {
+	// Only a POST a tier served counts: not held failures, GET /v1/models or a request without model.
+	if tier != "" && !held && r.Method == http.MethodPost && model != "" {
 		key := ""
 		if keyIdx >= 0 {
 			if key = a.config.keyName(keyIdx); key == "" {
 				key = "key-" + strconv.Itoa(keyIdx)
 			}
 		}
-		a.history.record(requestProject(r.Header), model, key, tier, usage, !usage.found && rec.status/100 == 2 && r.Method == http.MethodPost)
+		a.history.record(requestProject(r.Header), model, key, tier, usage, usageMissing)
 	}
 	a.logger.Info("request", attrs...)
 }
@@ -140,7 +142,7 @@ func (a *App) proxyV1(w http.ResponseWriter, r *http.Request, style APIStyle) {
 // serveProxy does the work of proxyV1 and returns what the log line needs: the
 // top-level model, the tier that answered ("" when none did), the tier 0 key index (-1 when tier 0 did not answer)
 // and the tokens the response reported.
-func (a *App) serveProxy(w http.ResponseWriter, r *http.Request, style APIStyle) (model, tier string, keyIdx int, usage usageTokens) {
+func (a *App) serveProxy(w http.ResponseWriter, r *http.Request, style APIStyle) (model, tier string, keyIdx int, usage usageTokens, held bool) {
 	keyIdx = -1
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
@@ -171,7 +173,7 @@ func (a *App) serveProxy(w http.ResponseWriter, r *http.Request, style APIStyle)
 			if reqErr != nil {
 				if orig.Err() != nil {
 					w.WriteHeader(statusClientClosed)
-					return model, "", -1, usageTokens{}
+					return model, "", -1, usageTokens{}, false
 				}
 				// Connection error or timeout: no cooldown, no key rotation, on to the extra tiers.
 				last.err = reqErr
@@ -196,16 +198,16 @@ func (a *App) serveProxy(w http.ResponseWriter, r *http.Request, style APIStyle)
 				break
 			}
 			a.telegram.rearm()
-			return model, tier0Name, idx, copyResponse(w, resp)
+			return model, tier0Name, idx, copyResponse(w, resp), false
 		}
 	}
 	if name, tokens, ok := a.proxyTiers(orig, w, r, fields, model, style, needTools, &last); ok {
 		a.telegram.rearm()
-		return model, name, -1, tokens
+		return model, name, -1, tokens, false
 	}
 	if orig.Err() != nil {
 		w.WriteHeader(statusClientClosed)
-		return model, "", -1, usageTokens{}
+		return model, "", -1, usageTokens{}, false
 	}
 	a.telegram.notifyFailure(model)
 	// No tier served it; alert once when every tier 0 key is exhausted.
@@ -213,11 +215,11 @@ func (a *App) serveProxy(w http.ResponseWriter, r *http.Request, style APIStyle)
 		a.sender.NotifyAllExhausted(a.keys.Status())
 	}
 	if last.resp != nil {
-		return model, last.tier, last.key, copyResponse(w, last.resp)
+		return model, last.tier, last.key, copyResponse(w, last.resp), true
 	}
 	if last.err != nil {
 		http.Error(w, "upstream unreachable", http.StatusBadGateway) // fixed text: the error would leak the tier URL
-		return model, "", -1, usageTokens{}
+		return model, "", -1, usageTokens{}, false
 	}
 	// No eligible tier remains. Fail fast locally instead of hammering upstream,
 	// and hint well-behaved clients at the first window via Retry-After.
@@ -225,7 +227,7 @@ func (a *App) serveProxy(w http.ResponseWriter, r *http.Request, style APIStyle)
 		w.Header().Set("Retry-After", strconv.Itoa(secs))
 	}
 	writeAPIError(w, style, http.StatusTooManyRequests, "rate_limit_exceeded", "all upstream keys exhausted")
-	return model, "", -1, usageTokens{}
+	return model, "", -1, usageTokens{}, false
 }
 
 // heldResponse is the last failure response seen, kept so the client can get it

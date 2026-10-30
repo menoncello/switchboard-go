@@ -2969,6 +2969,14 @@ func TestLoadConfigStateFile(t *testing.T) {
 	}
 }
 
+func TestLoadConfigUsageFileAndTimezone(t *testing.T) {
+	tiersYAML(t, "usage_file: /x/usage.json\ntimezone: America/Sao_Paulo\n")
+	cfg, err := loadConfig()
+	if err != nil || cfg.UsageFile != "/x/usage.json" || cfg.Timezone != "America/Sao_Paulo" {
+		t.Fatalf("cfg=%q %q err=%v", cfg.UsageFile, cfg.Timezone, err)
+	}
+}
+
 // fakeTelegram records sendMessage calls (path and body) and answers with status.
 func fakeTelegram(t *testing.T, status int) chan [2]string {
 	t.Helper()
