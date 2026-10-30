@@ -87,6 +87,11 @@ min_context: 64000
 # File where tier cooldowns and exhausted tier 0 keys are saved (see below).
 state_file: "/var/lib/switchboard-go/state.json"
 
+# File for the usage history and the IANA time zone that decides the day
+# (default UTC); see "Usage history" below.
+usage_file: "/var/lib/switchboard-go/usage.json"
+timezone: "America/Sao_Paulo"
+
 tiers:
   - name: "free-provider"
     base_url: "https://api.example.com/v1"
@@ -113,7 +118,31 @@ Entries whose cooldown has ended are not restored. With `retry_exhausted_after: 
 no key is saved, since exhausted keys have no cooldown. A missing or invalid file at
 startup is logged and the proxy starts without state; a write failure is logged
 and does not affect the request. Without `state_file` nothing is saved and
-startup (and `validate-config`) logs a warning. Daily spend is not persisted.
+startup (and `validate-config`) logs a warning. The usage history lives in its own file (see below).
+
+## Usage history
+
+`usage_file` and `timezone` (top-level, YAML only, no environment variable) turn
+on a per-request usage history that survives restarts. Each request served by a
+tier adds to one row per day, project (`X-Project`), model, key and tier
+(a key shows as its `key_name`, or `key-<index>` when unnamed; empty for extra
+tiers). Requests that no tier served (429, 502, 499, 413, 400) are not counted.
+A row counts `requests`, `tokens_in`, `tokens_out`, `tokens_cache_in` and
+`no_usage` (2xx POST responses without a `usage` field). The file is JSON:
+
+```json
+{"rows":[{"day":"2026-10-29","project":"sem projeto","model":"glm-5.1","key":"main","tier":"opencode-go","requests":2,"tokens_in":120,"tokens_out":30,"tokens_cache_in":0,"no_usage":0}]}
+```
+
+The day is computed in `timezone` (an IANA name such as `America/Sao_Paulo`;
+default UTC; an invalid name is rejected at startup). Rows older than 90 days are
+dropped when the file is loaded and written. The file is written a few seconds
+(3 s) after the first request that changed it, not on every request, and again on
+shutdown (SIGINT/SIGTERM). The write goes to a temporary file in the same
+directory and is renamed, so the directory must be writable; a write failure is
+logged and does not affect the request. A missing or invalid file at startup is
+logged and the history starts empty. Without `usage_file` the history stays in
+memory and startup (and `validate-config`) logs a warning.
 
 ## Tiers
 

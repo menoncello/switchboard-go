@@ -28,6 +28,7 @@ type App struct {
 	logger   *slog.Logger
 	// cooldowns holds the per-tier cooldown (tier 0 under tier0CooldownKey).
 	cooldowns *tierCooldowns
+	history   *usageHistory
 
 	// stateMu serializes saveState; lastState is what the last successful write held (unchanged until a write succeeds).
 	stateMu   sync.Mutex
@@ -43,6 +44,11 @@ type persistedState struct {
 
 func newApp(cfg Config) *App {
 	a := &App{config: cfg, keys: NewKeyManager(cfg.UpstreamAPIKeys, cfg.RetryExhaustedAfter), client: &http.Client{Transport: &http.Transport{Proxy: http.ProxyFromEnvironment, DialContext: (&net.Dialer{Timeout: 10 * time.Second, KeepAlive: 30 * time.Second}).DialContext, TLSHandshakeTimeout: 10 * time.Second, ResponseHeaderTimeout: cfg.UpstreamResponseHeaderTimeout, ExpectContinueTimeout: 2 * time.Second}}, sender: NewSMTPNotifier(cfg.SMTP), telegram: NewTelegramNotifier(cfg.Telegram), usage: newUsageCache(), logger: slog.New(slog.NewJSONHandler(os.Stderr, nil)), cooldowns: newTierCooldowns()}
+	loc, err := time.LoadLocation(cfg.Timezone)
+	if cfg.Timezone == "" || err != nil {
+		loc = time.UTC
+	}
+	a.history = newUsageHistory(cfg.UsageFile, loc, a.logger)
 	a.loadState()
 	return a
 }

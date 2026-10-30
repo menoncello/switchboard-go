@@ -10,6 +10,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	_ "time/tzdata" // the binary must not depend on the OS zoneinfo
 
 	yaml "gopkg.in/yaml.v3"
 )
@@ -51,6 +52,11 @@ type Config struct {
 	// StateFile is where the cooldowns and the exhausted tier 0 keys are saved so
 	// they survive a restart; empty keeps them in memory only. YAML only.
 	StateFile string
+
+	// UsageFile is where the usage history is saved (JSON); empty keeps it in memory only.
+	// Timezone is the IANA name that decides the history day (empty is UTC). YAML only.
+	UsageFile string
+	Timezone  string
 
 	// Tiers are extra free upstreams for failover; the upstream above is the
 	// implicit tier 0 and is not listed here.
@@ -156,6 +162,8 @@ type yamlConfig struct {
 	} `yaml:"limits"`
 	MinContext *int       `yaml:"min_context"`
 	StateFile  string     `yaml:"state_file"`
+	UsageFile  string     `yaml:"usage_file"`
+	Timezone   string     `yaml:"timezone"`
 	Tiers      []yamlTier `yaml:"tiers"`
 }
 
@@ -265,7 +273,7 @@ func loadYAMLConfig(path string) (Config, error) {
 	if err != nil {
 		return Config{}, err
 	}
-	return Config{Tiers: tiers, MinContext: minContext, StateFile: strings.TrimSpace(yc.StateFile), ListenAddr: yc.Server.ListenAddr, UpstreamBaseURL: yc.Upstream.BaseURL, ProxyAPIKey: yc.Server.ProxyAPIKey, UpstreamAPIKeys: yc.Upstream.APIKeys, MaxRequestBodyBytes: yc.Limits.MaxRequestBodyBytes, RetryExhaustedAfter: retry, UpstreamResponseHeaderTimeout: headerTimeout, SMTP: SMTPConfig{Host: yc.SMTP.Host, Port: yc.SMTP.Port, Username: yc.SMTP.Username, Password: yc.SMTP.Password, From: yc.SMTP.From, To: yc.SMTP.To, TLS: yc.SMTP.TLS, StartTLS: yc.SMTP.StartTLS}, Telegram: TelegramConfig{BotToken: yc.Telegram.BotToken, ChatID: yc.Telegram.ChatID}}, nil
+	return Config{Tiers: tiers, MinContext: minContext, StateFile: strings.TrimSpace(yc.StateFile), UsageFile: strings.TrimSpace(yc.UsageFile), Timezone: strings.TrimSpace(yc.Timezone), ListenAddr: yc.Server.ListenAddr, UpstreamBaseURL: yc.Upstream.BaseURL, ProxyAPIKey: yc.Server.ProxyAPIKey, UpstreamAPIKeys: yc.Upstream.APIKeys, MaxRequestBodyBytes: yc.Limits.MaxRequestBodyBytes, RetryExhaustedAfter: retry, UpstreamResponseHeaderTimeout: headerTimeout, SMTP: SMTPConfig{Host: yc.SMTP.Host, Port: yc.SMTP.Port, Username: yc.SMTP.Username, Password: yc.SMTP.Password, From: yc.SMTP.From, To: yc.SMTP.To, TLS: yc.SMTP.TLS, StartTLS: yc.SMTP.StartTLS}, Telegram: TelegramConfig{BotToken: yc.Telegram.BotToken, ChatID: yc.Telegram.ChatID}}, nil
 }
 
 func mergeConfig(dst *Config, src Config) {
@@ -289,6 +297,12 @@ func mergeConfig(dst *Config, src Config) {
 	}
 	if src.StateFile != "" {
 		dst.StateFile = src.StateFile
+	}
+	if src.UsageFile != "" {
+		dst.UsageFile = src.UsageFile
+	}
+	if src.Timezone != "" {
+		dst.Timezone = src.Timezone
 	}
 	if src.MinContext >= 0 {
 		dst.MinContext = src.MinContext
@@ -444,6 +458,15 @@ func validateConfig(cfg Config) error {
 	if cfg.UsageCacheTTL < 0 {
 		return errors.New("USAGE_CACHE_TTL must be >= 0")
 	}
+	if cfg.Timezone != "" {
+		_, err := time.LoadLocation(cfg.Timezone)
+		if err == nil && cfg.Timezone == "Local" {
+			err = errors.New("depends on the host time zone, use an IANA name")
+		}
+		if err != nil {
+			return fmt.Errorf("timezone %q: %w", cfg.Timezone, err)
+		}
+	}
 	return validateTiers(cfg.Tiers)
 }
 
@@ -522,5 +545,11 @@ func warnIneligibleTiers(cfg Config) {
 func warnNoStateFile(cfg Config) {
 	if cfg.StateFile == "" {
 		log.Printf("warning: state_file is not set; tier cooldowns and exhausted keys are lost on restart")
+	}
+}
+
+func warnNoUsageFile(cfg Config) {
+	if cfg.UsageFile == "" {
+		log.Printf("warning: usage_file is not set; the usage history is kept in memory and lost on restart")
 	}
 }

@@ -125,6 +125,15 @@ func (a *App) proxyV1(w http.ResponseWriter, r *http.Request, style APIStyle) {
 	} else if tier != "" && rec.status/100 == 2 && r.Method == http.MethodPost { // GET /v1/models has no usage by nature
 		attrs = append(attrs, "usage_missing", true)
 	}
+	if tier != "" {
+		key := ""
+		if keyIdx >= 0 {
+			if key = a.config.keyName(keyIdx); key == "" {
+				key = "key-" + strconv.Itoa(keyIdx)
+			}
+		}
+		a.history.record(requestProject(r.Header), model, key, tier, usage, !usage.found && rec.status/100 == 2 && r.Method == http.MethodPost)
+	}
 	a.logger.Info("request", attrs...)
 }
 
