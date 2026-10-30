@@ -1,7 +1,7 @@
 ---
 title: 'Tracer: rodada do agente com OpenRouter grava a proposta'
 type: 'chore'
-ticket: 'story-tracer-rodada-do-agente-com-openrouter-grava-a-proposta'
+ticket: 1
 created: '2026-10-30'
 status: 'done'
 baseline_revision: '1a429eda028d990d517325b7b2a22d4939b85553'
