@@ -17,10 +17,11 @@ You only propose. You never change anything:
 
 - Never write to the config file, the `state_file` or the `usage_file`.
 - Never edit `tiers` or `prices`, and never touch the proxy or its code.
-- Never print `api_key` or `api_keys` values (from the config) in the proposal,
-  in logs or in your messages.
+- Never print `api_key`, `api_keys` or `bot_token` values (from the config) in
+  the proposal, in logs or in your messages.
 
-The only file you create is the proposal.
+The only file you create is the proposal. The only message you send is the
+Telegram notice of step 8.
 
 ## Inputs
 
@@ -59,9 +60,11 @@ real tier; replace it.
    is available, record `não alcançável` for that hash; never invent a hash. If the config itself cannot be read, stop
    here and follow the "Config unreadable" case in Edge cases. Keep these as the
    "início" hashes. Only read the files; never change them.
-1. Read the config and take only `tiers` and `prices`, plus `upstream.base_url`.
-   `upstream.base_url` is read only for the provider search in step 5. No other
-   upstream field is read, and its keys (`api_key`, `api_keys`) are never read.
+1. Read the config and take only `tiers` and `prices`, plus `upstream.base_url`
+   and `telegram.bot_token` / `telegram.chat_id`. `upstream.base_url` is read
+   only for the provider search in step 5; the `telegram` fields only for step 8.
+   No other upstream field is read, and its keys (`api_key`, `api_keys`) are
+   never read.
    - `tiers[].name`, `tiers[].base_url`, `tiers[].free`.
    - `tiers[].models.<name>.id`: the model id the tier maps to. When `id` is
      missing, the model `<name>` is the id.
@@ -192,11 +195,33 @@ real tier; replace it.
      Do not retry the run on your own.
 7. Routing guard, end of the run. After the proposal is on disk, compute the
    same three hashes again (the "fim" hashes), with the same tool, and append
-   the "Roteamento" section to the proposal; then finish. If the config no longer opens at this
+   the "Roteamento" section to the proposal; then go to step 8. If the config no longer opens at this
    point, its "fim" hash is `ilegível`. If `state_file` or `usage_file` was
    reachable at the start but is not now (or the reverse), write `não
    alcançável` on that side only. Never revert or fix anything, whatever the hashes
    show.
+8. Telegram notice, after step 7. Look at the "Gratuidade" items that stayed in
+   the proposal after step 6 and say `gratuito para pago`. These are the models
+   that stopped being free; a model already proposed with the same value was
+   dropped in step 6, so it does not trigger a second notice. With none, send
+   nothing and end the run. Also send nothing when "Roteamento" could not be
+   appended in step 7 (incomplete proposal).
+   - Otherwise send one message with `POST
+     https://api.telegram.org/bot<bot_token>/sendMessage`, a JSON body with
+     `chat_id` and `text`. Make the call with a tool that does not show the URL
+     or the token in its output or in your messages; if you have none that can
+     POST, do not send and say so in chat. The text has one line per model
+     (`<tier>/<model id>`, at most 20, then `e mais N`) and then the absolute
+     path of the proposal file once, for example
+     `Catálogo: modelo passou de gratuito a pago: openrouter-free/anthropic/foo`
+     and, on the next line, `Proposta: /dados/catalog-proposals/2026-10-30T14-05.md`.
+   - If `bot_token` or `chat_id` is missing or empty, do not send; say so in
+     chat. If the send fails, say so in chat with the status or the reason,
+     never with the token or the request URL. The proposal stays as it is; do
+     not retry on your own. Name the models in that chat message: step 6 will
+     drop these items in later runs, so no later run sends this notice again.
+   - Never change a file for this step. The routing hashes were already
+     computed in step 7.
 
 ## Proposal format
 
@@ -318,7 +343,7 @@ Examples:
 |------|----------------|
 | Normal run: an OpenRouter tier exists and the API answers | The proposal with the six sections; every item has a URL; "Roteamento" with the three hashes at start and end and `roteamento inalterado: sim`. |
 | No OpenRouter tier: no `base_url` has the host `openrouter.ai` | The proposal with the OpenRouter items empty, the note "nenhum tier OpenRouter na config", the items of step 5 for the other tiers (if any) and "Roteamento". |
-| OpenRouter unavailable: the request fails, the status is not 2xx, or a 2xx response has an unparsable body or no `data` list | The proposal with the note "OpenRouter indisponível" and the reason (error message or status). The OpenRouter item sections stay empty; do not invent items. The run still goes through steps 5, 6 and 7, so page items for other tiers may appear. "Roteamento" is still written. |
+| OpenRouter unavailable: the request fails, the status is not 2xx, or a 2xx response has an unparsable body or no `data` list | The proposal with the note "OpenRouter indisponível" and the reason (error message or status). The OpenRouter item sections stay empty; do not invent items. The run still goes through steps 5 to 8, so page items for other tiers may appear. "Roteamento" is still written. |
 | Documentation page unreadable (does not open, not 2xx, empty) | One line of the tier under "Preço": `- <tier> — não verificado: <reason> (fonte: <URL>)`. The run goes on and ends with the proposal and "Roteamento". |
 | Documentation page changed format (no recognizable models or prices) | Same line as above, with the reason. One unreadable value only: `não verificado` in place of that value on the model's item. Never invent a number. |
 | Tier outside OpenRouter with no row in the "Documentation pages" table | The note `tier <name> sem página na tabela` under the title; no item for the tier. |
@@ -328,6 +353,9 @@ Examples:
 | Second run with no change in the sources or the config | "Modelos novos", "Preço", "Gratuidade" and "Limites" get `_Nada nesta rodada._`, plus "Roteamento". "Provedores novos" is not promised empty, because web search varies between runs; the only guarantee is that a provider already proposed with unchanged details is not repeated. |
 | A value changed since the last proposed one (a price in `prices`, a limit on the page) | Only that item, with the new value and `(antes proposto: <old value>)`. |
 | Config unreadable or unparsable, or `catalog-proposals/` missing or not writable | Write nothing and do not create anything. Report the error in chat and end the run. |
+| The proposal has a "Gratuidade" item `gratuito para pago` | One Telegram message with the model and the proposal path (step 8). |
+| No such item, or the item was dropped in step 6 as already proposed | No Telegram message. |
+| `bot_token` or `chat_id` missing, or the Telegram send fails | Say so in chat, without the token, naming the models. The proposal stays as it is; no retry, and later runs do not resend. |
 | The config changes during the run (its hash at the end differs from the start) | "Roteamento" with both config hashes and `roteamento inalterado: não`. The run ends; revert nothing. |
 | Only `state_file` or `usage_file` change during the run | The hashes of that line differ; `roteamento inalterado: sim`. |
 | `state_file` or `usage_file` has an empty path in the config or is not reachable | `não alcançável` in place of the hash: on both sides of that line when the path is empty in the config, only on the unreachable side otherwise. |
@@ -352,7 +380,8 @@ nothing is written, so there is no "Roteamento" section either.
    write access) and read and write access only to the `catalog-proposals/`
    folder itself, never to `state_file` or `usage_file`. The agent reads the
    earlier proposals there to avoid repeating items. It also needs web search
-   and page fetching for the provider search.
+   and page fetching for the provider search, and network access to
+   `api.telegram.org` for the notice of step 8.
 5. Run it once and open the file in `catalog-proposals/` to check the format,
    including the "Roteamento" section.
    Scheduling is not part of this version.
