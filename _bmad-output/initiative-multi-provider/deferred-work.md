@@ -16,3 +16,17 @@
 
 ## Deferred from: code review of story-teto-diario-em-dinheiro-para-tiers-pagos-plan (2026-10-30)
 - `include_usage` é injetado em todo request OpenAI com `stream: true` num tier pago, inclusive caminhos como `/v1/responses` (`withIncludeUsage` em proxy.go). Severidade média, não verificada. Resolve ao ver se o upstream aceita `stream_options.include_usage` nesse caminho; se rejeitar, limitar a `/chat/completions`.
+
+## Deferred from: code review of story-provedores-da-config-fora-do-openrouter-pela-documentacao-plan (2026-10-30)
+- Verify de ponta a ponta da 4.3 (hitl): rodar o agente com um tier real na tabela e com a página trocada por uma ilegível. Hoje a tabela só tem `exemplo-zai`, então nada disso foi observado.
+
+## Deferred from: code review of story-limites-novos-e-propostas-sem-repeticao-plan (2026-10-30)
+- Verify de limites da 4.4: o ensaio em sandbox cobriu as rodadas sem mudança e com preço alterado, mas `https://docs.z.ai/pricing` dá 404 e nenhuma rodada leu limites. Falta rodar com uma página legível de um tier fora do OpenRouter e conferir o nome do limite na identidade e o `(antes proposto: ...)` em "Limites".
+
+## Deferred from: code review of story-provedores-novos-com-tier-gratuito-plan (2026-10-31)
+- Verify de ponta a ponta da 4.5: nenhuma rodada real gravou "Provedores novos"; só houve inspeção do texto. Falta rodar o agente com busca na web e conferir URL, modelos gratuitos e estilo de API, e uma segunda rodada sem repetição.
+- Definição de "tier gratuito" na busca de provedores: o texto não separa cota recorrente de crédito de teste, cartão obrigatório ou restrição de região, e o estilo de API não prevê "compatível com OpenAI e Anthropic". Recomendado: só cota gratuita recorrente.
+
+## Deferred from: code review of story-recorrencia-do-agente-no-orca-plan (2026-10-31)
+
+- `--workspace path:<dir>` aceito pelo Orca não confirmado em `docs/catalog-agent.md:120`; rodar o comando uma vez (verify hitl) resolve.

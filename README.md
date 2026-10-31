@@ -167,6 +167,7 @@ See [docs/admin-api.md](docs/admin-api.md).
 - [systemd deployment](docs/deployment.md)
 - [SMTP notifications](docs/smtp.md)
 - [Operations and security](docs/operations.md)
+- [Catalog agent](docs/catalog-agent.md)
 
 ## Development
 
