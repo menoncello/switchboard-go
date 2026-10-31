@@ -53,8 +53,8 @@ deferred: []
 ## Tasks & Acceptance
 
 **Execution:**
-- [ ] `docs/catalog-agent.md` -- escrever, em inglês como os demais docs: papel do agente e a regra "só propõe"; entradas (caminho da config, diretório das propostas); passos da rodada (ler `tiers`/`prices`, achar tiers OpenRouter pelo host, consultar a API, comparar modelo a modelo com o `id` mapeado e com `prices`); regra de gratuidade (`prompt` e `completion` iguais a 0); formato da proposta (título com data/hora, seções em português: Modelos novos, Preço, Gratuidade, Limites, Provedores novos; item = linha com URL da fonte; direção com valor antigo e novo); nome do arquivo `catalog-proposals/AAAA-MM-DDTHH-MM.md`; casos de borda da matriz; passo do Eduardo no Orca (criar o agente, config só para leitura) -- tracer que fixa o formato
-- [ ] `README.md` -- acrescentar `- [Catalog agent](docs/catalog-agent.md)` à lista de documentos -- descoberta
+- [x] `docs/catalog-agent.md` -- escrever, em inglês como os demais docs: papel do agente e a regra "só propõe"; entradas (caminho da config, diretório das propostas); passos da rodada (ler `tiers`/`prices`, achar tiers OpenRouter pelo host, consultar a API, comparar modelo a modelo com o `id` mapeado e com `prices`); regra de gratuidade (`prompt` e `completion` iguais a 0); formato da proposta (título com data/hora, seções em português: Modelos novos, Preço, Gratuidade, Limites, Provedores novos; item = linha com URL da fonte; direção com valor antigo e novo); nome do arquivo `catalog-proposals/AAAA-MM-DDTHH-MM.md`; casos de borda da matriz; passo do Eduardo no Orca (criar o agente, config só para leitura) -- tracer que fixa o formato
+- [x] `README.md` -- acrescentar `- [Catalog agent](docs/catalog-agent.md)` à lista de documentos -- descoberta
 
 **Acceptance Criteria:**
 - Given o documento, when o Eduardo o cola num agente do Orca com uma config de exemplo, then o agente tem passos suficientes para gravar um arquivo em `catalog-proposals/` com as seções de modelos novos, preço e gratuidade, cada item com URL, sem tocar na config.
