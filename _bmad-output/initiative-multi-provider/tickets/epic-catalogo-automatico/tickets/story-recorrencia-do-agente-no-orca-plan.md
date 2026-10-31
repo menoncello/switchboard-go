@@ -3,7 +3,7 @@ title: 'Recorrência do agente no Orca'
 type: 'chore'
 ticket: 7
 created: '2026-10-31'
-status: 'built'
+status: done
 baseline_revision: '28f2d6ff2e6eec35549af2ee906706d4aa37961d'
 route: 'oneshot'
 route_source: 'auto'
@@ -67,3 +67,24 @@ Só texto em `docs/catalog-agent.md` (~20 linhas), então oneshot. O Orca tem `o
 **Verification:** `go test ./... && go vet ./...` ok; só `docs/catalog-agent.md` mudou fora de `_bmad-output`. A rodada real pelo Orca (verify `hitl`) não foi executada.
 
 **Residual risks:** o comando nunca foi executado; falha de rodada só aparece no histórico do Orca.
+
+## Code Review
+
+### 2026-10-31
+0 decision-needed, 6 patch, 1 defer, 6 rejected.
+
+- [x] [Review][Patch] Access: dar escrita ao diretório de propostas (fora do workspace) e criá-lo antes da primeira rodada [docs/catalog-agent.md:133]
+- [x] [Review][Patch] Pré-autorização de busca/fetch sem nota de que a rodada só escreve proposta, state e usage [docs/catalog-agent.md:133]
+- [x] [Review][Patch] Comando de exemplo sem `--fresh-session` e `--missed-run-grace-minutes` (sem valor sugerido) [docs/catalog-agent.md:115]
+- [x] [Review][Patch] "Knowing it worked" assume intervalo diário; a seção também oferece semanal [docs/catalog-agent.md:140]
+- [x] [Review][Patch] `--prompt` entre aspas duplas quebra com caminhos com espaço ou `$` [docs/catalog-agent.md:121]
+- [x] [Review][Patch] "Run this from the repo checkout" contradiz o `--workspace path:` absoluto; linha de Access com mais de 80 colunas [docs/catalog-agent.md:112,135]
+- [x] [Review][Defer] `--workspace path:<dir>` aceito pelo Orca não confirmado [docs/catalog-agent.md:120] — deferred: rodar o comando uma vez (verify hitl) resolve
+
+#### Rejected
+- Telegram sem credenciais na rodada: falso, `bot_token`/`chat_id` vêm da config (linha 65).
+- `run`/`runs` inconsistentes e `--time` fora da lista: falso, `orca automations --help` confirma os três.
+- Linha "Scheduling is not part of this version" removida: falso, a seção nova repete a garantia (107-109).
+- Guarda do R9 depende de passos manuais: falso, está documentado no passo 4 e em "Access".
+- Pausar/remover a automação e custo: fora de escopo (Orca já tem `--disabled`).
+- `chmod a-w` não vale para o dono, `go test` como verificação, tabela local perdida: baixo, o doc já oferece mount somente leitura e manda manter a branch; o resto edita o plano.

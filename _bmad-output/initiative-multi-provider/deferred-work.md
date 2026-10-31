@@ -26,3 +26,7 @@
 ## Deferred from: code review of story-provedores-novos-com-tier-gratuito-plan (2026-10-31)
 - Verify de ponta a ponta da 4.5: nenhuma rodada real gravou "Provedores novos"; só houve inspeção do texto. Falta rodar o agente com busca na web e conferir URL, modelos gratuitos e estilo de API, e uma segunda rodada sem repetição.
 - Definição de "tier gratuito" na busca de provedores: o texto não separa cota recorrente de crédito de teste, cartão obrigatório ou restrição de região, e o estilo de API não prevê "compatível com OpenAI e Anthropic". Recomendado: só cota gratuita recorrente.
+
+## Deferred from: code review of story-recorrencia-do-agente-no-orca-plan (2026-10-31)
+
+- `--workspace path:<dir>` aceito pelo Orca não confirmado em `docs/catalog-agent.md:120`; rodar o comando uma vez (verify hitl) resolve.

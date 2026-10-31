@@ -411,14 +411,17 @@ nothing: you create the automation in Orca, once, after step 5 above showed a
 good proposal.
 
 An unattended run has nobody to answer the agent's questions, so the prompt
-carries the two paths the agent would ask for. Run this from the repo
-checkout, with your own paths and timezone:
+carries the two paths the agent would ask for. Use your own paths and
+timezone (`--workspace` names the checkout, so the directory you run it from
+does not matter). Quote the prompt with single quotes if a path has spaces or
+`$`:
 
 ```bash
 orca automations create \
   --name "Catalog agent" \
   --provider claude \
   --trigger daily --time 09:00 --timezone America/Sao_Paulo \
+  --fresh-session --missed-run-grace-minutes 120 \
   --workspace path:/path/to/switchboard-go \
   --prompt "Follow docs/catalog-agent.md. Config path: /path/to/config.yaml (read-only). Proposals directory: /path/to/dir (holds catalog-proposals/)."
 ```
@@ -434,13 +437,19 @@ Check it with `orca automations list`, run it once now with
   `tier <name> sem página na tabela` on every run.
 - **Access.** `orca automations create` has no flag for permissions. Make the
   config read-only on disk (`chmod a-w`, or a read-only mount), make
-  `state_file` and `usage_file` not writable by the agent, and pre-authorize web search, page fetching and `api.telegram.org` in
-  the agent's own settings, because nobody is there to answer a prompt.
+  `state_file` and `usage_file` not writable by the agent, and pre-authorize
+  web search, page fetching and `api.telegram.org` in the agent's own
+  settings, because nobody is there to answer a prompt. The run writes only
+  the proposal, `state_file` and `usage_file`; give it write access to the
+  proposals directory (it is outside the workspace) and create that folder
+  before the first run.
 - **Time.** The automation fires at `--timezone`; the proposal file name uses
   the local time of the run. If the Orca machine is off at the scheduled time,
-  the run happens only inside the grace window (`--missed-run-grace-minutes`).
+  the run happens only inside the grace window (`--missed-run-grace-minutes`,
+  120 above); past it, that day is skipped.
 - **Knowing it worked.** A new file in `catalog-proposals/` with a later date
   and time than the previous one means the schedule works. A run that fails
   (config unreadable, folder not writable) writes no file and only reports in
-  chat, so if a day passes with no new file, look at
+  chat, so if one interval passes (a day, or a week if you chose weekly) with
+  no new file, look at
   `orca automations runs --id <id>` and the run's chat.
