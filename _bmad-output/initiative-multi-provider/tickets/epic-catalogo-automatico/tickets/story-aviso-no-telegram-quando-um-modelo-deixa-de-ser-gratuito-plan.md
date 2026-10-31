@@ -3,7 +3,7 @@ title: 'Aviso no Telegram quando um modelo deixa de ser gratuito'
 type: 'feature'
 ticket: 6
 created: '2026-10-31'
-status: built
+status: done
 baseline_revision: '62be3207b513a2acf333982973d668bf1066c54c'
 route: 'oneshot'
 route_source: 'auto'
@@ -65,3 +65,16 @@ Mudança só de texto em `docs/catalog-agent.md` (~25 linhas), então oneshot; o
 **Verification:** `go test ./... && go vet ./...` ok; só `docs/catalog-agent.md` mudou fora de `_bmad-output`. A mensagem real no Telegram (verify `hitl`) não foi executada.
 
 **Residual risks:** o item perdido por falha de envio não é reenviado em rodadas futuras; o envio nunca rodou com um agente.
+
+## Code Review
+
+### 2026-10-31
+Code review: 3 decision-needed, 2 patch, 0 defer, 11 rejected.
+
+- [x] [Review][Decision] Aviso perdido de vez se o envio falha ou é pulado — o passo 6 descarta o item nas rodadas seguintes. Options: (a) best-effort, manter e documentar; (b) marcador no arquivo da proposta e exceção no passo 6 para reenviar. Recommended: (a) — só vale (b) se ninguém lê o chat do agente. Resolved: (a) best-effort.
+- [x] [Review][Decision] Token pode aparecer na chamada da ferramenta (URL com `bot<token>` no argumento) ou em erro que repete a URL — Options: (a) só enviar se a ferramenta aceitar o token fora da linha de comando (stdin/env); (b) aceitar o token no transcript e documentar. Recommended: (a) — o token é segredo. Resolved: (a).
+- [x] [Review][Decision] Reaviso quando só o preço muda e o modelo continua gratuito→pago (item volta com `antes proposto`) — Options: (a) reavisar; (b) pular itens cujo `antes proposto` já era gratuito para pago. Recommended: (b) — o modelo já foi avisado. Resolved: (b).
+- [x] [Review][Patch] Linhas de borda "config changes" ("The run ends") e "page unreadable" não mencionam o passo 8; dizer que o aviso segue normalmente [docs/catalog-agent.md:Edge cases]
+- [x] [Review][Patch] Formato e envio: cabeçalho único + uma linha por modelo, corpo serializado como JSON, timeout, `ok:false` ou corpo ilegível = falha [docs/catalog-agent.md:step 8]
+
+Rejected: 11 (false: schema `telegram` já definido em `config.go:209` e `docs/configuration.md:77`; volta a gratuito e pago de novo já muda o último valor no passo 6; gratuidade não verificada fora da intenção; baixa: setup sem teste do Telegram, o `hitl` cobre).

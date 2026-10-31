@@ -203,23 +203,32 @@ real tier; replace it.
 8. Telegram notice, after step 7. Look at the "Gratuidade" items that stayed in
    the proposal after step 6 and say `gratuito para pago`. These are the models
    that stopped being free; a model already proposed with the same value was
-   dropped in step 6, so it does not trigger a second notice. With none, send
+   dropped in step 6, so it does not trigger a second notice. Do not notify an
+   item that ends with `(antes proposto: gratuito para pago...)`: that model
+   was already announced, and only its price changed. Only items whose "antes
+   proposto" is absent or not `gratuito para pago` notify. With none, send
    nothing and end the run. Also send nothing when "Roteamento" could not be
    appended in step 7 (incomplete proposal).
    - Otherwise send one message with `POST
-     https://api.telegram.org/bot<bot_token>/sendMessage`, a JSON body with
-     `chat_id` and `text`. Make the call with a tool that does not show the URL
-     or the token in its output or in your messages; if you have none that can
-     POST, do not send and say so in chat. The text has one line per model
-     (`<tier>/<model id>`, at most 20, then `e mais N`) and then the absolute
-     path of the proposal file once, for example
-     `Catálogo: modelo passou de gratuito a pago: openrouter-free/anthropic/foo`
-     and, on the next line, `Proposta: /dados/catalog-proposals/2026-10-30T14-05.md`.
+     https://api.telegram.org/bot<bot_token>/sendMessage`, with a request
+     timeout, and a JSON body with `chat_id` and `text`. Build the body with a
+     JSON serializer, never by string interpolation, and send `text` as plain
+     text (no `parse_mode`). Send only if the tool lets you pass the token
+     outside the command line or the visible arguments (stdin, environment
+     variable); if the token would appear in the command or the call arguments,
+     do not send and say so in chat. Error text from the tool must never be
+     copied to chat if it contains the URL or token. The text is one header
+     line, `Catálogo: modelo(s) passou de gratuito a pago:`, then one line per
+     model (`<tier>/<model id>`, at most 20, then `e mais N`), then the absolute
+     path of the proposal file on its own line, for example
+     `Proposta: /dados/catalog-proposals/2026-10-30T14-05.md`.
    - If `bot_token` or `chat_id` is missing or empty, do not send; say so in
-     chat. If the send fails, say so in chat with the status or the reason,
-     never with the token or the request URL. The proposal stays as it is; do
-     not retry on your own. Name the models in that chat message: step 6 will
-     drop these items in later runs, so no later run sends this notice again.
+     chat. A send fails when the request times out, the status is not 2xx, the
+     body has `ok:false`, or the body cannot be parsed. Then say so in chat with
+     the status or the reason, never with the token or the request URL. The
+     proposal stays as it is; do not retry on your own. Name the models in that
+     chat message. The notice is best-effort: step 6 drops these items in later
+     runs, so no later run sends it again. This is accepted.
    - Never change a file for this step. The routing hashes were already
      computed in step 7.
 
@@ -344,7 +353,7 @@ Examples:
 | Normal run: an OpenRouter tier exists and the API answers | The proposal with the six sections; every item has a URL; "Roteamento" with the three hashes at start and end and `roteamento inalterado: sim`. |
 | No OpenRouter tier: no `base_url` has the host `openrouter.ai` | The proposal with the OpenRouter items empty, the note "nenhum tier OpenRouter na config", the items of step 5 for the other tiers (if any) and "Roteamento". |
 | OpenRouter unavailable: the request fails, the status is not 2xx, or a 2xx response has an unparsable body or no `data` list | The proposal with the note "OpenRouter indisponível" and the reason (error message or status). The OpenRouter item sections stay empty; do not invent items. The run still goes through steps 5 to 8, so page items for other tiers may appear. "Roteamento" is still written. |
-| Documentation page unreadable (does not open, not 2xx, empty) | One line of the tier under "Preço": `- <tier> — não verificado: <reason> (fonte: <URL>)`. The run goes on and ends with the proposal and "Roteamento". |
+| Documentation page unreadable (does not open, not 2xx, empty) | One line of the tier under "Preço": `- <tier> — não verificado: <reason> (fonte: <URL>)`. The run goes on and ends with the proposal and "Roteamento", then step 8. |
 | Documentation page changed format (no recognizable models or prices) | Same line as above, with the reason. One unreadable value only: `não verificado` in place of that value on the model's item. Never invent a number. |
 | Tier outside OpenRouter with no row in the "Documentation pages" table | The note `tier <name> sem página na tabela` under the title; no item for the tier. |
 | Provider search fails or finds only providers already in the config | "Provedores novos" gets `_Nada nesta rodada._`; the run goes on and ends with the proposal and "Roteamento". |
@@ -354,9 +363,9 @@ Examples:
 | A value changed since the last proposed one (a price in `prices`, a limit on the page) | Only that item, with the new value and `(antes proposto: <old value>)`. |
 | Config unreadable or unparsable, or `catalog-proposals/` missing or not writable | Write nothing and do not create anything. Report the error in chat and end the run. |
 | The proposal has a "Gratuidade" item `gratuito para pago` | One Telegram message with the model and the proposal path (step 8). |
-| No such item, or the item was dropped in step 6 as already proposed | No Telegram message. |
-| `bot_token` or `chat_id` missing, or the Telegram send fails | Say so in chat, without the token, naming the models. The proposal stays as it is; no retry, and later runs do not resend. |
-| The config changes during the run (its hash at the end differs from the start) | "Roteamento" with both config hashes and `roteamento inalterado: não`. The run ends; revert nothing. |
+| No such item, or the item was dropped in step 6 as already proposed, or only the price changed while it was already `gratuito para pago` | No Telegram message. |
+| `bot_token` or `chat_id` missing, or the Telegram send fails | Say so in chat, without the token, naming the models. The proposal stays as it is; no retry. The notice is best-effort: if it is not sent, later runs do not resend it. This is accepted. |
+| The config changes during the run (its hash at the end differs from the start) | "Roteamento" with both config hashes and `roteamento inalterado: não`. The run goes on to step 8, and the notice is sent as usual; revert nothing. |
 | Only `state_file` or `usage_file` change during the run | The hashes of that line differ; `roteamento inalterado: sim`. |
 | `state_file` or `usage_file` has an empty path in the config or is not reachable | `não alcançável` in place of the hash: on both sides of that line when the path is empty in the config, only on the unreachable side otherwise. |
 | Appending "Roteamento" fails in step 7 (disk full, permission) | Report the error in chat and treat the proposal as incomplete: no "Roteamento" section, so no routing claim. |
