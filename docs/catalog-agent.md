@@ -25,7 +25,8 @@ Telegram notice of step 8.
 
 ## Inputs
 
-Ask the person for these two paths when they are not already set:
+Ask the person for these two paths when they are not already set (an
+automation gives them in its prompt, see "Running it on a schedule"):
 
 - **Config path**: the switchboard-go YAML file (see
   [configuration.md](configuration.md)). Read-only.
@@ -393,10 +394,53 @@ nothing is written, so there is no "Roteamento" section either.
    `api.telegram.org` for the notice of step 8.
 5. Run it once and open the file in `catalog-proposals/` to check the format,
    including the "Roteamento" section.
-   Scheduling is not part of this version.
+6. Schedule it (see below).
 
 The read-only config is one of three layers that prove the routing stayed the
 same: the hashes in the proposal, a Go test that fails when proxy code mentions
 `catalog-proposals` (`catalog_guard_test.go`), and this read-only access. The
 hashes only report a change after it happened; read-only access is what stops
 the agent from making it.
+
+## Running it on a schedule
+
+Recommended interval: **once a day**. Catalog changes are slow, and a model
+that stops being free is the case worth catching within a day. Weekly also
+works; hourly only adds repeated pages and web searches. The repo schedules
+nothing: you create the automation in Orca, once, after step 5 above showed a
+good proposal.
+
+An unattended run has nobody to answer the agent's questions, so the prompt
+carries the two paths the agent would ask for. Run this from the repo
+checkout, with your own paths and timezone:
+
+```bash
+orca automations create \
+  --name "Catalog agent" \
+  --provider claude \
+  --trigger daily --time 09:00 --timezone America/Sao_Paulo \
+  --workspace path:/path/to/switchboard-go \
+  --prompt "Follow docs/catalog-agent.md. Config path: /path/to/config.yaml (read-only). Proposals directory: /path/to/dir (holds catalog-proposals/)."
+```
+
+Check it with `orca automations list`, run it once now with
+`orca automations run <id>`, and see past runs with
+`orca automations runs --id <id>`.
+
+- **Which copy runs.** The automation reads `docs/catalog-agent.md` from the
+  `--workspace` checkout, not the text you pasted in step 2. Fill the
+  "Documentation pages" table in that checkout's file (and keep that checkout
+  on the branch that has it), or tiers outside OpenRouter get
+  `tier <name> sem página na tabela` on every run.
+- **Access.** `orca automations create` has no flag for permissions. Make the
+  config read-only on disk (`chmod a-w`, or a read-only mount), make
+  `state_file` and `usage_file` not writable by the agent, and pre-authorize web search, page fetching and `api.telegram.org` in
+  the agent's own settings, because nobody is there to answer a prompt.
+- **Time.** The automation fires at `--timezone`; the proposal file name uses
+  the local time of the run. If the Orca machine is off at the scheduled time,
+  the run happens only inside the grace window (`--missed-run-grace-minutes`).
+- **Knowing it worked.** A new file in `catalog-proposals/` with a later date
+  and time than the previous one means the schedule works. A run that fails
+  (config unreadable, folder not writable) writes no file and only reports in
+  chat, so if a day passes with no new file, look at
+  `orca automations runs --id <id>` and the run's chat.
