@@ -31,3 +31,11 @@ title = "O Eduardo recebe propostas de modelos e limites novos"
 description = "Uma automação recorrente pesquisa modelos novos, limites novos e quem deixou de ser gratuito, e grava propostas de mudança sem tocar no roteamento nem na config."
 covers = ["R9"]
 after = [{ epic = 2, needs = "o formato da config de tiers" }, { epic = 3, needs = "o formato da tabela de preços, que as propostas de limite e gratuidade citam" }]
+
+[[epic]]
+id = 5
+slug = "epic-acabamento-do-proxy"
+title = "O proxy não vaza erro do upstream e rejeita config inválida"
+description = "Fecha as pendências de código que os code reviews dos épicos 2 e 3 adiaram: erro de transporte sem URL do upstream, 404 de modelo inexistente seguindo ao próximo tier, classificação de /v1/completions, include_usage só onde cabe, validação da config e aviso SMTP na troca de tier."
+covers = ["R7"]
+after = [{ epic = 2, needs = "failover, estilos de API e config de tiers no formato atual" }, { epic = 3, needs = "o teto diário, o include_usage e o alerta SMTP existentes" }]
