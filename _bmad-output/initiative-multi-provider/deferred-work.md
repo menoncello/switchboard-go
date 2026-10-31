@@ -19,3 +19,6 @@
 
 ## Deferred from: code review of story-provedores-da-config-fora-do-openrouter-pela-documentacao-plan (2026-10-30)
 - Verify de ponta a ponta da 4.3 (hitl): rodar o agente com um tier real na tabela e com a página trocada por uma ilegível. Hoje a tabela só tem `exemplo-zai`, então nada disso foi observado.
+
+## Deferred from: code review of story-limites-novos-e-propostas-sem-repeticao-plan (2026-10-30)
+- Verify de limites da 4.4: o ensaio em sandbox cobriu as rodadas sem mudança e com preço alterado, mas `https://docs.z.ai/pricing` dá 404 e nenhuma rodada leu limites. Falta rodar com uma página legível de um tier fora do OpenRouter e conferir o nome do limite na identidade e o `(antes proposto: ...)` em "Limites".

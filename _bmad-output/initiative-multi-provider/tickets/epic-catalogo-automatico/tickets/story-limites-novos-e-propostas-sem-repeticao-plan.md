@@ -3,7 +3,7 @@ title: 'Limites novos e propostas sem repetição'
 type: 'feature'
 ticket: 4
 created: '2026-10-30'
-status: 'built'
+status: done
 baseline_revision: 'aef6de5a3eb00906de123d2dd523efde7eea4af3'
 route: 'oneshot'
 route_source: 'auto'
@@ -67,3 +67,24 @@ Mudança só de texto em `docs/catalog-agent.md` (~45 linhas), então oneshot; n
 **Verification:** `go test ./... && go vet ./...` ok; fora de `_bmad-output` só `docs/catalog-agent.md` mudou. O ensaio com fonte de exemplo não foi executado por um agente: só inspeção do texto.
 
 **Residual risks:** a regra depende de o agente comparar sentido e reusar a redação anterior; nunca rodou. Item `não verificado` persistente deixa de aparecer a partir da segunda rodada.
+
+## Code Review
+
+### 2026-10-30
+Revisão: 1 `decision-needed`, 2 `patch`, 0 `defer`, 13 rejeitados.
+
+- [x] [Review][Decision] (resolvido: ensaio rodado em sandbox; rodadas 1-3 ok, limites não testados por 404 da página) Ensaio do Verify (duas rodadas sem mudança; preço e limite alterados) nunca foi executado — a regra só foi lida, e o plano admite que "nunca rodou". Options: (a) rodar o ensaio com um agente e fonte de exemplo agora; (b) aceitar e deixar registrado como risco; (c) adiar para um teste de fumaça na integração do épico. Recommended: (a) — é o Verify do ticket e a única checagem que exercita a mudança.
+- [x] [Review][Patch] Exemplo de "Limites" mostra duas linhas da mesma identidade (60 e 120) no mesmo bloco, contra a regra do passo 6 [docs/catalog-agent.md:257]
+- [x] [Review][Patch] Formatos de "Preço" e "Modelos novos" não mostram o sufixo `(antes proposto: ...)` que a regra do passo 6 e a tabela de bordas aplicam [docs/catalog-agent.md:232]
+
+**Rejected**
+- Item `não verificado` persistente some a partir da segunda rodada (2 achados): é o que o ticket pede; risco já registrado no plano.
+- Última proposta não mostra pendências antigas: inerente a não repetir itens.
+- Histórico sem teto / arquivar ressuscita itens (2 achados): crescimento lento; um teto acrescenta regra.
+- Nome de limite renomeado ou ambíguo: a regra "mesmo nome" e reusar a redação já cobrem.
+- Valor volta após ausência e é suprimido: a pessoa já viu esse valor; o conserto acrescenta regra.
+- Limite sem `: ` ou no formato antigo: afeta só a transição e só gera itens a mais, nunca suprime.
+- Todos os arquivos pulados sem explicação, ordenação de sufixo `-10` vs `-9`: raro; o conserto acrescenta regra.
+- `(antes proposto)` aninhado: falso, o valor já é definido sem `(antes proposto)` e `(fonte)`.
+- Limite em `tiers` sem comparação com a config: falso, limite não tem campo na config (passo 4).
+- Contexto, tool calling e disponibilidade sem mudança no diff: falso para este diff, vêm de passos anteriores.

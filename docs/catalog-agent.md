@@ -242,6 +242,8 @@ section: `- <tier>/<model id> — <what changed> (fonte: <page URL>)`, or only
   `<limit name>: não verificado: <reason>`, never a guessed number. A limit that
   changed since an earlier proposal shows both values, the old one from that
   proposal: `... — requisições por minuto: 120 (antes proposto: 60) (fonte: ...)`.
+  The same suffix goes on any item of "Modelos novos", "Preço" or "Gratuidade"
+  whose value changed (step 6); the example above shows it under "Preço".
 - Under "Provedores novos": leave empty in this version, with the line
   `_Nada nesta rodada._`. A later story fills it in.
 - An item from a documentation page with an unreadable value for one model
@@ -258,7 +260,7 @@ Examples:
 - zai/glm-x — novo: US$ 0,30 in / 0,90 out por 1M (fonte: https://docs.z.ai/pricing)
 - zai/glm-y — novo: preço não verificado (página sem preço deste modelo) (fonte: https://docs.z.ai/pricing)
 - zai/glm-x — requisições por minuto: 60 (fonte: https://docs.z.ai/pricing)
-- zai/glm-x — requisições por minuto: 120 (antes proposto: 60) (fonte: https://docs.z.ai/pricing)
+- openrouter-paid/vendor/bar — preço: US$ 0,80 in / 1,60 out → US$ 0,70 in / 1,40 out por 1M (antes proposto: US$ 0,80 in / 1,60 out → US$ 0,75 in / 1,50 out por 1M) (fonte: https://openrouter.ai/api/v1/models)
 - zai — não verificado: página sem preços reconhecíveis (fonte: https://docs.z.ai/pricing)
 ```
 
