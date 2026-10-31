@@ -3,7 +3,7 @@ title: 'Provedores novos com tier gratuito'
 type: 'feature'
 ticket: 5
 created: '2026-10-30'
-status: built
+status: done
 baseline_revision: '7e4d67a7a4ad62828510f3bbf21ad4a81ebb37e3'
 route: 'oneshot'
 route_source: 'auto'
@@ -67,3 +67,23 @@ Mudança só de texto em `docs/catalog-agent.md` (~35 linhas), então oneshot; n
 **Verification:** `go test ./... && go vet ./...` ok; fora de `_bmad-output` só `docs/catalog-agent.md` mudou. O ensaio com fonte de exemplo não foi executado: só inspeção do texto.
 
 **Residual risks:** a busca na web não é repetível entre rodadas; provedores podem aparecer e sumir. Nunca rodou com um agente.
+
+## Code Review
+
+### 2026-10-31
+2 `decision-needed`, 8 `patch`, 0 `defer`, 5 rejected.
+
+- [x] [Review][Decision] (adiado: ticket fechado sem ensaio) Nenhuma rodada real gravou a seção — o critério de verificação ("uma rodada grava a seção com ao menos um provedor fora da config") não foi observado; só houve inspeção do texto. Options: (1) rodar um ensaio agora com um agente e uma config de exemplo; (2) aceitar como não verificado. Recommended: 1 — é a única forma de observar o critério e de testar a regra de não repetição.
+- [x] [Review][Decision] (adiado: ticket fechado sem decidir) "Tier gratuito" não está definido — crédito de teste, cartão obrigatório ou restrição de região entram como gratuito; "compatível com OpenAI e Anthropic" não cabe no enum de estilo. Options: (1) só cota gratuita recorrente, crédito único fica de fora; (2) incluir tudo com uma nota de condições. Recommended: 1 — "tier gratuito" no ticket é cota recorrente e a pessoa não distingue crédito de teste na lista.
+- [x] [Review][Patch] Teste "fora da config" só olha o host da API: provedor já configurado com outro host entra como novo; `base_url` vazio ou inválido não tem regra [docs/catalog-agent.md:passo 5]
+- [x] [Review][Patch] Passo 5 usa `upstream.base_url`, mas o passo 1 lê só `tiers` e `prices` e o passo 2 deixa o tier 0 fora de escopo [docs/catalog-agent.md:passos 1, 2 e 5]
+- [x] [Review][Patch] Teto de 5 e reuso da redação citam o passo 6, mas as propostas anteriores só são lidas lá; ler antes da busca [docs/catalog-agent.md:passos 5 e 6]
+- [x] [Review][Patch] Páginas de provedor sem regra de redirecionamento e "outros sites" sem definição (subdomínio, domínio registrável) [docs/catalog-agent.md:passo 5]
+- [x] [Review][Patch] Provedor cuja página só traz nome de exibição, sem id de API: aplicar a regra dos tiers (não listar, nunca derivar o id) [docs/catalog-agent.md:passo 5]
+- [x] [Review][Patch] Identidade e valor sem forma canônica: nome do provedor (sem " — ", sem quebra de linha, nome oficial mais curto) e ordenação dos ids (ordem de bytes) [docs/catalog-agent.md:passos 5 e 6, formato]
+- [x] [Review][Patch] Caso de borda "segunda rodada sem mudança" promete tudo vazio, mas a busca na web varia; condicionar a "sem mudança nas fontes" para provedores [docs/catalog-agent.md:tabela de casos]
+- [x] [Review][Patch] Falta linha de caso de borda para página de provedor ilegível ou sem modelos gratuitos (provedor não listado, sem linha `não verificado`) [docs/catalog-agent.md:tabela de casos]
+
+#### Rejected
+- Provedor some ou perde o tier gratuito sem aviso (blind, edge): falso, o texto diz que provedor sem modelos gratuitos declarados não é listado; é intencional.
+- Exemplos `exemplo-provedor` e `outro-provedor` podem vazar para propostas reais (blind): baixo, os nomes são evidentemente fictícios e o bloco é rotulado como exemplos.
