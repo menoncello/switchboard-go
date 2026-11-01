@@ -2192,6 +2192,38 @@ func TestFailover404MissingModelGoesToNextTierWithoutCooldown(t *testing.T) {
 	if rec := chatReq(app, `{"model":"a"}`); rec.Code != 404 || rec.Body.String() != `model not found` {
 		t.Fatalf("last tier: %d %q", rec.Code, rec.Body.String())
 	}
+	// a body past the 4096-byte peek limit still reaches the client intact
+	big := `{"error":"model not found"}` + strings.Repeat(" ", 10000)
+	s0, s1 = newStub(t, 404, big), newStub(t, 404, big)
+	app, _ = failoverApp(t, s0, s1, nil, time.Hour)
+	if rec := chatReq(app, `{"model":"a"}`); rec.Code != 404 || rec.Body.String() != big {
+		t.Fatalf("last tier, large body: %d len=%d", rec.Code, rec.Body.Len())
+	}
+}
+
+func TestFailover404DeadRouteMentioningModelsGetsCooldown(t *testing.T) {
+	s0, s1 := newStub(t, 404, `404 page not found: /v1/models`), newStub(t, 200, `{"from":"t1"}`)
+	app, _ := failoverApp(t, s0, s1, nil, time.Hour)
+	for i := 1; i <= 2; i++ {
+		rec := chatReq(app, `{"model":"a"}`)
+		if rec.Code != 200 || rec.Body.String() != `{"from":"t1"}` || s0.hits.Load() != 1 || s1.hits.Load() != int32(i) {
+			t.Fatalf("req %d: %d %q hits=%d/%d", i, rec.Code, rec.Body.String(), s0.hits.Load(), s1.hits.Load())
+		}
+	}
+	if app.cooldowns.remaining(tier0CooldownKey) == 0 {
+		t.Fatal("tier 0 not in cooldown after a dead-route 404")
+	}
+}
+
+func TestTelegramModelNotFoundSendsNothing(t *testing.T) {
+	calls := fakeTelegram(t, 200)
+	s0, s1 := newStub(t, 404, `model not found`), newStub(t, 404, `model not found`)
+	app, _ := failoverApp(t, s0, s1, nil, time.Hour)
+	app.telegram = NewTelegramNotifier(TelegramConfig{BotToken: "TOK", ChatID: "42"})
+	if rec := chatReq(app, `{"model":"typo"}`); rec.Code != 404 || rec.Body.String() != `model not found` {
+		t.Fatalf("got %d %q", rec.Code, rec.Body.String())
+	}
+	expectTelegram(t, calls, false)
 }
 
 func TestFailover404WithoutRequestModelPassesThrough(t *testing.T) {

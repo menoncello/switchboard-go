@@ -9,6 +9,7 @@ import (
 	"maps"
 	"math"
 	"net/http"
+	"regexp"
 	"slices"
 	"strconv"
 	"strings"
@@ -227,7 +228,10 @@ func (a *App) serveProxy(w http.ResponseWriter, r *http.Request, style APIStyle)
 		w.WriteHeader(statusClientClosed)
 		return model, "", -1, usageTokens{}, false
 	}
-	a.telegram.notifyFailure(model)
+	// A model the client got wrong says nothing about the tiers: no alert.
+	if last.resp == nil || !isModelNotFound(last.resp) {
+		a.telegram.notifyFailure(model)
+	}
 	// No tier served it; alert once when every tier 0 key is exhausted.
 	if a.keys.ShouldNotifyAllExhausted() {
 		a.sender.NotifyAllExhausted(a.keys.Status())
@@ -324,28 +328,20 @@ func withIncludeUsage(fields map[string]json.RawMessage) map[string]json.RawMess
 // isTierFailure reports whether resp means the whole tier is unhealthy and the
 // next one should be tried: 401, 402, 429, any 5xx, and a 404 (only when the request
 // names a model). A 404 about a missing model moves on too, but see isModelNotFound:
-// the tier is healthy, so it gets no cooldown. Like isKeyDead, it restores resp.Body.
+// the tier is healthy, so it gets no cooldown.
 func isTierFailure(resp *http.Response, hasModel bool) bool {
 	return resp.StatusCode == 401 || resp.StatusCode == 402 || resp.StatusCode == 429 || resp.StatusCode >= 500 ||
 		(resp.StatusCode == 404 && hasModel)
 }
 
+// modelNotFoundRe matches the error code model_not_found or "model" right next to the
+// not-found phrase, so a dead-route 404 that merely mentions /v1/models does not count.
+var modelNotFoundRe = regexp.MustCompile(`model_not_found|\b(unknown|invalid|no such) model\b|\bmodel\b[^.]{0,80}(not found|does not exist)`)
+
 // isModelNotFound reports whether resp is a 404 saying the requested model does not
 // exist on this tier. It restores resp.Body.
 func isModelNotFound(resp *http.Response) bool {
-	if resp.StatusCode != 404 {
-		return false
-	}
-	low := strings.ToLower(string(peekBody(resp)))
-	if !strings.Contains(low, "model") {
-		return false
-	}
-	for _, p := range []string{"not found", "does not exist", "unknown", "invalid", "no such"} {
-		if strings.Contains(low, p) {
-			return true
-		}
-	}
-	return false
+	return resp.StatusCode == 404 && modelNotFoundRe.Match(bytes.ToLower(peekBody(resp)))
 }
 
 // proxyTiers tries the eligible configured tiers (see tierModelID) in order after tier 0 failed or was

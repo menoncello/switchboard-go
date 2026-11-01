@@ -3,7 +3,7 @@ title: '404 de modelo inexistente segue ao próximo tier'
 type: 'bugfix'
 ticket: '2'
 created: '2026-11-01'
-status: 'built'
+status: done
 baseline_revision: 'bfb3ba28ed3ff1f4e1389fdfe625d8b1fd7b8d3d'
 route: 'oneshot'
 route_source: 'auto'
@@ -64,3 +64,20 @@ Oneshot: ~20 linhas em `proxy.go` (`isTierFailure` linha 324, chamadas nas linha
 - **Revisão de acompanhamento:** não recomendada.
 - **Verificação:** `go test ./...` ok, `go vet` e `gofmt` limpos.
 - **Riscos residuais:** typo de modelo do cliente pode disparar o alerta Telegram.
+
+## Code Review
+
+### 2026-11-01 — 0 decision-needed, 4 patch, 0 defer, 13 rejected
+
+- [x] [Review][Patch] Apertar `isModelNotFound`: exigir código/tipo `model_not_found` ou "model" junto da frase, e testar um 404 de rota morta com "model" no corpo [proxy.go:335-349]
+- [x] [Review][Patch] Alerta Telegram `notifyFailure` dispara quando o 404 de modelo não é atendido por nenhum tier [proxy.go:230]
+- [x] [Review][Patch] Sem teste de 404 de modelo retido como última resposta com corpo > 4096 bytes, conferido byte a byte [main_test.go:2189]
+- [x] [Review][Patch] Comentário de `isTierFailure` diz "Like isKeyDead, it restores resp.Body", mas a função não lê mais o corpo [proxy.go:~323]
+
+#### Rejected
+- Corpo 404 retido sobrescrito por falha de tier posterior (blind, edge): low, corrigir exige lógica de prioridade.
+- Tier reacionado a cada request após 404 de modelo (edge): é o que o ticket pede (sem cooldown).
+- Testes ausentes (sem model, tier único, unit): 404 sem model já coberto por TestFailover404WithoutRequestModelPassesThrough; resto low.
+- Docs sem efeitos colaterais: low, pouco visível.
+- Metadados do plano (`ticket: '2'`, risk/review): falso, id dentro do epic e campo de processo.
+- Intent: predicado vs chamadores, teste renomeado: low, descritivo. No-cooldown no tier extra só por hits: falso, `hits == i` prova.
