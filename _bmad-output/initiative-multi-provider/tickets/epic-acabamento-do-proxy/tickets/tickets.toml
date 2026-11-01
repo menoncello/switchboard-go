@@ -1,0 +1,79 @@
+# Stories do épico acabamento-do-proxy. Duas faixas: proxy.go (1, 2, 3, 4, 6) e config.go (5). O Refactor sweep fecha.
+# next_id = 8
+
+[[entry]]
+id = 1
+type = "story"
+title = "Erro de transporte passa por writeAPIError sem a URL do upstream"
+description = "proxyV1 deixa de devolver reqErr.Error() ao cliente em erro de transporte e responde por writeAPIError com mensagem genérica; o detalhe com a URL vai só ao log."
+verify = "go test: com o upstream inalcançável, a resposta ao cliente não contém a URL do upstream e tem o formato de erro da API; o log ainda traz o detalhe."
+covers = ["R1"]
+after = ["2.12"]
+hitl = false
+risk = "low"
+
+[[entry]]
+id = 2
+type = "story"
+title = "404 de modelo inexistente segue ao próximo tier"
+description = "isTierFailure passa a tratar o 404 de modelo inexistente como falha do tier: a request segue ao próximo tier mapeado, sem cooldown; o teste TestFailover400And404MissingModelPassThroughWithoutCooldown é ajustado ao novo comportamento e o 400 continua sem failover."
+verify = "go test: com o tier 0 devolvendo 404 de modelo inexistente, o próximo tier atende e o tier 0 não entra em cooldown; um 400 continua passando direto ao cliente."
+covers = ["R2"]
+after = [1]
+hitl = false
+risk = "medium"
+
+[[entry]]
+id = 3
+type = "story"
+title = "/v1/completions classificado como OpenAI"
+description = "apiStyleForRequest deixa de testar HasPrefix(path, \"/complete\") de modo que /v1/completions caia no estilo Anthropic; o legado de completions da OpenAI sai com o cabeçalho OpenAI e não pula tiers só OpenAI."
+verify = "go test: /v1/completions é OpenAI e um tier só OpenAI o atende; o caminho Anthropic de complete continua classificado como Anthropic."
+covers = ["R3"]
+after = [2, "2.5"]
+hitl = false
+risk = "low"
+
+[[entry]]
+id = 4
+type = "story"
+title = "include_usage só onde o upstream aceita"
+description = "Um passo hitl chama o upstream real em /v1/responses com stream_options.include_usage. Se o upstream rejeitar, withIncludeUsage passa a injetar o campo só em /chat/completions; se aceitar, a story só registra isso no Notes e fecha sem mudar código."
+verify = "O Eduardo confirma com uma chamada real em /v1/responses. Se houve mudança: go test mostra que /chat/completions recebe o campo e /v1/responses não."
+covers = ["R4"]
+after = [3, "3.6"]
+hitl = true
+risk = "medium"
+
+[[entry]]
+id = 5
+type = "story"
+title = "Config rejeita valores inválidos e aceita usage_url e usage_cache_ttl no YAML"
+description = "validateConfig rejeita MAX_REQUEST_BODY_BYTES e SMTP_PORT inválidos, como já faz com as durações; yamlConfig ganha usage_url e usage_cache_ttl, com a variável de ambiente ainda valendo; docs/operations.md cita os dois campos."
+verify = "go test: cada valor inválido recusa a partida com mensagem que nomeia o campo; usage_url e usage_cache_ttl lidos pelo YAML chegam ao cache de uso."
+covers = ["R5", "R6"]
+after = ["2.11"]
+hitl = false
+risk = "low"
+
+[[entry]]
+id = 6
+type = "story"
+title = "Aviso SMTP na troca de tier"
+description = "Quando uma request passa de um tier para outro, o Eduardo recebe um aviso SMTP, uma vez por episódio (como o Telegram do R16), reaproveitando o envio existente do alerta do teto diário."
+verify = "go test: com o tier 0 esgotado e um extra atendendo, um aviso SMTP sai na primeira troca e não se repete até o episódio acabar."
+covers = ["R7"]
+after = [4, "3.7"]
+hitl = false
+risk = "medium"
+
+[[entry]]
+id = 7
+type = "story"
+title = "Refactor sweep"
+description = "Limpeza do que o épico deixou: duplicações e nomes em proxy.go e config.go, e o que os code reviews das stories 1 a 6 adiarem. Sem escopo novo."
+verify = "go test e go vet passam e o diff não altera comportamento."
+covers = []
+after = [5, 6]
+hitl = false
+risk = "low"
