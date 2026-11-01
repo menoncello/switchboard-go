@@ -463,7 +463,7 @@ func (a *App) doUpstream(ctx context.Context, r *http.Request, body []byte, base
 
 func apiStyleForRequest(r *http.Request) APIStyle {
 	path := strings.TrimPrefix(r.URL.Path, "/v1")
-	if strings.HasPrefix(path, "/messages") || strings.HasPrefix(path, "/complete") {
+	if strings.HasPrefix(path, "/messages") || path == "/complete" {
 		return APIStyleAnthropic
 	}
 	for name := range r.Header {

@@ -283,7 +283,7 @@ Free tiers keep cost 0 in that case.
 ### API styles
 
 A request is `anthropic` when its path starts with `/v1/messages` or
-`/v1/complete`, or it carries any `anthropic-*` header; otherwise it is `openai`.
+is exactly `/v1/complete`, or it carries any `anthropic-*` header; otherwise it is `openai`.
 `styles` lists the styles a tier speaks, and the proxy never translates between
 them: a tier that does not list the request's style is skipped. The credential
 follows the request's style, not the tier's: `x-api-key` (plus

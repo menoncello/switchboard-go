@@ -3476,3 +3476,51 @@ func TestRequestLogStreamCutKeepsPartialUsage(t *testing.T) {
 		t.Fatalf("log: %v", got)
 	}
 }
+
+func TestAPIStyleForRequest(t *testing.T) {
+	cases := []struct {
+		path string
+		hdr  string
+		want APIStyle
+	}{
+		{"/v1/completions", "", APIStyleOpenAI},
+		{"/v1/chat/completions", "", APIStyleOpenAI},
+		{"/v1/complete", "", APIStyleAnthropic},
+		{"/v1/messages", "", APIStyleAnthropic},
+		{"/v1/completions", "anthropic-version", APIStyleAnthropic},
+	}
+	for _, c := range cases {
+		req := httptest.NewRequest(http.MethodPost, c.path, nil)
+		if c.hdr != "" {
+			req.Header.Set(c.hdr, "2023-06-01")
+		}
+		if got := apiStyleForRequest(req); got != c.want {
+			t.Errorf("%s hdr=%q: got %v, want %v", c.path, c.hdr, got, c.want)
+		}
+	}
+}
+
+func TestV1CompletionsServedByOpenAIOnlyTier(t *testing.T) {
+	s0 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusTooManyRequests)
+		_, _ = w.Write([]byte(quotaBody))
+	}))
+	defer s0.Close()
+	var hits int
+	var auth, apiKey string
+	s1 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits++
+		auth, apiKey = r.Header.Get("Authorization"), r.Header.Get("x-api-key")
+		_, _ = w.Write([]byte(`{}`))
+	}))
+	defer s1.Close()
+	app := newApp(Config{ProxyAPIKey: "p", UpstreamAPIKeys: []string{"k"}, UpstreamBaseURL: s0.URL, MaxRequestBodyBytes: 1 << 20, RetryExhaustedAfter: time.Hour, Tiers: []TierConfig{
+		{Name: "t1", BaseURL: s1.URL, APIKey: "tk", Free: true, Styles: []APIStyle{APIStyleOpenAI}, Models: []TierModel{{Name: "m"}}},
+	}})
+	if rec := tierReq(app, http.MethodPost, "/v1/completions", `{"model":"m","prompt":"hi"}`, nil); rec.Code != http.StatusOK {
+		t.Fatalf("code %d body %s", rec.Code, rec.Body.String())
+	}
+	if hits != 1 || auth != "Bearer tk" || apiKey != "" {
+		t.Fatalf("hits=%d auth=%q x-api-key=%q", hits, auth, apiKey)
+	}
+}
