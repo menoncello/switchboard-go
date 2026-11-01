@@ -3,7 +3,7 @@ title: 'Erro de transporte passa por writeAPIError sem a URL do upstream'
 type: 'bugfix'
 ticket: '1'
 created: '2026-11-01'
-status: 'built'
+status: done
 baseline_revision: '29af5a845b4e194c5bbbce6b2a02f5b90e86ccb5'
 route: 'oneshot'
 route_source: 'auto'
@@ -56,3 +56,22 @@ Oneshot: mudança de ~10 linhas em proxy.go e um teste ajustado. O teste existen
 - **Revisão de acompanhamento:** não recomendada.
 - **Verificação:** `go test ./...` ok, `go vet` e `gofmt` limpos.
 - **Riscos residuais:** a query string do cliente aparece no log dentro da URL.
+
+## Code Review
+
+### 2026-11-01
+0 `decision-needed`, 2 `patch`, 0 `defer`, 17 rejeitados.
+
+- [ ] [Review][Patch] (não aplicado: tier 0 não tem nome, o log de request usa tier "") Warn do tier 0 sem atributo `tier`, diferente do Warn dos tiers extras [proxy.go:193]
+- [x] [Review][Patch] Asserções fracas nos testes: `l[0]` (Warn do tier 0) não checado, mensagem genérica não asserida, `error.type` do estilo Anthropic não checado [main_test.go:2349-2367, main_test.go:2404-2409]
+
+**Rejected**
+- Query do cliente no log junto da URL (3 achados): log do operador, a query é do próprio cliente, o plano já aceitou o risco e a correção exige helper de redação.
+- Timeout vira 502 em vez de 504: 502 era o status anterior e a intenção pede 502 genérico.
+- Warn sem limite de taxa: só incomoda em queda prolongada e a correção traz estado.
+- `writeOpenAIError` fixa `invalid_request_error`: comportamento antigo de todo o helper, fora deste diff.
+- Tipo Anthropic inválido: falso, `anthropicErrorType` devolve `api_error` para 5xx.
+- Cancelamento sem teste: falso, `TestFailoverClientCancelStopsWithoutTouchingState` cobre.
+- Comentário obsoleto: falso, continua verdadeiro.
+- `ticket: '1'` no plano: falso, é o id local no epic. Demais itens de doc sem dano.
+- Verification-gap sem lacunas; Intent Alignment descritivo, sem defeito.
