@@ -201,11 +201,12 @@ the YAML file only, not from environment variables.
 
 A request goes to tier 0 first, then to the tiers in order. Each tier that fails
 is skipped (put in cooldown) and the next one is tried. A tier fails on `401`,
-`402`, any `5xx`, any `429`, and a `404` that is not about a missing model. A
-`404` fails the tier only when the request body has a non-empty top-level
-`model` and the `404` body does not say the model is missing (it contains "model"
-and one of "not found", "does not exist", "unknown", "invalid", "no such");
-otherwise it goes to the client. Any other status (`400`, a plain `403`, `2xx`,
+`402`, any `5xx`, any `429`, and a `404`. A `404` fails the tier only when the
+request body has a non-empty top-level `model`; otherwise it goes to the client.
+A `404` that says the model is missing (the body contains "model" and one of
+"not found", "does not exist", "unknown", "invalid", "no such") moves on to the
+next tier without putting this one in cooldown, and reaches the client only when
+no tier is left. Any other status (`400`, a plain `403`, `2xx`,
 `3xx`, other `4xx`) goes to the client without cooldown. Failover happens only
 before the response is copied: once a response starts (a stream included) there
 is no switch, even if it is cut.

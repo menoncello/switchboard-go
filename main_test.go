@@ -2145,12 +2145,12 @@ func TestFailoverExtraTierFailureStatusesGoToNextTier(t *testing.T) {
 	}
 }
 
-func TestFailover400And404MissingModelPassThroughWithoutCooldown(t *testing.T) {
+func TestFailover400And403PassThroughWithoutCooldown(t *testing.T) {
 	for _, c := range []struct {
 		status int
 		body   string
 	}{
-		{400, `bad request`}, {403, `forbidden`}, {404, `{"error":{"message":"The model gpt-x does not exist"}}`}, {404, `Model not found`},
+		{400, `bad request`}, {403, `forbidden`},
 	} {
 		s0, s1 := newStub(t, c.status, c.body), newStub(t, 200, `{"from":"t1"}`)
 		app, _ := failoverApp(t, s0, s1, nil, time.Hour)
@@ -2161,17 +2161,36 @@ func TestFailover400And404MissingModelPassThroughWithoutCooldown(t *testing.T) {
 			}
 		}
 	}
-	// a 404 from an extra tier that says the model is missing also goes to the client
+}
+
+func TestFailover404MissingModelGoesToNextTierWithoutCooldown(t *testing.T) {
+	for _, body := range []string{`{"error":{"message":"The model gpt-x does not exist"}}`, `Model not found`} {
+		s0, s1 := newStub(t, 404, body), newStub(t, 200, `{"from":"t1"}`)
+		app, _ := failoverApp(t, s0, s1, nil, time.Hour)
+		for i := 1; i <= 2; i++ {
+			rec := chatReq(app, `{"model":"a"}`)
+			if rec.Code != 200 || rec.Body.String() != `{"from":"t1"}` || s0.hits.Load() != int32(i) || s1.hits.Load() != int32(i) {
+				t.Fatalf("%q req %d: got %d %q hits=%d/%d", body, i, rec.Code, rec.Body.String(), s0.hits.Load(), s1.hits.Load())
+			}
+		}
+		if app.cooldowns.remaining(tier0CooldownKey) != 0 {
+			t.Fatalf("%q: tier 0 in cooldown after a model 404", body)
+		}
+	}
+	// the same from an extra tier: the next one answers and the tier stays out of cooldown
 	s0, s1, s2 := newStub(t, 500, `x`), newStub(t, 404, `model not found`), newStub(t, 200, `{"from":"t2"}`)
 	app, _ := failoverApp(t, s0, s1, s2, time.Hour)
 	for i := 1; i <= 2; i++ {
 		rec := chatReq(app, `{"model":"a"}`)
-		if i == 1 && (rec.Code != 404 || s2.hits.Load() != 0) {
-			t.Fatalf("tier 404: %d hits=%d", rec.Code, s2.hits.Load())
+		if rec.Code != 200 || rec.Body.String() != `{"from":"t2"}` || s1.hits.Load() != int32(i) || s2.hits.Load() != int32(i) {
+			t.Fatalf("tier 404 req %d: %d %q hits=%d/%d", i, rec.Code, rec.Body.String(), s1.hits.Load(), s2.hits.Load())
 		}
 	}
-	if s1.hits.Load() != 2 {
-		t.Fatalf("tier 1 was put in cooldown by a model 404: %d hits", s1.hits.Load())
+	// with no tier left, the last model 404 reaches the client
+	s0, s1 = newStub(t, 404, `model not found`), newStub(t, 404, `model not found`)
+	app, _ = failoverApp(t, s0, s1, nil, time.Hour)
+	if rec := chatReq(app, `{"model":"a"}`); rec.Code != 404 || rec.Body.String() != `model not found` {
+		t.Fatalf("last tier: %d %q", rec.Code, rec.Body.String())
 	}
 }
 

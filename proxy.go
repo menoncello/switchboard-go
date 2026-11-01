@@ -208,7 +208,10 @@ func (a *App) serveProxy(w http.ResponseWriter, r *http.Request, style APIStyle)
 			a.keys.MarkAvailable(idx)
 			if isTierFailure(resp, model != "") {
 				// The whole tier is unhealthy, not one key: rotating keys would not help.
-				a.cooldowns.set(tier0CooldownKey, a.config.RetryExhaustedAfter)
+				// A missing model says nothing about the tier's health: no cooldown.
+				if !isModelNotFound(resp) {
+					a.cooldowns.set(tier0CooldownKey, a.config.RetryExhaustedAfter)
+				}
 				last.hold(resp, tier0Name, idx)
 				break
 			}
@@ -319,23 +322,28 @@ func withIncludeUsage(fields map[string]json.RawMessage) map[string]json.RawMess
 }
 
 // isTierFailure reports whether resp means the whole tier is unhealthy and the
-// next one should be tried: 401, 402, 429, any 5xx, and a 404 that is not about a
-// missing model (only when the request names a model). Like isKeyDead, it restores resp.Body.
+// next one should be tried: 401, 402, 429, any 5xx, and a 404 (only when the request
+// names a model). A 404 about a missing model moves on too, but see isModelNotFound:
+// the tier is healthy, so it gets no cooldown. Like isKeyDead, it restores resp.Body.
 func isTierFailure(resp *http.Response, hasModel bool) bool {
-	switch {
-	case resp.StatusCode == 401 || resp.StatusCode == 402 || resp.StatusCode == 429 || resp.StatusCode >= 500:
-		return true
-	case resp.StatusCode == 404 && hasModel:
-		low := strings.ToLower(string(peekBody(resp)))
-		if !strings.Contains(low, "model") {
+	return resp.StatusCode == 401 || resp.StatusCode == 402 || resp.StatusCode == 429 || resp.StatusCode >= 500 ||
+		(resp.StatusCode == 404 && hasModel)
+}
+
+// isModelNotFound reports whether resp is a 404 saying the requested model does not
+// exist on this tier. It restores resp.Body.
+func isModelNotFound(resp *http.Response) bool {
+	if resp.StatusCode != 404 {
+		return false
+	}
+	low := strings.ToLower(string(peekBody(resp)))
+	if !strings.Contains(low, "model") {
+		return false
+	}
+	for _, p := range []string{"not found", "does not exist", "unknown", "invalid", "no such"} {
+		if strings.Contains(low, p) {
 			return true
 		}
-		for _, p := range []string{"not found", "does not exist", "unknown", "invalid", "no such"} {
-			if strings.Contains(low, p) {
-				return false
-			}
-		}
-		return true
 	}
 	return false
 }
@@ -376,11 +384,13 @@ func (a *App) proxyTiers(ctx context.Context, w http.ResponseWriter, r *http.Req
 			continue
 		}
 		if isTierFailure(resp, true) {
-			cooldown := a.config.RetryExhaustedAfter
-			if t.Cooldown != nil {
-				cooldown = *t.Cooldown
+			if !isModelNotFound(resp) {
+				cooldown := a.config.RetryExhaustedAfter
+				if t.Cooldown != nil {
+					cooldown = *t.Cooldown
+				}
+				a.cooldowns.set(t.Name, cooldown)
 			}
-			a.cooldowns.set(t.Name, cooldown)
 			last.hold(resp, t.Name, -1)
 			continue
 		}
