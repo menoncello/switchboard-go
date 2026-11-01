@@ -190,6 +190,7 @@ func (a *App) serveProxy(w http.ResponseWriter, r *http.Request, style APIStyle)
 					return model, "", -1, usageTokens{}, false
 				}
 				// Connection error or timeout: no cooldown, no key rotation, on to the extra tiers.
+				a.logger.Warn("upstream unreachable", "error", reqErr.Error())
 				last.err = reqErr
 				break
 			}
@@ -232,7 +233,7 @@ func (a *App) serveProxy(w http.ResponseWriter, r *http.Request, style APIStyle)
 		return model, last.tier, last.key, copyResponse(w, last.resp), true
 	}
 	if last.err != nil {
-		http.Error(w, "upstream unreachable", http.StatusBadGateway) // fixed text: the error would leak the tier URL
+		writeAPIError(w, style, http.StatusBadGateway, "upstream_unreachable", "upstream unreachable") // fixed text: the error would leak the tier URL
 		return model, "", -1, usageTokens{}, false
 	}
 	// No eligible tier remains. Fail fast locally instead of hammering upstream,
@@ -371,6 +372,7 @@ func (a *App) proxyTiers(ctx context.Context, w http.ResponseWriter, r *http.Req
 			if ctx.Err() != nil {
 				return "", usageTokens{}, false
 			}
+			a.logger.Warn("tier upstream unreachable", "tier", t.Name, "error", err.Error())
 			continue
 		}
 		if isTierFailure(resp, true) {

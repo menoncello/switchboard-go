@@ -2349,9 +2349,21 @@ func TestFailoverTier0UnreachableWithoutExtraTiersHidesTierURL(t *testing.T) {
 	s0, s1 := newStub(t, 200, `x`), newStub(t, 200, `x`)
 	s0.srv.Close()
 	app, _ := failoverApp(t, s0, s1, nil, time.Hour)
+	var logs bytes.Buffer
+	app.logger = slog.New(slog.NewJSONHandler(&logs, nil))
 	rec := tierReq(app, http.MethodGet, "/v1/models", "", nil)
-	if rec.Code != 502 || rec.Body.String() != "upstream unreachable\n" || strings.Contains(rec.Body.String(), s0.srv.URL) {
+	var body struct {
+		Error struct{ Code, Message string }
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil || rec.Code != 502 || body.Error.Code != "upstream_unreachable" || strings.Contains(rec.Body.String(), s0.srv.URL) {
 		t.Fatalf("got %d %q", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(logs.String(), s0.srv.URL) {
+		t.Fatalf("log lacks the upstream detail: %s", logs.String())
+	}
+	rec = tierReq(app, http.MethodGet, "/v1/models", "", map[string]string{"anthropic-version": "2023-06-01"})
+	if rec.Code != 502 || rec.Header().Get("Content-Type") != "application/json" || !strings.Contains(rec.Body.String(), `"type":"error"`) || strings.Contains(rec.Body.String(), s0.srv.URL) {
+		t.Fatalf("anthropic style: %d %q", rec.Code, rec.Body.String())
 	}
 }
 
@@ -2392,7 +2404,7 @@ func TestFailoverConnectionErrorExtraTierAndAllUnreachable(t *testing.T) {
 	app, _ = failoverApp(t, d0, d1, nil, time.Hour)
 	lines := captureLog(app)
 	rec = chatReq(app, `{"model":"a"}`)
-	if l := lines(t); rec.Code != 502 || l[0]["tier"] != "" || l[0]["status"] != float64(502) ||
+	if l := lines(t); len(l) != 3 || l[1]["msg"] != "tier upstream unreachable" || l[1]["tier"] != "t1" || rec.Code != 502 || l[len(l)-1]["tier"] != "" || l[len(l)-1]["status"] != float64(502) ||
 		app.cooldowns.remaining(tier0CooldownKey) != 0 || app.cooldowns.remaining("t1") != 0 {
 		t.Fatalf("all unreachable: %d %v", rec.Code, l)
 	}
