@@ -3486,6 +3486,8 @@ func TestAPIStyleForRequest(t *testing.T) {
 		{"/v1/completions", "", APIStyleOpenAI},
 		{"/v1/chat/completions", "", APIStyleOpenAI},
 		{"/v1/complete", "", APIStyleAnthropic},
+		{"/v1/complete/", "", APIStyleOpenAI},
+		{"/v1/completeX", "", APIStyleOpenAI},
 		{"/v1/messages", "", APIStyleAnthropic},
 		{"/v1/completions", "anthropic-version", APIStyleAnthropic},
 	}
@@ -3506,11 +3508,14 @@ func TestV1CompletionsServedByOpenAIOnlyTier(t *testing.T) {
 		_, _ = w.Write([]byte(quotaBody))
 	}))
 	defer s0.Close()
-	var hits int
+	var hits atomic.Int32
+	var mu sync.Mutex
 	var auth, apiKey string
 	s1 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		hits++
+		hits.Add(1)
+		mu.Lock()
 		auth, apiKey = r.Header.Get("Authorization"), r.Header.Get("x-api-key")
+		mu.Unlock()
 		_, _ = w.Write([]byte(`{}`))
 	}))
 	defer s1.Close()
@@ -3520,7 +3525,9 @@ func TestV1CompletionsServedByOpenAIOnlyTier(t *testing.T) {
 	if rec := tierReq(app, http.MethodPost, "/v1/completions", `{"model":"m","prompt":"hi"}`, nil); rec.Code != http.StatusOK {
 		t.Fatalf("code %d body %s", rec.Code, rec.Body.String())
 	}
-	if hits != 1 || auth != "Bearer tk" || apiKey != "" {
-		t.Fatalf("hits=%d auth=%q x-api-key=%q", hits, auth, apiKey)
+	mu.Lock()
+	defer mu.Unlock()
+	if hits.Load() != 1 || auth != "Bearer tk" || apiKey != "" {
+		t.Fatalf("hits=%d auth=%q x-api-key=%q", hits.Load(), auth, apiKey)
 	}
 }

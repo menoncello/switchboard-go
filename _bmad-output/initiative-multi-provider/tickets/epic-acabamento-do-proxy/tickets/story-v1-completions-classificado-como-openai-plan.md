@@ -3,7 +3,7 @@ title: '/v1/completions classificado como OpenAI'
 type: 'bugfix'
 ticket: '3'
 created: '2026-11-01'
-status: built
+status: done
 baseline_revision: '6b1a0628201de12f76d65ac23ae945e2ec4c4b67'
 route: 'oneshot'
 route_source: 'auto'
@@ -57,3 +57,17 @@ Oneshot: uma linha em `proxy.go:466` e um teste de `apiStyleForRequest` em `main
 - **Revisão de acompanhamento:** não recomendada.
 - **Verificação:** `go test ./...` ok, `go vet` e `gofmt` limpos.
 - **Riscos residuais:** `/v1/complete/` com barra final passa a cair em OpenAI.
+
+## Code Review
+
+### 2026-11-01
+0 decision-needed, 2 patch, 0 defer, 14 rejected.
+
+- [x] [Review][Patch] Nenhum teste separa `==` de `HasPrefix`: adicionar `/v1/complete/` e `/v1/completeX` (esperado OpenAI) em `TestAPIStyleForRequest` [main_test.go:3480-3500]
+- [x] [Review][Patch] `TestV1CompletionsServedByOpenAIOnlyTier` lê `hits`/`auth`/`apiKey` sem sincronização; usar atomic/mutex como os testes vizinhos [main_test.go:3511-3523]
+
+Rejected:
+- `/v1/complete/` e subcaminhos viram OpenAI (R1, R2): false, é o comportamento pedido (igualdade).
+- Premissa do ticket falsa / testes passam com o código antigo (B1, I1): corrigir editaria a intenção do plano.
+- Metadado `ticket: '3'` vs `5.3` (B7): false, ref 5.3 é o id 3 do epic.
+- `s0` sem asserção (R5, B4), doc sem `/v1` opcional (R6, B6), faltam linhas batches/sem `/v1` (B3, V3): low, pouco visível.
