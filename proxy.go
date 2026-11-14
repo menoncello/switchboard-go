@@ -311,7 +311,8 @@ func (a *App) tierCapped(t TierConfig) bool {
 }
 
 // withIncludeUsage returns fields with stream_options.include_usage set to true, keeping other
-// stream_options keys. fields is not changed.
+// stream_options keys. fields is not changed. Only /chat/completions accepts the field; /v1/responses
+// rejects it with 400, so the caller must not apply this there.
 func withIncludeUsage(fields map[string]json.RawMessage) map[string]json.RawMessage {
 	opts := map[string]json.RawMessage{}
 	_ = json.Unmarshal(fields["stream_options"], &opts) // not an object (or null): start empty
@@ -363,7 +364,7 @@ func (a *App) proxyTiers(ctx context.Context, w http.ResponseWriter, r *http.Req
 		tf := maps.Clone(fields) // per tier: the next tier must not see this tier's edits
 		tf["model"] = raw
 		var stream bool
-		if !t.Free && style == APIStyleOpenAI && json.Unmarshal(fields["stream"], &stream) == nil && stream {
+		if !t.Free && style == APIStyleOpenAI && strings.TrimPrefix(r.URL.Path, "/v1") == "/chat/completions" && json.Unmarshal(fields["stream"], &stream) == nil && stream {
 			tf = withIncludeUsage(tf)
 		}
 		tierBody, err := json.Marshal(tf)

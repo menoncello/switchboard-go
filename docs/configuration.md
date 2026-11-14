@@ -273,9 +273,10 @@ when that is shorter than the other waiting times. `/status` shows `US$ spent / 
 tier, and the state `teto` with the seconds to midnight while the cap holds.
 
 The cost of a request is only known when it ends, so a request already in flight can take the
-tier past the cap. For OpenAI-style requests with `stream: true` sent to a paid tier, the proxy
+tier past the cap. For `/chat/completions` requests with `stream: true` sent to a paid tier, the proxy
 adds `stream_options.include_usage: true` (other `stream_options` keys are kept) so the provider
-reports usage; free tiers and Anthropic-style requests get the body unchanged. A 2xx response
+reports usage; free tiers, Anthropic-style requests and `/v1/responses` (which reports usage in its
+`response.completed` event and rejects that field) get the body unchanged. A 2xx response
 from a paid tier with no `usage` is charged the highest `input` or `output` price in the whole
 `prices` map, as USD (the cost of 1M tokens, a deliberate worst case), and counts in "Sem usage".
 Free tiers keep cost 0 in that case.
@@ -356,8 +357,9 @@ Every proxied request writes one JSON line to stderr when its response ends
 - `usage_missing`: `true` when the response was `2xx` from a tier but carried no
   usable `usage` (absent, malformed, a compressed body with `Content-Encoding`,
   or a JSON body above 1 MiB). A `usage` of 0 input and 0 output counts as
-  missing. An OpenAI stream without `stream_options.include_usage` in the request
-  has no `usage` either, and the proxy does not alter the request to add it.
+  missing. A `/chat/completions` stream without `stream_options.include_usage`
+  in the request has no `usage` either (the proxy adds it only for paid tiers).
+  `/v1/responses` streams carry the usage in the `response.completed` event.
   Only `POST` requests are flagged (a `GET /v1/models` is not).
   The line then has no `tokens_*`.
   Responses that are not `2xx` and requests no tier answered (local `429`, `502`,
