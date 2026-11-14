@@ -1,8 +1,10 @@
 # SMTP notifications
 
 Switchboard Go can send email when it switches away from an exhausted upstream
-key, when all upstream keys have been exhausted and on the first request a paid
-tier serves each day (see "Usage history" in `configuration.md`). The
+key, when all upstream keys have been exhausted, when an extra tier serves a
+request tier 0 did not (once per episode, until tier 0 serves again) and on the
+first request a paid tier serves each day (see "Usage history" in
+`configuration.md`). The
 once-per-day guarantee across restarts needs `usage_file`, and a crash before its
 3 s delayed write can repeat the email on restart.
 

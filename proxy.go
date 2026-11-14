@@ -217,11 +217,13 @@ func (a *App) serveProxy(w http.ResponseWriter, r *http.Request, style APIStyle)
 				break
 			}
 			a.telegram.rearm()
+			a.sender.rearmTierSwitch()
 			return model, tier0Name, idx, copyResponse(w, resp), false
 		}
 	}
 	if name, tokens, ok := a.proxyTiers(orig, w, r, fields, model, style, needTools, &last); ok {
 		a.telegram.rearm()
+		a.sender.NotifyTierSwitch(name, model) // tier 0 was skipped or failed, so this is a switch
 		return model, name, -1, tokens, false
 	}
 	if orig.Err() != nil {

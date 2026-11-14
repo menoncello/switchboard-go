@@ -251,6 +251,11 @@ To try it by hand, run
 `go run ./cmd/fakeupstream -addr 127.0.0.1:9999` and switch it with
 `POST /__mode/quota` or `POST /__mode/ok`.
 
+When tier 0 does not serve a request (cooldown, exhausted keys or a failure)
+and an extra tier does, one SMTP email names that tier and the model. It is
+sent once per episode: later requests the extra tiers serve stay quiet until
+tier 0 serves a request again. A failed send makes the next switch try again.
+
 | Field | Required | Description |
 | --- | --- | --- |
 | `name` | Yes | Unique tier name, used in error messages. |
