@@ -977,7 +977,9 @@ func alertApp(t *testing.T, usageFile string, sendErr error, mod ...func(*Config
 	}
 	app := newApp(cfg)
 	app.history.now = func() time.Time { return capNow }
-	app.sender.switchDisarmed = true // tier 0 always fails here: keep the tier switch warning out of the paid first-use checks
+	for _, tr := range cfg.Tiers { // tier 0 always fails here: keep the tier switch warning out of the paid first-use checks
+		app.sender.warned[tr.Name] = 1
+	}
 	return app, msgs
 }
 

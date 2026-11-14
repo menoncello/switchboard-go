@@ -178,6 +178,7 @@ func (a *App) serveProxy(w http.ResponseWriter, r *http.Request, style APIStyle)
 	orig := r.Context()
 	var last heldResponse
 	defer last.release()
+	tier0ModelMissing := false // tier 0 is healthy but does not map the model: moving on is not a tier switch
 	if a.cooldowns.remaining(tier0CooldownKey) == 0 {
 		for attempts := 0; attempts < len(a.config.UpstreamAPIKeys); attempts++ {
 			idx, key, ok := a.keys.Current()
@@ -210,7 +211,9 @@ func (a *App) serveProxy(w http.ResponseWriter, r *http.Request, style APIStyle)
 			if isTierFailure(resp, model != "") {
 				// The whole tier is unhealthy, not one key: rotating keys would not help.
 				// A missing model says nothing about the tier's health: no cooldown.
-				if !isModelNotFound(resp) {
+				if isModelNotFound(resp) {
+					tier0ModelMissing = true
+				} else {
 					a.cooldowns.set(tier0CooldownKey, a.config.RetryExhaustedAfter)
 				}
 				last.hold(resp, tier0Name, idx)
@@ -223,7 +226,10 @@ func (a *App) serveProxy(w http.ResponseWriter, r *http.Request, style APIStyle)
 	}
 	if name, tokens, ok := a.proxyTiers(orig, w, r, fields, model, style, needTools, &last); ok {
 		a.telegram.rearm()
-		a.sender.NotifyTierSwitch(name, model) // tier 0 was skipped or failed, so this is a switch
+		if !tier0ModelMissing {
+			// tier 0 was skipped or failed, so this is a switch; a model tier 0 does not map is not
+			a.sender.NotifyTierSwitch(name, model)
+		}
 		return model, name, -1, tokens, false
 	}
 	if orig.Err() != nil {

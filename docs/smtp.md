@@ -2,11 +2,17 @@
 
 Switchboard Go can send email when it switches away from an exhausted upstream
 key, when all upstream keys have been exhausted, when an extra tier serves a
-request tier 0 did not (once per episode, until tier 0 serves again) and on the
-first request a paid tier serves each day (see "Usage history" in
-`configuration.md`). The
+request tier 0 did not and on the first request a paid tier serves each day (see
+"Usage history" in `configuration.md`). The
 once-per-day guarantee across restarts needs `usage_file`, and a crash before its
 3 s delayed write can repeat the email on restart.
+
+The tier switch email goes out once per extra tier per episode, so a move to
+another extra tier warns again. An episode ends when tier 0 serves a request. A
+404 model-not-found from tier 0 does not count, since tier 0 is healthy and only
+lacks the model. After a failed send the next attempt waits 5 minutes. A restart
+starts a new episode, so it may warn again. With no tier 0 key configured, tier 0
+never serves and the episode never ends.
 
 Notifications are disabled unless `SMTP_HOST`, `SMTP_FROM`, and `SMTP_TO` are
 all set.

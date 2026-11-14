@@ -2683,59 +2683,191 @@ func tierSwitchMails(t *testing.T, sendErr error) chan string {
 	return mails
 }
 
-func expectTierSwitchMail(t *testing.T, mails chan string, want bool) {
+// expectTierSwitchMail checks whether a tier switch mail for tier arrives (tier is ignored when want is false).
+func expectTierSwitchMail(t *testing.T, mails chan string, want bool, tier string) {
 	t.Helper()
 	select {
 	case m := <-mails:
 		if !want {
 			t.Fatalf("unexpected tier switch mail %q", m)
 		}
-		if !strings.Contains(m, "Subject: Switchboard Go switched tier: t1") || !strings.Contains(m, `model "a"`) {
-			t.Fatalf("bad tier switch mail %q", m)
+		if !strings.Contains(m, "Subject: Switchboard Go switched tier: "+tier+"\r\n") || !strings.Contains(m, `model "a"`) {
+			t.Fatalf("bad tier switch mail for %s: %q", tier, m)
 		}
 	case <-time.After(300 * time.Millisecond):
 		if want {
-			t.Fatal("no tier switch mail")
+			t.Fatalf("no tier switch mail for %s", tier)
 		}
 	}
+}
+
+// newSwitchNotifier is a configured notifier whose clock is the fake clock now.
+func newSwitchNotifier(now *time.Time) *SMTPNotifier {
+	n := NewSMTPNotifier(SMTPConfig{Host: "h", Port: 25, From: "f@x", To: "t@x"})
+	n.now = func() time.Time { return *now }
+	return n
 }
 
 func TestTierSwitchMailOncePerEpisode(t *testing.T) {
 	mails := tierSwitchMails(t, nil)
 	s0, s1 := newStub(t, 429, quotaBody), newStub(t, 200, `x`)
 	app, now := failoverApp(t, s0, s1, nil, time.Hour)
-	app.sender = NewSMTPNotifier(SMTPConfig{Host: "h", Port: 25, From: "f@x", To: "t@x"})
+	app.sender = newSwitchNotifier(now)
 	if rec := chatReq(app, `{"model":"a"}`); rec.Code != 200 || s1.hits.Load() != 1 {
 		t.Fatalf("got %d, t1 hits=%d", rec.Code, s1.hits.Load())
 	}
-	expectTierSwitchMail(t, mails, true)
+	expectTierSwitchMail(t, mails, true, "t1")
 	if rec := chatReq(app, `{"model":"a"}`); rec.Code != 200 || s1.hits.Load() != 2 { // same episode
 		t.Fatalf("got %d, t1 hits=%d", rec.Code, s1.hits.Load())
 	}
-	expectTierSwitchMail(t, mails, false)
+	expectTierSwitchMail(t, mails, false, "")
 	*now = now.Add(2 * time.Hour)
 	s0.status.Store(200)
 	if rec := chatReq(app, `{"model":"a"}`); rec.Code != 200 || s1.hits.Load() != 2 { // tier 0 serves: episode over
 		t.Fatalf("got %d, t1 hits=%d", rec.Code, s1.hits.Load())
 	}
-	expectTierSwitchMail(t, mails, false)
+	expectTierSwitchMail(t, mails, false, "")
 	s0.status.Store(429)
 	if rec := chatReq(app, `{"model":"a"}`); rec.Code != 200 || s1.hits.Load() != 3 {
 		t.Fatalf("got %d, t1 hits=%d", rec.Code, s1.hits.Load())
 	}
-	expectTierSwitchMail(t, mails, true)
+	expectTierSwitchMail(t, mails, true, "t1")
 }
 
-func TestTierSwitchMailFailedSendRearms(t *testing.T) {
+func TestTierSwitchMailOncePerExtraTier(t *testing.T) {
+	mails := tierSwitchMails(t, nil)
+	s0, s1, s2 := newStub(t, 429, quotaBody), newStub(t, 200, `x`), newStub(t, 200, `y`)
+	app, now := failoverApp(t, s0, s1, s2, time.Hour)
+	app.sender = newSwitchNotifier(now)
+	chatReq(app, `{"model":"a"}`) // tier 0 exhausted, t1 serves
+	expectTierSwitchMail(t, mails, true, "t1")
+	s1.status.Store(503) // t1 fails (cooldown), t2 serves
+	if rec := chatReq(app, `{"model":"a"}`); rec.Code != 200 || rec.Body.String() != "y" {
+		t.Fatalf("got %d %q", rec.Code, rec.Body.String())
+	}
+	expectTierSwitchMail(t, mails, true, "t2")
+	for i := 0; i < 2; i++ { // t2 keeps serving: quiet
+		if rec := chatReq(app, `{"model":"a"}`); rec.Code != 200 || rec.Body.String() != "y" {
+			t.Fatalf("got %d %q", rec.Code, rec.Body.String())
+		}
+	}
+	expectTierSwitchMail(t, mails, false, "")
+	// t1 back, t2 fails: t1 was already warned in this episode
+	*now = now.Add(2 * time.Hour)
+	s1.status.Store(200)
+	s2.status.Store(503)
+	if rec := chatReq(app, `{"model":"a"}`); rec.Code != 200 || rec.Body.String() != "x" {
+		t.Fatalf("got %d %q", rec.Code, rec.Body.String())
+	}
+	expectTierSwitchMail(t, mails, false, "")
+}
+
+func TestTierSwitchMailNoWarningWhenTier0LacksModel(t *testing.T) {
+	mails := tierSwitchMails(t, nil)
+	s0, s1 := newStub(t, 404, `{"error":{"code":"model_not_found"}}`), newStub(t, 200, `x`)
+	app, now := failoverApp(t, s0, s1, nil, time.Hour)
+	app.sender = newSwitchNotifier(now)
+	for i := 1; i <= 2; i++ {
+		if rec := chatReq(app, `{"model":"a"}`); rec.Code != 200 || s1.hits.Load() != int32(i) {
+			t.Fatalf("got %d, t1 hits=%d", rec.Code, s1.hits.Load())
+		}
+	}
+	expectTierSwitchMail(t, mails, false, "")
+	app.sender.mu.Lock()
+	warned := len(app.sender.warned)
+	app.sender.mu.Unlock()
+	if warned != 0 {
+		t.Fatalf("model-not-found on tier 0 must not start an episode, warned=%d", warned)
+	}
+	// a plain 404 (dead route, not a missing model) still counts as a failure
+	s0.status.Store(404)
+	s0.body.Store(`{"error":"route gone"}`)
+	chatReq(app, `{"model":"a"}`)
+	expectTierSwitchMail(t, mails, true, "t1")
+}
+
+// waitSwitchState polls the notifier state under its lock until cond holds.
+func waitSwitchState(t *testing.T, n *SMTPNotifier, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		n.mu.Lock()
+		ok := cond()
+		n.mu.Unlock()
+		if ok {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("notifier state never settled")
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+func TestTierSwitchMailFailedSendBacksOff(t *testing.T) {
 	mails := tierSwitchMails(t, fmt.Errorf("smtp down"))
 	s0, s1 := newStub(t, 429, quotaBody), newStub(t, 200, `x`)
-	app, _ := failoverApp(t, s0, s1, nil, time.Hour)
-	app.sender = NewSMTPNotifier(SMTPConfig{Host: "h", Port: 25, From: "f@x", To: "t@x"})
+	app, now := failoverApp(t, s0, s1, nil, time.Hour)
+	n := newSwitchNotifier(now)
+	app.sender = n
 	chatReq(app, `{"model":"a"}`)
-	expectTierSwitchMail(t, mails, true)
-	time.Sleep(100 * time.Millisecond) // let the goroutine rearm after the failed send
+	expectTierSwitchMail(t, mails, true, "t1")
+	waitSwitchState(t, n, func() bool { return len(n.warned) == 0 && !n.retryAt.IsZero() }) // failed send rearmed and set the backoff
+	*now = now.Add(tierSwitchRetryAfter - time.Second)
 	chatReq(app, `{"model":"a"}`)
-	expectTierSwitchMail(t, mails, true)
+	expectTierSwitchMail(t, mails, false, "") // inside the backoff
+	// tier 0 serving does not clear the backoff
+	s0.status.Store(200)
+	chatReq(app, `{"model":"a"}`)
+	s0.status.Store(429)
+	chatReq(app, `{"model":"a"}`)
+	expectTierSwitchMail(t, mails, false, "")
+	*now = now.Add(2 * time.Second)
+	chatReq(app, `{"model":"a"}`)
+	expectTierSwitchMail(t, mails, true, "t1") // backoff over
+	waitSwitchState(t, n, func() bool { return len(n.warned) == 0 })
+	chatReq(app, `{"model":"a"}`)
+	expectTierSwitchMail(t, mails, false, "") // new failure, new backoff
+}
+
+func TestTierSwitchMailStaleFailureDoesNotRearmNewEpisode(t *testing.T) {
+	var calls atomic.Int32
+	var done atomic.Int32 // sends that returned
+	started, release := make(chan struct{}), make(chan struct{})
+	old := sendMail
+	sendMail = func(string, smtp.Auth, string, []string, []byte, bool, bool) error {
+		defer done.Add(1)
+		if calls.Add(1) == 1 { // the old episode's send: slow, then fails
+			close(started)
+			<-release
+			return fmt.Errorf("smtp down")
+		}
+		return nil
+	}
+	now := time.Unix(10000, 0).UTC()
+	n := newSwitchNotifier(&now)
+	t.Cleanup(func() {
+		for done.Load() < calls.Load() { // let every send goroutine end before restoring sendMail
+			time.Sleep(time.Millisecond)
+		}
+		sendMail = old
+	})
+	n.NotifyTierSwitch("t1", "a")
+	<-started
+	n.rearmTierSwitch()                                            // tier 0 served: old episode over
+	n.NotifyTierSwitch("t1", "a")                                  // new episode warns t1 again; this send succeeds
+	waitSwitchState(t, n, func() bool { return done.Load() == 1 }) // the new episode's send is done
+	close(release)
+	waitSwitchState(t, n, func() bool { return !n.retryAt.IsZero() }) // the old send failed
+	if _, ok := n.warned["t1"]; !ok {
+		t.Fatal("a stale failed send rearmed the newer episode")
+	}
+	now = now.Add(2 * tierSwitchRetryAfter)
+	n.NotifyTierSwitch("t1", "a") // still warned in this episode: nothing sent
+	time.Sleep(50 * time.Millisecond)
+	if calls.Load() != 2 {
+		t.Fatalf("unexpected extra send: %d calls", calls.Load())
+	}
 }
 
 func TestTierSwitchMailNotConfiguredSendsNothing(t *testing.T) {
@@ -2745,12 +2877,12 @@ func TestTierSwitchMailNotConfiguredSendsNothing(t *testing.T) {
 	if rec := chatReq(app, `{"model":"a"}`); rec.Code != 200 {
 		t.Fatalf("got %d", rec.Code)
 	}
-	expectTierSwitchMail(t, mails, false)
+	expectTierSwitchMail(t, mails, false, "")
 	app.sender.mu.Lock()
-	disarmed := app.sender.switchDisarmed
+	warned, retry := len(app.sender.warned), app.sender.retryAt
 	app.sender.mu.Unlock()
-	if disarmed {
-		t.Fatal("an unconfigured notifier must not disarm")
+	if warned != 0 || !retry.IsZero() {
+		t.Fatalf("an unconfigured notifier must keep its state: warned=%d retryAt=%v", warned, retry)
 	}
 }
 

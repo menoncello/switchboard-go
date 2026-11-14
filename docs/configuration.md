@@ -253,8 +253,12 @@ To try it by hand, run
 
 When tier 0 does not serve a request (cooldown, exhausted keys or a failure)
 and an extra tier does, one SMTP email names that tier and the model. It is
-sent once per episode: later requests the extra tiers serve stay quiet until
-tier 0 serves a request again. A failed send makes the next switch try again.
+sent once per extra tier per episode: later requests the same tier serves stay
+quiet, but a move to another extra tier warns again. An episode ends when tier 0
+serves a request. A 404 model-not-found from tier 0 does not count, since tier 0
+is healthy and only lacks the model. After a failed send the next attempt waits
+5 minutes. A restart starts a new episode, so it may warn again. With no tier 0
+key configured, tier 0 never serves and the episode never ends.
 
 | Field | Required | Description |
 | --- | --- | --- |

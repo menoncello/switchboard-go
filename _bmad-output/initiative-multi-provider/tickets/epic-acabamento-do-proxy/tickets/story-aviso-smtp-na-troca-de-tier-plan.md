@@ -81,3 +81,31 @@ Status: built
 **Verificação:** `go vet ./...` limpo; `go test -race -count=1 ./...` ok (3 vezes antes dos patches, 1 depois). Sem o rearme em `proxy.go`, `TestTierSwitchMailOncePerEpisode` falha.
 
 **Riscos residuais:** sem chave do tier 0 configurada, toda request vai a um extra e o aviso sai uma vez e nunca rearma; é o comportamento esperado de "uma vez por episódio". Não houve envio real por SMTP, só pelo stub de `sendMail`.
+
+## Code Review
+
+### 2026-11-14
+
+2 decision-needed (resolvidas → patch), 2 patch, 0 defer, 13 rejeitados.
+
+- [x] [Review][Decision] Sem backoff com SMTP fora do ar — resolvida (Eduardo): (b) intervalo mínimo entre tentativas depois de uma falha. Vira patch.
+- [x] [Review][Decision] Troca entre extras (t1 → t2) dentro do episódio não avisa — resolvida (Eduardo): (b) avisar também a mudança de tier extra dentro do episódio. Vira patch.
+- [x] [Review][Patch] Depois de um envio falho, esperar um intervalo mínimo antes de tentar de novo; o rearme por falha só vale se o episódio ainda é o mesmo [notify.go:NotifyTierSwitch]
+- [x] [Review][Patch] Avisar cada tier extra novo que atende dentro do episódio (uma vez por tier, para tráfego misto entre t1 e t2 não mandar e-mail a cada request) [notify.go:NotifyTierSwitch]
+- [x] [Review][Patch] 404 model_not_found no tier 0 saudável conta como troca: um modelo só mapeado num extra manda "switched tier" com o tier 0 de pé, e tráfego misto rearma e repete o e-mail [proxy.go:226]
+- [x] [Review][Patch] Docs sem as limitações: restart no meio do episódio manda outro aviso; sem chave no tier 0 o aviso sai uma vez e nunca rearma [docs/configuration.md:254]
+
+Rejeitados:
+- Rearme tardio de envio falho do episódio anterior: low, custa um e-mail a mais num cenário raro; o conserto pede contador de geração.
+- Mutex no caminho quente: low, mutex sem contenção custa nanossegundos.
+- Dois e-mails (troca + primeiro uso do tier pago): false, são alertas distintos e documentados; a escrita do campo no teste vem antes de qualquer goroutine.
+- E-mail sem o motivo da falha do tier 0 e sem aviso de volta: low, melhoria que pede parâmetro e e-mail novos.
+- Testes por tempo e lacunas (concorrência, stream): low, mesmo padrão dos testes do Telegram.
+- Inconsistências do plano (estimativa, `ticket: '6'`, Change Log vazio): false, convenção do store e registro histórico.
+- 4xx de cliente no tier 0 rearma: false, o tier 0 respondeu; o Telegram trata 4xx igual.
+- Requests concorrentes fora de ordem perto da recuperação: low, a request de fato trocou de tier; no máximo um e-mail a mais.
+- Dreno de 200 ms no cleanup do teste: low, as goroutines nascem antes de `chatReq` voltar.
+- Sleep de 100 ms no teste de envio falho: low, já rejeitado no build.
+- Claim "rearma quando o tier 0 volta a atender" também em 4xx: false, mesmo motivo do 4xx.
+- `alertApp` mascara a interação com o alerta de primeiro uso: low, os alertas são independentes.
+- Cooldown e falha do tier 0 também contam como troca: false, "esgotado" é o caso do verify, não o limite da intenção.

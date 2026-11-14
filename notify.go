@@ -12,15 +12,27 @@ import (
 	"time"
 )
 
-// SMTPNotifier sends the email alerts. The tier switch warning goes out once per
-// episode: it disarms when an extra tier serves a request and re-arms when tier 0 does.
+// tierSwitchRetryAfter is how long after a failed tier switch email the next attempt waits.
+// A var so tests can shrink it.
+var tierSwitchRetryAfter = 5 * time.Minute
+
+// SMTPNotifier sends the email alerts. The tier switch warning goes out once per extra
+// tier per episode; an episode ends when tier 0 serves a request. After a failed send
+// no new attempt happens until tierSwitchRetryAfter has passed.
 type SMTPNotifier struct {
-	cfg            SMTPConfig
-	mu             sync.Mutex
-	switchDisarmed bool
+	cfg SMTPConfig
+	now func() time.Time // injectable clock for the retry backoff
+	mu  sync.Mutex
+	// warned holds the tiers already warned about in the current episode, each with the
+	// token of the send that put it there, so a failed send only undoes its own entry.
+	warned   map[string]uint64
+	nextSend uint64
+	retryAt  time.Time // no tier switch send before this instant (zero: no backoff)
 }
 
-func NewSMTPNotifier(cfg SMTPConfig) *SMTPNotifier { return &SMTPNotifier{cfg: cfg} }
+func NewSMTPNotifier(cfg SMTPConfig) *SMTPNotifier {
+	return &SMTPNotifier{cfg: cfg, now: time.Now, warned: map[string]uint64{}}
+}
 func (n *SMTPNotifier) NotifySwitch(idx int, st StatusResponse) {
 	go n.send("Switchboard Go switched upstream key", fmt.Sprintf("Switched away from key %d\n\n%+v", idx, st))
 }
@@ -34,29 +46,42 @@ func (n *SMTPNotifier) configured() bool {
 	return n.cfg.Host != "" && n.cfg.To != "" && n.cfg.From != ""
 }
 
-// NotifyTierSwitch warns that an extra tier served a request tier 0 did not, once per episode.
+// NotifyTierSwitch warns that an extra tier served a request tier 0 did not, once per
+// extra tier per episode and not while a failed send is backing off.
 func (n *SMTPNotifier) NotifyTierSwitch(tier, model string) {
 	if !n.configured() {
 		return
 	}
 	n.mu.Lock()
-	first := !n.switchDisarmed
-	n.switchDisarmed = true
-	n.mu.Unlock()
-	if first {
-		go func() {
-			// a lost warning must not silence the rest of the episode: retry on the next switch
-			if !n.send("Switchboard Go switched tier: "+tier, fmt.Sprintf("Tier 0 did not serve a request; tier %q served it (model %q).", tier, truncateModel(model))) {
-				n.rearmTierSwitch()
-			}
-		}()
+	if _, done := n.warned[tier]; done || n.now().Before(n.retryAt) {
+		n.mu.Unlock()
+		return
 	}
+	n.nextSend++
+	token := n.nextSend
+	n.warned[tier] = token
+	n.mu.Unlock()
+	go func() {
+		if n.send("Switchboard Go switched tier: "+tier, fmt.Sprintf("Tier 0 did not serve a request; tier %q served it (model %q).", tier, truncateModel(model))) {
+			return
+		}
+		// A lost warning must not silence the episode, but SMTP is probably down: retry
+		// after the backoff, not on the next request. Only undo this send's own entry,
+		// so a slow failure from an old episode cannot rearm a newer one.
+		n.mu.Lock()
+		if n.warned[tier] == token {
+			delete(n.warned, tier)
+		}
+		n.retryAt = n.now().Add(tierSwitchRetryAfter)
+		n.mu.Unlock()
+	}()
 }
 
-// rearmTierSwitch ends the switch episode: tier 0 served a request.
+// rearmTierSwitch ends the switch episode: tier 0 served a request. It does not clear
+// the backoff after a failed send.
 func (n *SMTPNotifier) rearmTierSwitch() {
 	n.mu.Lock()
-	n.switchDisarmed = false
+	clear(n.warned)
 	n.mu.Unlock()
 }
 
