@@ -9,6 +9,7 @@ import (
 	"maps"
 	"math"
 	"net/http"
+	"regexp"
 	"slices"
 	"strconv"
 	"strings"
@@ -177,6 +178,7 @@ func (a *App) serveProxy(w http.ResponseWriter, r *http.Request, style APIStyle)
 	orig := r.Context()
 	var last heldResponse
 	defer last.release()
+	tier0ModelMissing := false // tier 0 is healthy but does not map the model: moving on is not a tier switch
 	if a.cooldowns.remaining(tier0CooldownKey) == 0 {
 		for attempts := 0; attempts < len(a.config.UpstreamAPIKeys); attempts++ {
 			idx, key, ok := a.keys.Current()
@@ -190,6 +192,7 @@ func (a *App) serveProxy(w http.ResponseWriter, r *http.Request, style APIStyle)
 					return model, "", -1, usageTokens{}, false
 				}
 				// Connection error or timeout: no cooldown, no key rotation, on to the extra tiers.
+				a.logger.Warn("upstream unreachable", "error", reqErr.Error())
 				last.err = reqErr
 				break
 			}
@@ -207,23 +210,36 @@ func (a *App) serveProxy(w http.ResponseWriter, r *http.Request, style APIStyle)
 			a.keys.MarkAvailable(idx)
 			if isTierFailure(resp, model != "") {
 				// The whole tier is unhealthy, not one key: rotating keys would not help.
-				a.cooldowns.set(tier0CooldownKey, a.config.RetryExhaustedAfter)
+				// A missing model says nothing about the tier's health: no cooldown.
+				if isModelNotFound(resp) {
+					tier0ModelMissing = true
+				} else {
+					a.cooldowns.set(tier0CooldownKey, a.config.RetryExhaustedAfter)
+				}
 				last.hold(resp, tier0Name, idx)
 				break
 			}
 			a.telegram.rearm()
+			a.sender.rearmTierSwitch()
 			return model, tier0Name, idx, copyResponse(w, resp), false
 		}
 	}
 	if name, tokens, ok := a.proxyTiers(orig, w, r, fields, model, style, needTools, &last); ok {
 		a.telegram.rearm()
+		if !tier0ModelMissing {
+			// tier 0 was skipped or failed, so this is a switch; a model tier 0 does not map is not
+			a.sender.NotifyTierSwitch(name, model)
+		}
 		return model, name, -1, tokens, false
 	}
 	if orig.Err() != nil {
 		w.WriteHeader(statusClientClosed)
 		return model, "", -1, usageTokens{}, false
 	}
-	a.telegram.notifyFailure(model)
+	// A model the client got wrong says nothing about the tiers: no alert.
+	if last.resp == nil || !isModelNotFound(last.resp) {
+		a.telegram.notifyFailure(model)
+	}
 	// No tier served it; alert once when every tier 0 key is exhausted.
 	if a.keys.ShouldNotifyAllExhausted() {
 		a.sender.NotifyAllExhausted(a.keys.Status())
@@ -232,7 +248,7 @@ func (a *App) serveProxy(w http.ResponseWriter, r *http.Request, style APIStyle)
 		return model, last.tier, last.key, copyResponse(w, last.resp), true
 	}
 	if last.err != nil {
-		http.Error(w, "upstream unreachable", http.StatusBadGateway) // fixed text: the error would leak the tier URL
+		writeAPIError(w, style, http.StatusBadGateway, "upstream_unreachable", "upstream unreachable") // fixed text: the error would leak the tier URL
 		return model, "", -1, usageTokens{}, false
 	}
 	// No eligible tier remains. Fail fast locally instead of hammering upstream,
@@ -303,7 +319,9 @@ func (a *App) tierCapped(t TierConfig) bool {
 }
 
 // withIncludeUsage returns fields with stream_options.include_usage set to true, keeping other
-// stream_options keys. fields is not changed.
+// stream_options keys. fields is not changed. Some models reject the field on /v1/responses (gpt-5.6-luna
+// answers 400, grok-4.7 accepts it) and that API already reports usage in response.completed, so the
+// caller applies this only on /chat/completions.
 func withIncludeUsage(fields map[string]json.RawMessage) map[string]json.RawMessage {
 	opts := map[string]json.RawMessage{}
 	_ = json.Unmarshal(fields["stream_options"], &opts) // not an object (or null): start empty
@@ -318,25 +336,22 @@ func withIncludeUsage(fields map[string]json.RawMessage) map[string]json.RawMess
 }
 
 // isTierFailure reports whether resp means the whole tier is unhealthy and the
-// next one should be tried: 401, 402, 429, any 5xx, and a 404 that is not about a
-// missing model (only when the request names a model). Like isKeyDead, it restores resp.Body.
+// next one should be tried: 401, 402, 429, any 5xx, and a 404 (only when the request
+// names a model). A 404 about a missing model moves on too, but see isModelNotFound:
+// the tier is healthy, so it gets no cooldown.
 func isTierFailure(resp *http.Response, hasModel bool) bool {
-	switch {
-	case resp.StatusCode == 401 || resp.StatusCode == 402 || resp.StatusCode == 429 || resp.StatusCode >= 500:
-		return true
-	case resp.StatusCode == 404 && hasModel:
-		low := strings.ToLower(string(peekBody(resp)))
-		if !strings.Contains(low, "model") {
-			return true
-		}
-		for _, p := range []string{"not found", "does not exist", "unknown", "invalid", "no such"} {
-			if strings.Contains(low, p) {
-				return false
-			}
-		}
-		return true
-	}
-	return false
+	return resp.StatusCode == 401 || resp.StatusCode == 402 || resp.StatusCode == 429 || resp.StatusCode >= 500 ||
+		(resp.StatusCode == 404 && hasModel)
+}
+
+// modelNotFoundRe matches the error code model_not_found or "model" right next to the
+// not-found phrase, so a dead-route 404 that merely mentions /v1/models does not count.
+var modelNotFoundRe = regexp.MustCompile(`model_not_found|\b(unknown|invalid|no such) model\b|\bmodel\b[^.]{0,80}(not found|does not exist)`)
+
+// isModelNotFound reports whether resp is a 404 saying the requested model does not
+// exist on this tier. It restores resp.Body.
+func isModelNotFound(resp *http.Response) bool {
+	return resp.StatusCode == 404 && modelNotFoundRe.Match(bytes.ToLower(peekBody(resp)))
 }
 
 // proxyTiers tries the eligible configured tiers (see tierModelID) in order after tier 0 failed or was
@@ -358,7 +373,7 @@ func (a *App) proxyTiers(ctx context.Context, w http.ResponseWriter, r *http.Req
 		tf := maps.Clone(fields) // per tier: the next tier must not see this tier's edits
 		tf["model"] = raw
 		var stream bool
-		if !t.Free && style == APIStyleOpenAI && json.Unmarshal(fields["stream"], &stream) == nil && stream {
+		if !t.Free && style == APIStyleOpenAI && strings.TrimPrefix(r.URL.Path, "/v1") == "/chat/completions" && json.Unmarshal(fields["stream"], &stream) == nil && stream {
 			tf = withIncludeUsage(tf)
 		}
 		tierBody, err := json.Marshal(tf)
@@ -371,14 +386,17 @@ func (a *App) proxyTiers(ctx context.Context, w http.ResponseWriter, r *http.Req
 			if ctx.Err() != nil {
 				return "", usageTokens{}, false
 			}
+			a.logger.Warn("tier upstream unreachable", "tier", t.Name, "error", err.Error())
 			continue
 		}
 		if isTierFailure(resp, true) {
-			cooldown := a.config.RetryExhaustedAfter
-			if t.Cooldown != nil {
-				cooldown = *t.Cooldown
+			if !isModelNotFound(resp) {
+				cooldown := a.config.RetryExhaustedAfter
+				if t.Cooldown != nil {
+					cooldown = *t.Cooldown
+				}
+				a.cooldowns.set(t.Name, cooldown)
 			}
-			a.cooldowns.set(t.Name, cooldown)
 			last.hold(resp, t.Name, -1)
 			continue
 		}
@@ -455,7 +473,7 @@ func (a *App) doUpstream(ctx context.Context, r *http.Request, body []byte, base
 
 func apiStyleForRequest(r *http.Request) APIStyle {
 	path := strings.TrimPrefix(r.URL.Path, "/v1")
-	if strings.HasPrefix(path, "/messages") || strings.HasPrefix(path, "/complete") {
+	if strings.HasPrefix(path, "/messages") || path == "/complete" {
 		return APIStyleAnthropic
 	}
 	for name := range r.Header {

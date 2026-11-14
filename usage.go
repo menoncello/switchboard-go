@@ -27,16 +27,23 @@ type usageFields struct {
 	PromptDetails struct {
 		CachedTokens int `json:"cached_tokens"`
 	} `json:"prompt_tokens_details"`
+	InputDetails struct { // OpenAI Responses API
+		CachedTokens int `json:"cached_tokens"`
+	} `json:"input_tokens_details"`
 }
 
-// parseUsage reads `usage` from the top of raw (OpenAI, Anthropic JSON, stream chunk) or from
-// `message.usage` (Anthropic message_start). Anything else, including malformed JSON, is not found.
+// parseUsage reads `usage` from the top of raw (OpenAI, Anthropic JSON, stream chunk, Responses API JSON body),
+// from `message.usage` (Anthropic message_start) or from `response.usage` (OpenAI Responses stream event
+// `response.completed`). Anything else, including malformed JSON, is not found.
 func parseUsage(raw []byte) usageTokens {
 	var v struct {
 		Usage   *usageFields `json:"usage"`
 		Message *struct {
 			Usage *usageFields `json:"usage"`
 		} `json:"message"`
+		Response *struct {
+			Usage *usageFields `json:"usage"`
+		} `json:"response"`
 	}
 	if json.Unmarshal(raw, &v) != nil {
 		return usageTokens{}
@@ -45,11 +52,15 @@ func parseUsage(raw []byte) usageTokens {
 	if u == nil && v.Message != nil {
 		u = v.Message.Usage
 	}
+	if u == nil && v.Response != nil {
+		u = v.Response.Usage
+	}
 	if u == nil {
 		return usageTokens{}
 	}
 	t := usageTokens{in: max(u.PromptTokens, u.InputTokens), out: max(u.CompletionTokens, u.OutputTokens),
-		cache: u.CacheCreation + u.CacheRead + u.PromptDetails.CachedTokens}
+		cache: u.CacheCreation + u.CacheRead +
+			u.PromptDetails.CachedTokens + u.InputDetails.CachedTokens}
 	t.found = t.in > 0 || t.out > 0
 	return t
 }

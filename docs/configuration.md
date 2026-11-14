@@ -92,6 +92,10 @@ state_file: "/var/lib/switchboard-go/state.json"
 usage_file: "/var/lib/switchboard-go/usage.json"
 timezone: "America/Sao_Paulo"
 
+# Usage lookup for /admin/keys and /status (see USAGE_URL and USAGE_CACHE_TTL).
+usage_url: "https://opencode.ai/zen/go/v1/usage"
+usage_cache_ttl: "60s"
+
 # USD per 1M tokens, by tier name and mapped model id (see "Usage history").
 prices:
   nome-do-tier:
@@ -201,11 +205,12 @@ the YAML file only, not from environment variables.
 
 A request goes to tier 0 first, then to the tiers in order. Each tier that fails
 is skipped (put in cooldown) and the next one is tried. A tier fails on `401`,
-`402`, any `5xx`, any `429`, and a `404` that is not about a missing model. A
-`404` fails the tier only when the request body has a non-empty top-level
-`model` and the `404` body does not say the model is missing (it contains "model"
-and one of "not found", "does not exist", "unknown", "invalid", "no such");
-otherwise it goes to the client. Any other status (`400`, a plain `403`, `2xx`,
+`402`, any `5xx`, any `429`, and a `404`. A `404` fails the tier only when the
+request body has a non-empty top-level `model`; otherwise it goes to the client.
+A `404` that says the model is missing (the body contains "model" and one of
+"not found", "does not exist", "unknown", "invalid", "no such") moves on to the
+next tier without putting this one in cooldown, and reaches the client only when
+no tier is left. Any other status (`400`, a plain `403`, `2xx`,
 `3xx`, other `4xx`) goes to the client without cooldown. Failover happens only
 before the response is copied: once a response starts (a stream included) there
 is no switch, even if it is cut.
@@ -246,6 +251,15 @@ To try it by hand, run
 `go run ./cmd/fakeupstream -addr 127.0.0.1:9999` and switch it with
 `POST /__mode/quota` or `POST /__mode/ok`.
 
+When tier 0 does not serve a request (cooldown, exhausted keys or a failure)
+and an extra tier does, one SMTP email names that tier and the model. It is
+sent once per extra tier per episode: later requests the same tier serves stay
+quiet, but a move to another extra tier warns again. An episode ends when tier 0
+serves a request. A 404 model-not-found from tier 0 does not count, since tier 0
+is healthy and only lacks the model. After a failed send the next attempt waits
+5 minutes. A restart starts a new episode, so it may warn again. With no tier 0
+key configured, tier 0 never serves and the episode never ends.
+
 | Field | Required | Description |
 | --- | --- | --- |
 | `name` | Yes | Unique tier name, used in error messages. |
@@ -272,9 +286,11 @@ when that is shorter than the other waiting times. `/status` shows `US$ spent / 
 tier, and the state `teto` with the seconds to midnight while the cap holds.
 
 The cost of a request is only known when it ends, so a request already in flight can take the
-tier past the cap. For OpenAI-style requests with `stream: true` sent to a paid tier, the proxy
+tier past the cap. For `/chat/completions` requests with `stream: true` sent to a paid tier, the proxy
 adds `stream_options.include_usage: true` (other `stream_options` keys are kept) so the provider
-reports usage; free tiers and Anthropic-style requests get the body unchanged. A 2xx response
+reports usage; free tiers, Anthropic-style requests and other OpenAI paths such as `/v1/responses`
+(which reports usage in its `response.completed` event, and some models reject the field there) and
+`/v1/completions` get the body unchanged. A 2xx response
 from a paid tier with no `usage` is charged the highest `input` or `output` price in the whole
 `prices` map, as USD (the cost of 1M tokens, a deliberate worst case), and counts in "Sem usage".
 Free tiers keep cost 0 in that case.
@@ -282,7 +298,7 @@ Free tiers keep cost 0 in that case.
 ### API styles
 
 A request is `anthropic` when its path starts with `/v1/messages` or
-`/v1/complete`, or it carries any `anthropic-*` header; otherwise it is `openai`.
+is exactly `/v1/complete`, or it carries any `anthropic-*` header; otherwise it is `openai`.
 `styles` lists the styles a tier speaks, and the proxy never translates between
 them: a tier that does not list the request's style is skipped. The credential
 follows the request's style, not the tier's: `x-api-key` (plus
@@ -355,8 +371,9 @@ Every proxied request writes one JSON line to stderr when its response ends
 - `usage_missing`: `true` when the response was `2xx` from a tier but carried no
   usable `usage` (absent, malformed, a compressed body with `Content-Encoding`,
   or a JSON body above 1 MiB). A `usage` of 0 input and 0 output counts as
-  missing. An OpenAI stream without `stream_options.include_usage` in the request
-  has no `usage` either, and the proxy does not alter the request to add it.
+  missing. A `/chat/completions` stream without `stream_options.include_usage`
+  in the request has no `usage` either (the proxy adds it only for paid tiers).
+  `/v1/responses` streams carry the usage in the `response.completed` event.
   Only `POST` requests are flagged (a `GET /v1/models` is not).
   The line then has no `tokens_*`.
   Responses that are not `2xx` and requests no tier answered (local `429`, `502`,
@@ -379,13 +396,13 @@ after validation.
 | `LISTEN_ADDR` | No | `:8080` | HTTP listen address. Use `127.0.0.1:8080` for local-only access. |
 | `UPSTREAM_BASE_URL` | No | `https://opencode.ai/zen/go/v1` | OpenCode Go upstream base URL for OpenAI-compatible and Anthropic Messages-compatible routes. |
 | `OPENCODE_GO_KEY_NAMES` | No | | Comma-separated labels for the keys, in the same order as `OPENCODE_GO_API_KEYS`. Shown by `/admin/keys` so a key is identified by name and index, never by value. Missing or shorter list means empty names. Max 40 characters each; line breaks are removed. |
-| `USAGE_URL` | No | `https://opencode.ai/zen/go/v1/usage` | OpenCode Go usage endpoint queried by `/admin/keys` (override for tests). |
-| `USAGE_CACHE_TTL` | No | `60s` | How long `/admin/keys` reuses each key's usage lookup, so a refreshing dashboard does not hammer the upstream. Go duration. `0` disables the cache. |
-| `MAX_REQUEST_BODY_BYTES` | No | `20971520` | Maximum request body size. Requests above this return `413`. |
+| `USAGE_URL` | No | `https://opencode.ai/zen/go/v1/usage` | OpenCode Go usage endpoint queried by `/admin/keys` and `/status` (override for tests). Maps to `usage_url`. |
+| `USAGE_CACHE_TTL` | No | `60s` | How long `/admin/keys` reuses each key's usage lookup, so a refreshing dashboard does not hammer the upstream. Go duration. `0` disables the cache. Maps to `usage_cache_ttl`; an invalid or negative value stops startup. |
+| `MAX_REQUEST_BODY_BYTES` | No | `20971520` | Maximum request body size. Requests above this return `413`. Maps to `limits.max_request_body_bytes`. A value that is not a whole number > 0 stops startup. |
 | `RETRY_EXHAUSTED_AFTER` | No | `5m` | Cooldown before an exhausted key is retried automatically. Go duration (`30s`, `5m`). `0` disables the cooldown (retry on the next request). Maps to `upstream.retry_exhausted_after`. |
 | `UPSTREAM_RESPONSE_HEADER_TIMEOUT` | No | `30s` | Max wait for response headers from the upstream API. Go duration (`30s`, `5m`). `0` disables it. Maps to `upstream.response_header_timeout`. |
 | `SMTP_HOST` | No | | SMTP host for notifications. |
-| `SMTP_PORT` | No | `25` | SMTP port. |
+| `SMTP_PORT` | No | `25` | SMTP port. Maps to `smtp.port`. A value that is not a whole number from 1 to 65535 stops startup. |
 | `SMTP_USERNAME` | No | | SMTP username. If empty, SMTP AUTH is skipped. |
 | `SMTP_PASSWORD` | No | | SMTP password. |
 | `SMTP_FROM` | No | | Sender email address. Required for notifications. |

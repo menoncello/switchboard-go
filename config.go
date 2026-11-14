@@ -201,7 +201,7 @@ type yamlConfig struct {
 		Password string `yaml:"password"`
 		From     string `yaml:"from"`
 		To       string `yaml:"to"`
-		Port     int    `yaml:"port"`
+		Port     *int   `yaml:"port"`
 		TLS      bool   `yaml:"tls"`
 		StartTLS bool   `yaml:"starttls"`
 	} `yaml:"smtp"`
@@ -210,14 +210,16 @@ type yamlConfig struct {
 		ChatID   string `yaml:"chat_id"`
 	} `yaml:"telegram"`
 	Limits struct {
-		MaxRequestBodyBytes int64 `yaml:"max_request_body_bytes"`
+		MaxRequestBodyBytes *int64 `yaml:"max_request_body_bytes"`
 	} `yaml:"limits"`
-	MinContext *int                            `yaml:"min_context"`
-	StateFile  string                          `yaml:"state_file"`
-	UsageFile  string                          `yaml:"usage_file"`
-	Timezone   string                          `yaml:"timezone"`
-	Prices     map[string]map[string]yamlPrice `yaml:"prices"`
-	Tiers      []yamlTier                      `yaml:"tiers"`
+	MinContext    *int                            `yaml:"min_context"`
+	StateFile     string                          `yaml:"state_file"`
+	UsageFile     string                          `yaml:"usage_file"`
+	UsageURL      string                          `yaml:"usage_url"`
+	UsageCacheTTL string                          `yaml:"usage_cache_ttl"`
+	Timezone      string                          `yaml:"timezone"`
+	Prices        map[string]map[string]yamlPrice `yaml:"prices"`
+	Tiers         []yamlTier                      `yaml:"tiers"`
 }
 
 type yamlTier struct {
@@ -316,12 +318,37 @@ func loadYAMLConfig(path string) (Config, error) {
 		}
 		headerTimeout = d
 	}
+	usageCacheTTL := time.Duration(-1)
+	if s := strings.TrimSpace(yc.UsageCacheTTL); s != "" {
+		d, err := time.ParseDuration(s)
+		if err != nil {
+			return Config{}, fmt.Errorf("parse usage_cache_ttl: %w", err)
+		}
+		if d < 0 {
+			return Config{}, fmt.Errorf("usage_cache_ttl must be >= 0")
+		}
+		usageCacheTTL = d
+	}
 	minContext := -1 // not present in file: keep the default
 	if yc.MinContext != nil {
 		if *yc.MinContext < 0 {
 			return Config{}, fmt.Errorf("min_context must be >= 0")
 		}
 		minContext = *yc.MinContext
+	}
+	var maxBody int64 // 0: not present in file, keep the default
+	if yc.Limits.MaxRequestBodyBytes != nil {
+		if *yc.Limits.MaxRequestBodyBytes <= 0 {
+			return Config{}, fmt.Errorf("limits.max_request_body_bytes must be a whole number > 0")
+		}
+		maxBody = *yc.Limits.MaxRequestBodyBytes
+	}
+	var smtpPort int // 0: not present in file, keep the default
+	if yc.SMTP.Port != nil {
+		if *yc.SMTP.Port < 1 || *yc.SMTP.Port > 65535 {
+			return Config{}, fmt.Errorf("smtp.port must be a whole number between 1 and 65535")
+		}
+		smtpPort = *yc.SMTP.Port
 	}
 	tiers, err := convertTiers(yc.Tiers)
 	if err != nil {
@@ -331,7 +358,7 @@ func loadYAMLConfig(path string) (Config, error) {
 	if err != nil {
 		return Config{}, err
 	}
-	return Config{Tiers: tiers, MinContext: minContext, StateFile: strings.TrimSpace(yc.StateFile), UsageFile: strings.TrimSpace(yc.UsageFile), Timezone: strings.TrimSpace(yc.Timezone), Prices: prices, ListenAddr: yc.Server.ListenAddr, UpstreamBaseURL: yc.Upstream.BaseURL, ProxyAPIKey: yc.Server.ProxyAPIKey, UpstreamAPIKeys: yc.Upstream.APIKeys, MaxRequestBodyBytes: yc.Limits.MaxRequestBodyBytes, RetryExhaustedAfter: retry, UpstreamResponseHeaderTimeout: headerTimeout, SMTP: SMTPConfig{Host: yc.SMTP.Host, Port: yc.SMTP.Port, Username: yc.SMTP.Username, Password: yc.SMTP.Password, From: yc.SMTP.From, To: yc.SMTP.To, TLS: yc.SMTP.TLS, StartTLS: yc.SMTP.StartTLS}, Telegram: TelegramConfig{BotToken: yc.Telegram.BotToken, ChatID: yc.Telegram.ChatID}}, nil
+	return Config{Tiers: tiers, MinContext: minContext, StateFile: strings.TrimSpace(yc.StateFile), UsageFile: strings.TrimSpace(yc.UsageFile), UsageURL: strings.TrimSpace(yc.UsageURL), UsageCacheTTL: usageCacheTTL, Timezone: strings.TrimSpace(yc.Timezone), Prices: prices, ListenAddr: yc.Server.ListenAddr, UpstreamBaseURL: yc.Upstream.BaseURL, ProxyAPIKey: yc.Server.ProxyAPIKey, UpstreamAPIKeys: yc.Upstream.APIKeys, MaxRequestBodyBytes: maxBody, RetryExhaustedAfter: retry, UpstreamResponseHeaderTimeout: headerTimeout, SMTP: SMTPConfig{Host: yc.SMTP.Host, Port: smtpPort, Username: yc.SMTP.Username, Password: yc.SMTP.Password, From: yc.SMTP.From, To: yc.SMTP.To, TLS: yc.SMTP.TLS, StartTLS: yc.SMTP.StartTLS}, Telegram: TelegramConfig{BotToken: yc.Telegram.BotToken, ChatID: yc.Telegram.ChatID}}, nil
 }
 
 func mergeConfig(dst *Config, src Config) {
@@ -361,6 +388,12 @@ func mergeConfig(dst *Config, src Config) {
 	}
 	if src.Timezone != "" {
 		dst.Timezone = src.Timezone
+	}
+	if src.UsageURL != "" {
+		dst.UsageURL = src.UsageURL
+	}
+	if src.UsageCacheTTL >= 0 {
+		dst.UsageCacheTTL = src.UsageCacheTTL
 	}
 	if len(src.Prices) > 0 {
 		dst.Prices = src.Prices
@@ -426,6 +459,8 @@ func applyEnvOverrides(cfg *Config) {
 	if v := strings.TrimSpace(os.Getenv("MAX_REQUEST_BODY_BYTES")); v != "" {
 		if n, err := strconv.ParseInt(v, 10, 64); err == nil && n > 0 {
 			cfg.MaxRequestBodyBytes = n
+		} else {
+			cfg.MaxRequestBodyBytes = -1 // validateConfig reports the typo
 		}
 	}
 	if v := strings.TrimSpace(os.Getenv("RETRY_EXHAUSTED_AFTER")); v != "" {
@@ -462,9 +497,11 @@ func applyEnvOverrides(cfg *Config) {
 	if v := os.Getenv("SMTP_HOST"); v != "" {
 		cfg.SMTP.Host = v
 	}
-	if v := os.Getenv("SMTP_PORT"); v != "" {
-		if n, err := strconv.Atoi(v); err == nil {
+	if v := strings.TrimSpace(os.Getenv("SMTP_PORT")); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n >= 1 && n <= 65535 {
 			cfg.SMTP.Port = n
+		} else {
+			cfg.SMTP.Port = -1 // validateConfig reports the typo
 		}
 	}
 	if v := os.Getenv("SMTP_USERNAME"); v != "" {
@@ -505,7 +542,7 @@ func validateConfig(cfg Config) error {
 		return errors.New("UPSTREAM_BASE_URL is required")
 	}
 	if cfg.MaxRequestBodyBytes <= 0 {
-		return errors.New("MAX_REQUEST_BODY_BYTES must be > 0")
+		return errors.New("MAX_REQUEST_BODY_BYTES must be a whole number > 0")
 	}
 	if cfg.RetryExhaustedAfter < 0 {
 		return errors.New("RETRY_EXHAUSTED_AFTER must be >= 0")
@@ -517,7 +554,11 @@ func validateConfig(cfg Config) error {
 		return errors.New("UPSTREAM_RESPONSE_HEADER_TIMEOUT must be >= 0")
 	}
 	if cfg.UsageCacheTTL < 0 {
-		return errors.New("USAGE_CACHE_TTL must be >= 0")
+		return errors.New("USAGE_CACHE_TTL (usage_cache_ttl) must be >= 0")
+	}
+	// 0 is only "not set" in a hand-built Config; loadConfig starts from port 25.
+	if cfg.SMTP.Port < 0 || cfg.SMTP.Port > 65535 {
+		return errors.New("SMTP_PORT must be a whole number between 1 and 65535")
 	}
 	if cfg.Timezone != "" {
 		_, err := time.LoadLocation(cfg.Timezone)

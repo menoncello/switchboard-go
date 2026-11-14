@@ -112,7 +112,7 @@ Example response:
   `index` identify the key.
 - `state`, `current`, `eligible`, `last_429_time` and `retry_after_seconds` are
   inferred exactly as in `/admin/status` (see above).
-- `usage` is fetched from the upstream by this proxy: `GET <USAGE_URL>` (default
+- `usage` is fetched from the upstream by this proxy: `GET <usage_url>` (YAML `usage_url` or env `USAGE_URL`, default
   `https://opencode.ai/zen/go/v1/usage`) with `Authorization: Bearer <that key>`.
   The upstream answers `{"usage": {"rolling"|"weekly"|"monthly": {"percent",
   "resetsAt"}}}`; the proxy renames `resetsAt` to `resets_at` and passes its
@@ -122,7 +122,7 @@ Example response:
   followed. If a key's lookup fails, `usage` is absent and `usage_error` holds
   only the HTTP status (`HTTP 401`) or the error type (`timeout`,
   `invalid_response`, `no_windows`, a Go type name).
-- Results (including errors) are cached in memory per key for `USAGE_CACHE_TTL`
+- Results (including errors) are cached in memory per key for `usage_cache_ttl` / `USAGE_CACHE_TTL`
   (default 60 seconds); `usage_cached_seconds` reports that TTL. State fields are
   always live.
 

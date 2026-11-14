@@ -2145,12 +2145,12 @@ func TestFailoverExtraTierFailureStatusesGoToNextTier(t *testing.T) {
 	}
 }
 
-func TestFailover400And404MissingModelPassThroughWithoutCooldown(t *testing.T) {
+func TestFailover400And403PassThroughWithoutCooldown(t *testing.T) {
 	for _, c := range []struct {
 		status int
 		body   string
 	}{
-		{400, `bad request`}, {403, `forbidden`}, {404, `{"error":{"message":"The model gpt-x does not exist"}}`}, {404, `Model not found`},
+		{400, `bad request`}, {403, `forbidden`},
 	} {
 		s0, s1 := newStub(t, c.status, c.body), newStub(t, 200, `{"from":"t1"}`)
 		app, _ := failoverApp(t, s0, s1, nil, time.Hour)
@@ -2161,18 +2161,69 @@ func TestFailover400And404MissingModelPassThroughWithoutCooldown(t *testing.T) {
 			}
 		}
 	}
-	// a 404 from an extra tier that says the model is missing also goes to the client
+}
+
+func TestFailover404MissingModelGoesToNextTierWithoutCooldown(t *testing.T) {
+	for _, body := range []string{`{"error":{"message":"The model gpt-x does not exist"}}`, `Model not found`} {
+		s0, s1 := newStub(t, 404, body), newStub(t, 200, `{"from":"t1"}`)
+		app, _ := failoverApp(t, s0, s1, nil, time.Hour)
+		for i := 1; i <= 2; i++ {
+			rec := chatReq(app, `{"model":"a"}`)
+			if rec.Code != 200 || rec.Body.String() != `{"from":"t1"}` || s0.hits.Load() != int32(i) || s1.hits.Load() != int32(i) {
+				t.Fatalf("%q req %d: got %d %q hits=%d/%d", body, i, rec.Code, rec.Body.String(), s0.hits.Load(), s1.hits.Load())
+			}
+		}
+		if app.cooldowns.remaining(tier0CooldownKey) != 0 {
+			t.Fatalf("%q: tier 0 in cooldown after a model 404", body)
+		}
+	}
+	// the same from an extra tier: the next one answers and the tier stays out of cooldown
 	s0, s1, s2 := newStub(t, 500, `x`), newStub(t, 404, `model not found`), newStub(t, 200, `{"from":"t2"}`)
 	app, _ := failoverApp(t, s0, s1, s2, time.Hour)
 	for i := 1; i <= 2; i++ {
 		rec := chatReq(app, `{"model":"a"}`)
-		if i == 1 && (rec.Code != 404 || s2.hits.Load() != 0) {
-			t.Fatalf("tier 404: %d hits=%d", rec.Code, s2.hits.Load())
+		if rec.Code != 200 || rec.Body.String() != `{"from":"t2"}` || s1.hits.Load() != int32(i) || s2.hits.Load() != int32(i) {
+			t.Fatalf("tier 404 req %d: %d %q hits=%d/%d", i, rec.Code, rec.Body.String(), s1.hits.Load(), s2.hits.Load())
 		}
 	}
-	if s1.hits.Load() != 2 {
-		t.Fatalf("tier 1 was put in cooldown by a model 404: %d hits", s1.hits.Load())
+	// with no tier left, the last model 404 reaches the client
+	s0, s1 = newStub(t, 404, `model not found`), newStub(t, 404, `model not found`)
+	app, _ = failoverApp(t, s0, s1, nil, time.Hour)
+	if rec := chatReq(app, `{"model":"a"}`); rec.Code != 404 || rec.Body.String() != `model not found` {
+		t.Fatalf("last tier: %d %q", rec.Code, rec.Body.String())
 	}
+	// a body past the 4096-byte peek limit still reaches the client intact
+	big := `{"error":"model not found"}` + strings.Repeat(" ", 10000)
+	s0, s1 = newStub(t, 404, big), newStub(t, 404, big)
+	app, _ = failoverApp(t, s0, s1, nil, time.Hour)
+	if rec := chatReq(app, `{"model":"a"}`); rec.Code != 404 || rec.Body.String() != big {
+		t.Fatalf("last tier, large body: %d len=%d", rec.Code, rec.Body.Len())
+	}
+}
+
+func TestFailover404DeadRouteMentioningModelsGetsCooldown(t *testing.T) {
+	s0, s1 := newStub(t, 404, `404 page not found: /v1/models`), newStub(t, 200, `{"from":"t1"}`)
+	app, _ := failoverApp(t, s0, s1, nil, time.Hour)
+	for i := 1; i <= 2; i++ {
+		rec := chatReq(app, `{"model":"a"}`)
+		if rec.Code != 200 || rec.Body.String() != `{"from":"t1"}` || s0.hits.Load() != 1 || s1.hits.Load() != int32(i) {
+			t.Fatalf("req %d: %d %q hits=%d/%d", i, rec.Code, rec.Body.String(), s0.hits.Load(), s1.hits.Load())
+		}
+	}
+	if app.cooldowns.remaining(tier0CooldownKey) == 0 {
+		t.Fatal("tier 0 not in cooldown after a dead-route 404")
+	}
+}
+
+func TestTelegramModelNotFoundSendsNothing(t *testing.T) {
+	calls := fakeTelegram(t, 200)
+	s0, s1 := newStub(t, 404, `model not found`), newStub(t, 404, `model not found`)
+	app, _ := failoverApp(t, s0, s1, nil, time.Hour)
+	app.telegram = NewTelegramNotifier(TelegramConfig{BotToken: "TOK", ChatID: "42"})
+	if rec := chatReq(app, `{"model":"typo"}`); rec.Code != 404 || rec.Body.String() != `model not found` {
+		t.Fatalf("got %d %q", rec.Code, rec.Body.String())
+	}
+	expectTelegram(t, calls, false)
 }
 
 func TestFailover404WithoutRequestModelPassesThrough(t *testing.T) {
@@ -2349,9 +2400,21 @@ func TestFailoverTier0UnreachableWithoutExtraTiersHidesTierURL(t *testing.T) {
 	s0, s1 := newStub(t, 200, `x`), newStub(t, 200, `x`)
 	s0.srv.Close()
 	app, _ := failoverApp(t, s0, s1, nil, time.Hour)
+	var logs bytes.Buffer
+	app.logger = slog.New(slog.NewJSONHandler(&logs, nil))
 	rec := tierReq(app, http.MethodGet, "/v1/models", "", nil)
-	if rec.Code != 502 || rec.Body.String() != "upstream unreachable\n" || strings.Contains(rec.Body.String(), s0.srv.URL) {
+	var body struct {
+		Error struct{ Code, Message string }
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil || rec.Code != 502 || body.Error.Code != "upstream_unreachable" || body.Error.Message != "upstream unreachable" || strings.Contains(rec.Body.String(), s0.srv.URL) {
 		t.Fatalf("got %d %q", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(logs.String(), s0.srv.URL) {
+		t.Fatalf("log lacks the upstream detail: %s", logs.String())
+	}
+	rec = tierReq(app, http.MethodGet, "/v1/models", "", map[string]string{"anthropic-version": "2023-06-01"})
+	if rec.Code != 502 || rec.Header().Get("Content-Type") != "application/json" || !strings.Contains(rec.Body.String(), `"type":"error"`) || !strings.Contains(rec.Body.String(), `"type":"api_error"`) || strings.Contains(rec.Body.String(), s0.srv.URL) {
+		t.Fatalf("anthropic style: %d %q", rec.Code, rec.Body.String())
 	}
 }
 
@@ -2392,7 +2455,7 @@ func TestFailoverConnectionErrorExtraTierAndAllUnreachable(t *testing.T) {
 	app, _ = failoverApp(t, d0, d1, nil, time.Hour)
 	lines := captureLog(app)
 	rec = chatReq(app, `{"model":"a"}`)
-	if l := lines(t); rec.Code != 502 || l[0]["tier"] != "" || l[0]["status"] != float64(502) ||
+	if l := lines(t); len(l) != 3 || l[0]["msg"] != "upstream unreachable" || !strings.Contains(fmt.Sprint(l[0]["error"]), d0.srv.URL) || l[1]["msg"] != "tier upstream unreachable" || l[1]["tier"] != "t1" || rec.Code != 502 || l[len(l)-1]["tier"] != "" || l[len(l)-1]["status"] != float64(502) ||
 		app.cooldowns.remaining(tier0CooldownKey) != 0 || app.cooldowns.remaining("t1") != 0 {
 		t.Fatalf("all unreachable: %d %v", rec.Code, l)
 	}
@@ -2589,6 +2652,237 @@ func TestFailoverAllKeysExhaustedAndTiersFailStillAlerts(t *testing.T) {
 		case <-deadline:
 			t.Fatal("no all-exhausted alert")
 		}
+	}
+}
+
+// tierSwitchMails replaces sendMail with a fake (failing with sendErr) and returns a channel
+// with only the tier switch warnings, since the key alerts also go through sendMail.
+func tierSwitchMails(t *testing.T, sendErr error) chan string {
+	t.Helper()
+	mails := make(chan string, 8)
+	calls := make(chan struct{}, 32)
+	old := sendMail
+	sendMail = func(addr string, auth smtp.Auth, from string, to []string, msg []byte, useTLS, useStartTLS bool) error {
+		if strings.Contains(string(msg), "switched tier") {
+			mails <- string(msg)
+		}
+		calls <- struct{}{}
+		return sendErr
+	}
+	t.Cleanup(func() {
+		// wait for the alert goroutines to finish before restoring sendMail, so they never race with it
+		for {
+			select {
+			case <-calls:
+			case <-time.After(200 * time.Millisecond):
+				sendMail = old
+				return
+			}
+		}
+	})
+	return mails
+}
+
+// expectTierSwitchMail checks whether a tier switch mail for tier arrives (tier is ignored when want is false).
+func expectTierSwitchMail(t *testing.T, mails chan string, want bool, tier string) {
+	t.Helper()
+	select {
+	case m := <-mails:
+		if !want {
+			t.Fatalf("unexpected tier switch mail %q", m)
+		}
+		if !strings.Contains(m, "Subject: Switchboard Go switched tier: "+tier+"\r\n") || !strings.Contains(m, `model "a"`) {
+			t.Fatalf("bad tier switch mail for %s: %q", tier, m)
+		}
+	case <-time.After(300 * time.Millisecond):
+		if want {
+			t.Fatalf("no tier switch mail for %s", tier)
+		}
+	}
+}
+
+// newSwitchNotifier is a configured notifier whose clock is the fake clock now.
+func newSwitchNotifier(now *time.Time) *SMTPNotifier {
+	n := NewSMTPNotifier(SMTPConfig{Host: "h", Port: 25, From: "f@x", To: "t@x"})
+	n.now = func() time.Time { return *now }
+	return n
+}
+
+func TestTierSwitchMailOncePerEpisode(t *testing.T) {
+	mails := tierSwitchMails(t, nil)
+	s0, s1 := newStub(t, 429, quotaBody), newStub(t, 200, `x`)
+	app, now := failoverApp(t, s0, s1, nil, time.Hour)
+	app.sender = newSwitchNotifier(now)
+	if rec := chatReq(app, `{"model":"a"}`); rec.Code != 200 || s1.hits.Load() != 1 {
+		t.Fatalf("got %d, t1 hits=%d", rec.Code, s1.hits.Load())
+	}
+	expectTierSwitchMail(t, mails, true, "t1")
+	if rec := chatReq(app, `{"model":"a"}`); rec.Code != 200 || s1.hits.Load() != 2 { // same episode
+		t.Fatalf("got %d, t1 hits=%d", rec.Code, s1.hits.Load())
+	}
+	expectTierSwitchMail(t, mails, false, "")
+	*now = now.Add(2 * time.Hour)
+	s0.status.Store(200)
+	if rec := chatReq(app, `{"model":"a"}`); rec.Code != 200 || s1.hits.Load() != 2 { // tier 0 serves: episode over
+		t.Fatalf("got %d, t1 hits=%d", rec.Code, s1.hits.Load())
+	}
+	expectTierSwitchMail(t, mails, false, "")
+	s0.status.Store(429)
+	if rec := chatReq(app, `{"model":"a"}`); rec.Code != 200 || s1.hits.Load() != 3 {
+		t.Fatalf("got %d, t1 hits=%d", rec.Code, s1.hits.Load())
+	}
+	expectTierSwitchMail(t, mails, true, "t1")
+}
+
+func TestTierSwitchMailOncePerExtraTier(t *testing.T) {
+	mails := tierSwitchMails(t, nil)
+	s0, s1, s2 := newStub(t, 429, quotaBody), newStub(t, 200, `x`), newStub(t, 200, `y`)
+	app, now := failoverApp(t, s0, s1, s2, time.Hour)
+	app.sender = newSwitchNotifier(now)
+	chatReq(app, `{"model":"a"}`) // tier 0 exhausted, t1 serves
+	expectTierSwitchMail(t, mails, true, "t1")
+	s1.status.Store(503) // t1 fails (cooldown), t2 serves
+	if rec := chatReq(app, `{"model":"a"}`); rec.Code != 200 || rec.Body.String() != "y" {
+		t.Fatalf("got %d %q", rec.Code, rec.Body.String())
+	}
+	expectTierSwitchMail(t, mails, true, "t2")
+	for i := 0; i < 2; i++ { // t2 keeps serving: quiet
+		if rec := chatReq(app, `{"model":"a"}`); rec.Code != 200 || rec.Body.String() != "y" {
+			t.Fatalf("got %d %q", rec.Code, rec.Body.String())
+		}
+	}
+	expectTierSwitchMail(t, mails, false, "")
+	// t1 back, t2 fails: t1 was already warned in this episode
+	*now = now.Add(2 * time.Hour)
+	s1.status.Store(200)
+	s2.status.Store(503)
+	if rec := chatReq(app, `{"model":"a"}`); rec.Code != 200 || rec.Body.String() != "x" {
+		t.Fatalf("got %d %q", rec.Code, rec.Body.String())
+	}
+	expectTierSwitchMail(t, mails, false, "")
+}
+
+func TestTierSwitchMailNoWarningWhenTier0LacksModel(t *testing.T) {
+	mails := tierSwitchMails(t, nil)
+	s0, s1 := newStub(t, 404, `{"error":{"code":"model_not_found"}}`), newStub(t, 200, `x`)
+	app, now := failoverApp(t, s0, s1, nil, time.Hour)
+	app.sender = newSwitchNotifier(now)
+	for i := 1; i <= 2; i++ {
+		if rec := chatReq(app, `{"model":"a"}`); rec.Code != 200 || s1.hits.Load() != int32(i) {
+			t.Fatalf("got %d, t1 hits=%d", rec.Code, s1.hits.Load())
+		}
+	}
+	expectTierSwitchMail(t, mails, false, "")
+	app.sender.mu.Lock()
+	warned := len(app.sender.warned)
+	app.sender.mu.Unlock()
+	if warned != 0 {
+		t.Fatalf("model-not-found on tier 0 must not start an episode, warned=%d", warned)
+	}
+	// a plain 404 (dead route, not a missing model) still counts as a failure
+	s0.status.Store(404)
+	s0.body.Store(`{"error":"route gone"}`)
+	chatReq(app, `{"model":"a"}`)
+	expectTierSwitchMail(t, mails, true, "t1")
+}
+
+// waitSwitchState polls the notifier state under its lock until cond holds.
+func waitSwitchState(t *testing.T, n *SMTPNotifier, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		n.mu.Lock()
+		ok := cond()
+		n.mu.Unlock()
+		if ok {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("notifier state never settled")
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+func TestTierSwitchMailFailedSendBacksOff(t *testing.T) {
+	mails := tierSwitchMails(t, fmt.Errorf("smtp down"))
+	s0, s1 := newStub(t, 429, quotaBody), newStub(t, 200, `x`)
+	app, now := failoverApp(t, s0, s1, nil, time.Hour)
+	n := newSwitchNotifier(now)
+	app.sender = n
+	chatReq(app, `{"model":"a"}`)
+	expectTierSwitchMail(t, mails, true, "t1")
+	waitSwitchState(t, n, func() bool { return len(n.warned) == 0 && !n.retryAt.IsZero() }) // failed send rearmed and set the backoff
+	*now = now.Add(tierSwitchRetryAfter - time.Second)
+	chatReq(app, `{"model":"a"}`)
+	expectTierSwitchMail(t, mails, false, "") // inside the backoff
+	// tier 0 serving does not clear the backoff
+	s0.status.Store(200)
+	chatReq(app, `{"model":"a"}`)
+	s0.status.Store(429)
+	chatReq(app, `{"model":"a"}`)
+	expectTierSwitchMail(t, mails, false, "")
+	*now = now.Add(2 * time.Second)
+	chatReq(app, `{"model":"a"}`)
+	expectTierSwitchMail(t, mails, true, "t1") // backoff over
+	waitSwitchState(t, n, func() bool { return len(n.warned) == 0 })
+	chatReq(app, `{"model":"a"}`)
+	expectTierSwitchMail(t, mails, false, "") // new failure, new backoff
+}
+
+func TestTierSwitchMailStaleFailureDoesNotRearmNewEpisode(t *testing.T) {
+	var calls atomic.Int32
+	var done atomic.Int32 // sends that returned
+	started, release := make(chan struct{}), make(chan struct{})
+	old := sendMail
+	sendMail = func(string, smtp.Auth, string, []string, []byte, bool, bool) error {
+		defer done.Add(1)
+		if calls.Add(1) == 1 { // the old episode's send: slow, then fails
+			close(started)
+			<-release
+			return fmt.Errorf("smtp down")
+		}
+		return nil
+	}
+	now := time.Unix(10000, 0).UTC()
+	n := newSwitchNotifier(&now)
+	t.Cleanup(func() {
+		for done.Load() < calls.Load() { // let every send goroutine end before restoring sendMail
+			time.Sleep(time.Millisecond)
+		}
+		sendMail = old
+	})
+	n.NotifyTierSwitch("t1", "a")
+	<-started
+	n.rearmTierSwitch()                                            // tier 0 served: old episode over
+	n.NotifyTierSwitch("t1", "a")                                  // new episode warns t1 again; this send succeeds
+	waitSwitchState(t, n, func() bool { return done.Load() == 1 }) // the new episode's send is done
+	close(release)
+	waitSwitchState(t, n, func() bool { return !n.retryAt.IsZero() }) // the old send failed
+	if _, ok := n.warned["t1"]; !ok {
+		t.Fatal("a stale failed send rearmed the newer episode")
+	}
+	now = now.Add(2 * tierSwitchRetryAfter)
+	n.NotifyTierSwitch("t1", "a") // still warned in this episode: nothing sent
+	time.Sleep(50 * time.Millisecond)
+	if calls.Load() != 2 {
+		t.Fatalf("unexpected extra send: %d calls", calls.Load())
+	}
+}
+
+func TestTierSwitchMailNotConfiguredSendsNothing(t *testing.T) {
+	mails := tierSwitchMails(t, nil)
+	s0, s1 := newStub(t, 429, quotaBody), newStub(t, 200, `x`)
+	app, _ := failoverApp(t, s0, s1, nil, time.Hour)
+	if rec := chatReq(app, `{"model":"a"}`); rec.Code != 200 {
+		t.Fatalf("got %d", rec.Code)
+	}
+	expectTierSwitchMail(t, mails, false, "")
+	app.sender.mu.Lock()
+	warned, retry := len(app.sender.warned), app.sender.retryAt
+	app.sender.mu.Unlock()
+	if warned != 0 || !retry.IsZero() {
+		t.Fatalf("an unconfigured notifier must keep its state: warned=%d retryAt=%v", warned, retry)
 	}
 }
 
@@ -3411,5 +3705,203 @@ func TestRequestLogStreamCutKeepsPartialUsage(t *testing.T) {
 	got := lines(t)
 	if len(got) != 1 || got[0]["tokens_in"] != float64(12) || got[0]["tokens_out"] != float64(1) || got[0]["tokens_cache_in"] != float64(40) || got[0]["usage_partial"] != true {
 		t.Fatalf("log: %v", got)
+	}
+}
+
+func TestAPIStyleForRequest(t *testing.T) {
+	cases := []struct {
+		path string
+		hdr  string
+		want APIStyle
+	}{
+		{"/v1/completions", "", APIStyleOpenAI},
+		{"/v1/chat/completions", "", APIStyleOpenAI},
+		{"/v1/complete", "", APIStyleAnthropic},
+		{"/v1/complete/", "", APIStyleOpenAI},
+		{"/v1/completeX", "", APIStyleOpenAI},
+		{"/v1/messages", "", APIStyleAnthropic},
+		{"/v1/completions", "anthropic-version", APIStyleAnthropic},
+	}
+	for _, c := range cases {
+		req := httptest.NewRequest(http.MethodPost, c.path, nil)
+		if c.hdr != "" {
+			req.Header.Set(c.hdr, "2023-06-01")
+		}
+		if got := apiStyleForRequest(req); got != c.want {
+			t.Errorf("%s hdr=%q: got %v, want %v", c.path, c.hdr, got, c.want)
+		}
+	}
+}
+
+func TestV1CompletionsServedByOpenAIOnlyTier(t *testing.T) {
+	s0 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusTooManyRequests)
+		_, _ = w.Write([]byte(quotaBody))
+	}))
+	defer s0.Close()
+	var hits atomic.Int32
+	var mu sync.Mutex
+	var auth, apiKey string
+	s1 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
+		mu.Lock()
+		auth, apiKey = r.Header.Get("Authorization"), r.Header.Get("x-api-key")
+		mu.Unlock()
+		_, _ = w.Write([]byte(`{}`))
+	}))
+	defer s1.Close()
+	app := newApp(Config{ProxyAPIKey: "p", UpstreamAPIKeys: []string{"k"}, UpstreamBaseURL: s0.URL, MaxRequestBodyBytes: 1 << 20, RetryExhaustedAfter: time.Hour, Tiers: []TierConfig{
+		{Name: "t1", BaseURL: s1.URL, APIKey: "tk", Free: true, Styles: []APIStyle{APIStyleOpenAI}, Models: []TierModel{{Name: "m"}}},
+	}})
+	if rec := tierReq(app, http.MethodPost, "/v1/completions", `{"model":"m","prompt":"hi"}`, nil); rec.Code != http.StatusOK {
+		t.Fatalf("code %d body %s", rec.Code, rec.Body.String())
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if hits.Load() != 1 || auth != "Bearer tk" || apiKey != "" {
+		t.Fatalf("hits=%d auth=%q x-api-key=%q", hits.Load(), auth, apiKey)
+	}
+}
+
+// clearConfigEnv blanks the env vars these tests care about; an empty value is
+// treated as unset by applyEnvOverrides.
+func clearConfigEnv(t *testing.T) {
+	t.Helper()
+	for _, n := range []string{"SMTP_PORT", "MAX_REQUEST_BODY_BYTES", "USAGE_URL", "USAGE_CACHE_TTL"} {
+		t.Setenv(n, "")
+	}
+}
+
+func TestLoadConfigRejectsInvalidBodyLimitAndSMTPPort(t *testing.T) {
+	const bodyEnv, bodyKey, portEnv, portKey = "MAX_REQUEST_BODY_BYTES", "limits.max_request_body_bytes", "SMTP_PORT", "smtp.port"
+	cases := []struct{ name, yaml, env, val, want, notWant string }{
+		{"body env not a number", "", bodyEnv, "abc", bodyEnv, bodyKey},
+		{"body env zero", "", bodyEnv, "0", bodyEnv, bodyKey},
+		{"body env negative", "", bodyEnv, "-5", bodyEnv, bodyKey},
+		{"body yaml negative", "limits: {max_request_body_bytes: -5}\n", "", "", bodyKey, bodyEnv},
+		{"body yaml zero", "limits: {max_request_body_bytes: 0}\n", "", "", bodyKey, bodyEnv},
+		{"body yaml negative with valid env", "limits: {max_request_body_bytes: -5}\n", bodyEnv, "1024", bodyKey, bodyEnv},
+		{"port env not a number", "", portEnv, "abc", portEnv, portKey},
+		{"port env zero", "", portEnv, "0", portEnv, portKey},
+		{"port env too big", "", portEnv, "70000", portEnv, portKey},
+		{"port yaml too big", "smtp: {port: 70000}\n", "", "", portKey, portEnv},
+		{"port yaml negative", "smtp: {port: -1}\n", "", "", portKey, portEnv},
+		{"port yaml zero", "smtp: {port: 0}\n", "", "", portKey, portEnv},
+		{"port yaml too big with valid env", "smtp: {port: 70000}\n", portEnv, "587", portKey, portEnv},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			clearConfigEnv(t)
+			tiersYAML(t, c.yaml)
+			if c.env != "" {
+				t.Setenv(c.env, c.val)
+			}
+			_, err := loadConfig()
+			if err == nil || !strings.Contains(err.Error(), c.want) {
+				t.Fatalf("want error naming %s, got %v", c.want, err)
+			}
+			if strings.Contains(err.Error(), c.notWant) {
+				t.Fatalf("error must not mention %s, got %v", c.notWant, err)
+			}
+		})
+	}
+}
+
+func TestLoadConfigBodyLimitAndSMTPPortDefaultsAndValid(t *testing.T) {
+	clearConfigEnv(t)
+	tiersYAML(t, "")
+	cfg, err := loadConfig()
+	if err != nil || cfg.MaxRequestBodyBytes != 20<<20 || cfg.SMTP.Port != 25 {
+		t.Fatalf("defaults: body=%d port=%d err=%v", cfg.MaxRequestBodyBytes, cfg.SMTP.Port, err)
+	}
+	t.Setenv("SMTP_PORT", "587")
+	t.Setenv("MAX_REQUEST_BODY_BYTES", "1024")
+	cfg, err = loadConfig()
+	if err != nil || cfg.MaxRequestBodyBytes != 1024 || cfg.SMTP.Port != 587 {
+		t.Fatalf("env: body=%d port=%d err=%v", cfg.MaxRequestBodyBytes, cfg.SMTP.Port, err)
+	}
+}
+
+func TestLoadConfigBodyLimitAndSMTPPortFromYAML(t *testing.T) {
+	clearConfigEnv(t)
+	tiersYAML(t, "smtp: {port: 587}\nlimits: {max_request_body_bytes: 1024}\n")
+	cfg, err := loadConfig()
+	if err != nil || cfg.MaxRequestBodyBytes != 1024 || cfg.SMTP.Port != 587 {
+		t.Fatalf("yaml: body=%d port=%d err=%v", cfg.MaxRequestBodyBytes, cfg.SMTP.Port, err)
+	}
+}
+
+func TestLoadConfigSMTPPortEnvWhitespaceAndBounds(t *testing.T) {
+	for _, c := range []struct {
+		val  string
+		want int
+	}{{" 587 ", 587}, {"1", 1}, {"65535", 65535}} {
+		t.Run(c.val, func(t *testing.T) {
+			clearConfigEnv(t)
+			tiersYAML(t, "")
+			t.Setenv("SMTP_PORT", c.val)
+			cfg, err := loadConfig()
+			if err != nil || cfg.SMTP.Port != c.want {
+				t.Fatalf("SMTP_PORT=%q: port=%d err=%v, want %d", c.val, cfg.SMTP.Port, err, c.want)
+			}
+		})
+	}
+}
+
+func TestLoadConfigUsageURLAndCacheTTLFromYAML(t *testing.T) {
+	clearConfigEnv(t)
+	tiersYAML(t, "usage_url: \"https://u.example/usage\"\nusage_cache_ttl: \"5s\"\n")
+	cfg, err := loadConfig()
+	if err != nil || cfg.UsageURL != "https://u.example/usage" || cfg.UsageCacheTTL != 5*time.Second {
+		t.Fatalf("yaml: url=%q ttl=%v err=%v", cfg.UsageURL, cfg.UsageCacheTTL, err)
+	}
+	t.Setenv("USAGE_URL", "https://env.example/usage")
+	t.Setenv("USAGE_CACHE_TTL", "9s")
+	cfg, err = loadConfig()
+	if err != nil || cfg.UsageURL != "https://env.example/usage" || cfg.UsageCacheTTL != 9*time.Second {
+		t.Fatalf("env over yaml: url=%q ttl=%v err=%v", cfg.UsageURL, cfg.UsageCacheTTL, err)
+	}
+}
+
+func TestLoadConfigUsageCacheTTLYAMLZeroDefaultAndInvalid(t *testing.T) {
+	clearConfigEnv(t)
+	tiersYAML(t, "usage_cache_ttl: \"0s\"\n")
+	if cfg, err := loadConfig(); err != nil || cfg.UsageCacheTTL != 0 {
+		t.Fatalf("zero: ttl=%v err=%v", cfg.UsageCacheTTL, err)
+	}
+	tiersYAML(t, "")
+	if cfg, err := loadConfig(); err != nil || cfg.UsageCacheTTL != defaultUsageCacheTTL || cfg.UsageURL != defaultUsageURL {
+		t.Fatalf("default: url=%q ttl=%v err=%v", cfg.UsageURL, cfg.UsageCacheTTL, err)
+	}
+	for _, v := range []string{"soon", "-1s"} {
+		tiersYAML(t, "usage_cache_ttl: \""+v+"\"\n")
+		if _, err := loadConfig(); err == nil || !strings.Contains(err.Error(), "usage_cache_ttl") {
+			t.Fatalf("%s: want error naming usage_cache_ttl, got %v", v, err)
+		}
+	}
+}
+
+func TestUsageURLFromYAMLReachesUsageLookup(t *testing.T) {
+	var hits atomic.Int32
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{}`))
+	}))
+	defer up.Close()
+	clearConfigEnv(t)
+	tiersYAML(t, "usage_url: \""+up.URL+"/usage\"\nusage_cache_ttl: \"0s\"\n")
+	cfg, err := loadConfig()
+	if err != nil {
+		t.Fatal(err)
+	}
+	app := newApp(cfg)
+	for i := 0; i < 2; i++ {
+		req := httptest.NewRequest(http.MethodGet, "/admin/keys", nil)
+		req.Header.Set("Authorization", "Bearer p")
+		app.ServeHTTP(httptest.NewRecorder(), req)
+	}
+	if n := hits.Load(); n != 2 {
+		t.Fatalf("usage lookups at yaml usage_url = %d, want 2 (yaml usage_cache_ttl 0s disables the cache)", n)
 	}
 }

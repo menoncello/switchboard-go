@@ -838,6 +838,68 @@ func TestPaidTierStreamIncludeUsage(t *testing.T) {
 	}
 }
 
+func TestPaidTierStreamResponsesNoIncludeUsage(t *testing.T) {
+	for _, tc := range []struct{ body, keep string }{
+		{`{"model":"a","stream":true}`, ""},
+		{`{"model":"a","stream":true,"stream_options":{"x":1}}`, `"x":1`},
+	} {
+		paid := newCapUpstream(t, 200, "application/json", `{}`)
+		app := capApp(t, paid, nil, "")
+		rec := tierReq(app, http.MethodPost, "/v1/responses", tc.body, nil)
+		pb := paid.seen()
+		if rec.Code != 200 || len(pb) != 1 || strings.Contains(pb[0], "include_usage") || !strings.Contains(pb[0], tc.keep) ||
+			(tc.keep == "" && strings.Contains(pb[0], "stream_options")) {
+			t.Fatalf("body %s: status %d, upstream %v", tc.body, rec.Code, pb)
+		}
+	}
+}
+
+func TestPaidTierStreamNonChatPathsBodyUnchanged(t *testing.T) {
+	for _, path := range []string{"/v1/responses", "/v1/completions"} {
+		paid := newCapUpstream(t, 200, "application/json", `{}`)
+		app := capApp(t, paid, nil, "")
+		rec := tierReq(app, http.MethodPost, path, `{"model":"a","stream":true}`, nil)
+		pb := paid.seen()
+		if rec.Code != 200 || len(pb) != 1 || strings.Contains(pb[0], "include_usage") || strings.Contains(pb[0], "stream_options") {
+			t.Fatalf("%s: status %d, upstream %v", path, rec.Code, pb)
+		}
+	}
+}
+
+func TestPaidTierChatCompletionsUnprefixedIncludeUsage(t *testing.T) {
+	paid := newCapUpstream(t, 200, "application/json", `{}`)
+	app := capApp(t, paid, nil, "")
+	rec := tierReq(app, http.MethodPost, "/chat/completions", `{"model":"a","stream":true}`, nil)
+	if pb := paid.seen(); rec.Code != 200 || len(pb) != 1 || !strings.Contains(pb[0], `"include_usage":true`) {
+		t.Fatalf("status %d, upstream %v", rec.Code, pb)
+	}
+}
+
+func TestParseUsageResponsesCompletedEvent(t *testing.T) {
+	line := `{"type":"response.completed","response":{"usage":{"input_tokens":1245,"output_tokens":52,"total_tokens":1297,"input_tokens_details":{"cached_tokens":1152}}}}`
+	if u := parseUsage([]byte(line)); !u.found || u.in != 1245 || u.out != 52 || u.cache != 1152 {
+		t.Fatalf("usage: %+v", u)
+	}
+	created := `{"type":"response.created","response":{"id":"r1","usage":null}}`
+	if u := parseUsage([]byte(created)); u.found {
+		t.Fatalf("response.created must not count: %+v", u)
+	}
+}
+
+func TestPaidTierResponsesStreamUsage(t *testing.T) {
+	sse := "event: response.created\n" +
+		`data: {"type":"response.created","response":{"id":"r1","object":"response","usage":null}}` + "\n\n" +
+		"event: response.completed\n" +
+		`data: {"type":"response.completed","response":{"id":"r1","usage":{"input_tokens":1245,"output_tokens":52,"total_tokens":1297,"input_tokens_details":{"cached_tokens":1152}}}}` + "\n\n"
+	paid := newCapUpstream(t, 200, "text/event-stream", sse)
+	app := capApp(t, paid, nil, "")
+	rec := tierReq(app, http.MethodPost, "/v1/responses", `{"model":"a","stream":true}`, nil)
+	r := app.history.snapshot()
+	if rec.Code != 200 || len(r) != 1 || r[0].TokensIn != 1245 || r[0].TokensOut != 52 || r[0].TokensCacheIn != 1152 || r[0].NoUsage != 0 {
+		t.Fatalf("code=%d rows: %+v", rec.Code, r)
+	}
+}
+
 func TestPaidTierStreamOptionsOddShapes(t *testing.T) {
 	for _, so := range []string{`null`, `"x"`, `{"include_usage":false,"x":1}`} {
 		paid := newCapUpstream(t, 200, "application/json", `{}`)
@@ -915,6 +977,9 @@ func alertApp(t *testing.T, usageFile string, sendErr error, mod ...func(*Config
 	}
 	app := newApp(cfg)
 	app.history.now = func() time.Time { return capNow }
+	for _, tr := range cfg.Tiers { // tier 0 always fails here: keep the tier switch warning out of the paid first-use checks
+		app.sender.warned[tr.Name] = 1
+	}
 	return app, msgs
 }
 
