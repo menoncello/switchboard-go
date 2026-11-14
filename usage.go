@@ -27,6 +27,9 @@ type usageFields struct {
 	PromptDetails struct {
 		CachedTokens int `json:"cached_tokens"`
 	} `json:"prompt_tokens_details"`
+	InputDetails struct { // OpenAI Responses API
+		CachedTokens int `json:"cached_tokens"`
+	} `json:"input_tokens_details"`
 }
 
 // parseUsage reads `usage` from the top of raw (OpenAI, Anthropic JSON, stream chunk, Responses API JSON body),
@@ -56,7 +59,8 @@ func parseUsage(raw []byte) usageTokens {
 		return usageTokens{}
 	}
 	t := usageTokens{in: max(u.PromptTokens, u.InputTokens), out: max(u.CompletionTokens, u.OutputTokens),
-		cache: u.CacheCreation + u.CacheRead + u.PromptDetails.CachedTokens}
+		cache: u.CacheCreation + u.CacheRead +
+			u.PromptDetails.CachedTokens + u.InputDetails.CachedTokens}
 	t.found = t.in > 0 || t.out > 0
 	return t
 }

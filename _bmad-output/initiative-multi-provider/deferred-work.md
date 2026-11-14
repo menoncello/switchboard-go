@@ -30,3 +30,7 @@
 ## Deferred from: code review of story-recorrencia-do-agente-no-orca-plan (2026-10-31)
 
 - `--workspace path:<dir>` aceito pelo Orca não confirmado em `docs/catalog-agent.md:120`; rodar o comando uma vez (verify hitl) resolve.
+
+## Deferred from: code review of story-include-usage-so-onde-o-upstream-aceita-plan (2026-11-14)
+
+- `sseUsageScanner` descarta linhas SSE acima de `maxUsageBody` (1 MiB). O evento `response.completed` da Responses API traz o output inteiro e as instructions, então respostas longas em `/v1/responses` perdem o usage e vão a "Sem usage" com custo de pior caso, o que pode antecipar o teto diário. Corrigir pede ler o `usage` do fim da linha ou um decoder em streaming (usage.go:77-84).

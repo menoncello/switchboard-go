@@ -311,8 +311,9 @@ func (a *App) tierCapped(t TierConfig) bool {
 }
 
 // withIncludeUsage returns fields with stream_options.include_usage set to true, keeping other
-// stream_options keys. fields is not changed. Only /chat/completions accepts the field; /v1/responses
-// rejects it with 400, so the caller must not apply this there.
+// stream_options keys. fields is not changed. Some models reject the field on /v1/responses (gpt-5.6-luna
+// answers 400, grok-4.7 accepts it) and that API already reports usage in response.completed, so the
+// caller applies this only on /chat/completions.
 func withIncludeUsage(fields map[string]json.RawMessage) map[string]json.RawMessage {
 	opts := map[string]json.RawMessage{}
 	_ = json.Unmarshal(fields["stream_options"], &opts) // not an object (or null): start empty

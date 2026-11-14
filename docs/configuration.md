@@ -275,8 +275,9 @@ tier, and the state `teto` with the seconds to midnight while the cap holds.
 The cost of a request is only known when it ends, so a request already in flight can take the
 tier past the cap. For `/chat/completions` requests with `stream: true` sent to a paid tier, the proxy
 adds `stream_options.include_usage: true` (other `stream_options` keys are kept) so the provider
-reports usage; free tiers, Anthropic-style requests and `/v1/responses` (which reports usage in its
-`response.completed` event and rejects that field) get the body unchanged. A 2xx response
+reports usage; free tiers, Anthropic-style requests and other OpenAI paths such as `/v1/responses`
+(which reports usage in its `response.completed` event, and some models reject the field there) and
+`/v1/completions` get the body unchanged. A 2xx response
 from a paid tier with no `usage` is charged the highest `input` or `output` price in the whole
 `prices` map, as USD (the cost of 1M tokens, a deliberate worst case), and counts in "Sem usage".
 Free tiers keep cost 0 in that case.

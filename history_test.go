@@ -854,6 +854,18 @@ func TestPaidTierStreamResponsesNoIncludeUsage(t *testing.T) {
 	}
 }
 
+func TestPaidTierStreamNonChatPathsBodyUnchanged(t *testing.T) {
+	for _, path := range []string{"/v1/responses", "/v1/completions"} {
+		paid := newCapUpstream(t, 200, "application/json", `{}`)
+		app := capApp(t, paid, nil, "")
+		rec := tierReq(app, http.MethodPost, path, `{"model":"a","stream":true}`, nil)
+		pb := paid.seen()
+		if rec.Code != 200 || len(pb) != 1 || strings.Contains(pb[0], "include_usage") || strings.Contains(pb[0], "stream_options") {
+			t.Fatalf("%s: status %d, upstream %v", path, rec.Code, pb)
+		}
+	}
+}
+
 func TestPaidTierChatCompletionsUnprefixedIncludeUsage(t *testing.T) {
 	paid := newCapUpstream(t, 200, "application/json", `{}`)
 	app := capApp(t, paid, nil, "")
@@ -865,7 +877,7 @@ func TestPaidTierChatCompletionsUnprefixedIncludeUsage(t *testing.T) {
 
 func TestParseUsageResponsesCompletedEvent(t *testing.T) {
 	line := `{"type":"response.completed","response":{"usage":{"input_tokens":1245,"output_tokens":52,"total_tokens":1297,"input_tokens_details":{"cached_tokens":1152}}}}`
-	if u := parseUsage([]byte(line)); !u.found || u.in != 1245 || u.out != 52 {
+	if u := parseUsage([]byte(line)); !u.found || u.in != 1245 || u.out != 52 || u.cache != 1152 {
 		t.Fatalf("usage: %+v", u)
 	}
 	created := `{"type":"response.created","response":{"id":"r1","usage":null}}`
@@ -883,7 +895,7 @@ func TestPaidTierResponsesStreamUsage(t *testing.T) {
 	app := capApp(t, paid, nil, "")
 	rec := tierReq(app, http.MethodPost, "/v1/responses", `{"model":"a","stream":true}`, nil)
 	r := app.history.snapshot()
-	if rec.Code != 200 || len(r) != 1 || r[0].TokensIn != 1245 || r[0].TokensOut != 52 || r[0].NoUsage != 0 {
+	if rec.Code != 200 || len(r) != 1 || r[0].TokensIn != 1245 || r[0].TokensOut != 52 || r[0].TokensCacheIn != 1152 || r[0].NoUsage != 0 {
 		t.Fatalf("code=%d rows: %+v", rec.Code, r)
 	}
 }
