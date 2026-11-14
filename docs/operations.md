@@ -62,7 +62,8 @@ disables the cooldown: exhausted keys are retried on the very next request and n
   key and tier; project and model names come from the client), but never key values. If the proxy has a public URL,
   restrict the port by network (firewall, VPN or reverse-proxy allowlist) so only trusted clients can reach
   `/status`. Each visit can also trigger usage queries to the upstream with your keys when the usage cache has
-  expired.
+  expired. The endpoint and cache time come from `usage_url` and `usage_cache_ttl` in the YAML (or `USAGE_URL` and
+  `USAGE_CACHE_TTL`, which win over the file).
 - `/v1/*` and `/admin/*` require authentication.
 
 ## Operational behavior
@@ -72,6 +73,9 @@ disables the cooldown: exhausted keys are retried on the very next request and n
   exhausted-key retry cooldown.
 - Request bodies larger than `max_request_body_bytes` are rejected with HTTP
   `413`.
+- Startup fails, naming the field, when `max_request_body_bytes` or `smtp.port`
+  (or `MAX_REQUEST_BODY_BYTES` / `SMTP_PORT`) is not a valid number, as it does
+  for an invalid duration. A `0` in the YAML for either field keeps the default.
 - Hop-by-hop and proxy headers are stripped when forwarding.
 - The proxy sets a compatible default upstream `User-Agent` if the client does
   not provide one. This avoids upstream blocks of generic HTTP clients.

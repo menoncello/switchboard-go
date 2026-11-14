@@ -92,6 +92,10 @@ state_file: "/var/lib/switchboard-go/state.json"
 usage_file: "/var/lib/switchboard-go/usage.json"
 timezone: "America/Sao_Paulo"
 
+# Usage lookup for /admin/keys and /status (see USAGE_URL and USAGE_CACHE_TTL).
+usage_url: "https://opencode.ai/zen/go/v1/usage"
+usage_cache_ttl: "60s"
+
 # USD per 1M tokens, by tier name and mapped model id (see "Usage history").
 prices:
   nome-do-tier:
@@ -383,13 +387,13 @@ after validation.
 | `LISTEN_ADDR` | No | `:8080` | HTTP listen address. Use `127.0.0.1:8080` for local-only access. |
 | `UPSTREAM_BASE_URL` | No | `https://opencode.ai/zen/go/v1` | OpenCode Go upstream base URL for OpenAI-compatible and Anthropic Messages-compatible routes. |
 | `OPENCODE_GO_KEY_NAMES` | No | | Comma-separated labels for the keys, in the same order as `OPENCODE_GO_API_KEYS`. Shown by `/admin/keys` so a key is identified by name and index, never by value. Missing or shorter list means empty names. Max 40 characters each; line breaks are removed. |
-| `USAGE_URL` | No | `https://opencode.ai/zen/go/v1/usage` | OpenCode Go usage endpoint queried by `/admin/keys` (override for tests). |
-| `USAGE_CACHE_TTL` | No | `60s` | How long `/admin/keys` reuses each key's usage lookup, so a refreshing dashboard does not hammer the upstream. Go duration. `0` disables the cache. |
-| `MAX_REQUEST_BODY_BYTES` | No | `20971520` | Maximum request body size. Requests above this return `413`. |
+| `USAGE_URL` | No | `https://opencode.ai/zen/go/v1/usage` | OpenCode Go usage endpoint queried by `/admin/keys` and `/status` (override for tests). Maps to `usage_url`. |
+| `USAGE_CACHE_TTL` | No | `60s` | How long `/admin/keys` reuses each key's usage lookup, so a refreshing dashboard does not hammer the upstream. Go duration. `0` disables the cache. Maps to `usage_cache_ttl`; an invalid or negative value stops startup. |
+| `MAX_REQUEST_BODY_BYTES` | No | `20971520` | Maximum request body size. Requests above this return `413`. Maps to `limits.max_request_body_bytes`. A value that is not a whole number > 0 stops startup (`0` in the YAML means the default). |
 | `RETRY_EXHAUSTED_AFTER` | No | `5m` | Cooldown before an exhausted key is retried automatically. Go duration (`30s`, `5m`). `0` disables the cooldown (retry on the next request). Maps to `upstream.retry_exhausted_after`. |
 | `UPSTREAM_RESPONSE_HEADER_TIMEOUT` | No | `30s` | Max wait for response headers from the upstream API. Go duration (`30s`, `5m`). `0` disables it. Maps to `upstream.response_header_timeout`. |
 | `SMTP_HOST` | No | | SMTP host for notifications. |
-| `SMTP_PORT` | No | `25` | SMTP port. |
+| `SMTP_PORT` | No | `25` | SMTP port. Maps to `smtp.port`. A value that is not a whole number from 1 to 65535 stops startup (`0` in the YAML means the default). |
 | `SMTP_USERNAME` | No | | SMTP username. If empty, SMTP AUTH is skipped. |
 | `SMTP_PASSWORD` | No | | SMTP password. |
 | `SMTP_FROM` | No | | Sender email address. Required for notifications. |

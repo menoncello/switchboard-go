@@ -3531,3 +3531,97 @@ func TestV1CompletionsServedByOpenAIOnlyTier(t *testing.T) {
 		t.Fatalf("hits=%d auth=%q x-api-key=%q", hits.Load(), auth, apiKey)
 	}
 }
+
+func TestLoadConfigRejectsInvalidBodyLimitAndSMTPPort(t *testing.T) {
+	cases := []struct{ name, yaml, env, val, want string }{
+		{"body env not a number", "", "MAX_REQUEST_BODY_BYTES", "abc", "MAX_REQUEST_BODY_BYTES"},
+		{"body env zero", "", "MAX_REQUEST_BODY_BYTES", "0", "MAX_REQUEST_BODY_BYTES"},
+		{"body env negative", "", "MAX_REQUEST_BODY_BYTES", "-5", "MAX_REQUEST_BODY_BYTES"},
+		{"body yaml negative", "limits: {max_request_body_bytes: -5}\n", "", "", "max_request_body_bytes"},
+		{"port env not a number", "", "SMTP_PORT", "abc", "SMTP_PORT"},
+		{"port env zero", "", "SMTP_PORT", "0", "SMTP_PORT"},
+		{"port env too big", "", "SMTP_PORT", "70000", "SMTP_PORT"},
+		{"port yaml too big", "smtp: {port: 70000}\n", "", "", "smtp.port"},
+		{"port yaml negative", "smtp: {port: -1}\n", "", "", "smtp.port"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			tiersYAML(t, c.yaml)
+			if c.env != "" {
+				t.Setenv(c.env, c.val)
+			}
+			if _, err := loadConfig(); err == nil || !strings.Contains(err.Error(), c.want) {
+				t.Fatalf("want error naming %s, got %v", c.want, err)
+			}
+		})
+	}
+}
+
+func TestLoadConfigBodyLimitAndSMTPPortDefaultsAndValid(t *testing.T) {
+	tiersYAML(t, "")
+	cfg, err := loadConfig()
+	if err != nil || cfg.MaxRequestBodyBytes != 20<<20 || cfg.SMTP.Port != 25 {
+		t.Fatalf("defaults: body=%d port=%d err=%v", cfg.MaxRequestBodyBytes, cfg.SMTP.Port, err)
+	}
+	t.Setenv("SMTP_PORT", "587")
+	t.Setenv("MAX_REQUEST_BODY_BYTES", "1024")
+	cfg, err = loadConfig()
+	if err != nil || cfg.MaxRequestBodyBytes != 1024 || cfg.SMTP.Port != 587 {
+		t.Fatalf("env: body=%d port=%d err=%v", cfg.MaxRequestBodyBytes, cfg.SMTP.Port, err)
+	}
+}
+
+func TestLoadConfigUsageURLAndCacheTTLFromYAML(t *testing.T) {
+	tiersYAML(t, "usage_url: \"https://u.example/usage\"\nusage_cache_ttl: \"5s\"\n")
+	cfg, err := loadConfig()
+	if err != nil || cfg.UsageURL != "https://u.example/usage" || cfg.UsageCacheTTL != 5*time.Second {
+		t.Fatalf("yaml: url=%q ttl=%v err=%v", cfg.UsageURL, cfg.UsageCacheTTL, err)
+	}
+	t.Setenv("USAGE_URL", "https://env.example/usage")
+	t.Setenv("USAGE_CACHE_TTL", "9s")
+	cfg, err = loadConfig()
+	if err != nil || cfg.UsageURL != "https://env.example/usage" || cfg.UsageCacheTTL != 9*time.Second {
+		t.Fatalf("env over yaml: url=%q ttl=%v err=%v", cfg.UsageURL, cfg.UsageCacheTTL, err)
+	}
+}
+
+func TestLoadConfigUsageCacheTTLYAMLZeroDefaultAndInvalid(t *testing.T) {
+	tiersYAML(t, "usage_cache_ttl: \"0s\"\n")
+	if cfg, err := loadConfig(); err != nil || cfg.UsageCacheTTL != 0 {
+		t.Fatalf("zero: ttl=%v err=%v", cfg.UsageCacheTTL, err)
+	}
+	tiersYAML(t, "")
+	if cfg, err := loadConfig(); err != nil || cfg.UsageCacheTTL != defaultUsageCacheTTL || cfg.UsageURL != defaultUsageURL {
+		t.Fatalf("default: url=%q ttl=%v err=%v", cfg.UsageURL, cfg.UsageCacheTTL, err)
+	}
+	for _, v := range []string{"soon", "-1s"} {
+		tiersYAML(t, "usage_cache_ttl: \""+v+"\"\n")
+		if _, err := loadConfig(); err == nil || !strings.Contains(err.Error(), "usage_cache_ttl") {
+			t.Fatalf("%s: want error naming usage_cache_ttl, got %v", v, err)
+		}
+	}
+}
+
+func TestUsageURLFromYAMLReachesUsageLookup(t *testing.T) {
+	var hits atomic.Int32
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{}`))
+	}))
+	defer up.Close()
+	tiersYAML(t, "usage_url: \""+up.URL+"/usage\"\nusage_cache_ttl: \"1h\"\n")
+	cfg, err := loadConfig()
+	if err != nil {
+		t.Fatal(err)
+	}
+	app := newApp(cfg)
+	for i := 0; i < 2; i++ {
+		req := httptest.NewRequest(http.MethodGet, "/admin/keys", nil)
+		req.Header.Set("Authorization", "Bearer p")
+		app.ServeHTTP(httptest.NewRecorder(), req)
+	}
+	if n := hits.Load(); n != 1 {
+		t.Fatalf("usage lookups at yaml usage_url = %d, want 1 (second served from the 1h cache)", n)
+	}
+}
