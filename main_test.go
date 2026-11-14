@@ -3532,32 +3532,52 @@ func TestV1CompletionsServedByOpenAIOnlyTier(t *testing.T) {
 	}
 }
 
+// clearConfigEnv blanks the env vars these tests care about; an empty value is
+// treated as unset by applyEnvOverrides.
+func clearConfigEnv(t *testing.T) {
+	t.Helper()
+	for _, n := range []string{"SMTP_PORT", "MAX_REQUEST_BODY_BYTES", "USAGE_URL", "USAGE_CACHE_TTL"} {
+		t.Setenv(n, "")
+	}
+}
+
 func TestLoadConfigRejectsInvalidBodyLimitAndSMTPPort(t *testing.T) {
-	cases := []struct{ name, yaml, env, val, want string }{
-		{"body env not a number", "", "MAX_REQUEST_BODY_BYTES", "abc", "MAX_REQUEST_BODY_BYTES"},
-		{"body env zero", "", "MAX_REQUEST_BODY_BYTES", "0", "MAX_REQUEST_BODY_BYTES"},
-		{"body env negative", "", "MAX_REQUEST_BODY_BYTES", "-5", "MAX_REQUEST_BODY_BYTES"},
-		{"body yaml negative", "limits: {max_request_body_bytes: -5}\n", "", "", "max_request_body_bytes"},
-		{"port env not a number", "", "SMTP_PORT", "abc", "SMTP_PORT"},
-		{"port env zero", "", "SMTP_PORT", "0", "SMTP_PORT"},
-		{"port env too big", "", "SMTP_PORT", "70000", "SMTP_PORT"},
-		{"port yaml too big", "smtp: {port: 70000}\n", "", "", "smtp.port"},
-		{"port yaml negative", "smtp: {port: -1}\n", "", "", "smtp.port"},
+	const bodyEnv, bodyKey, portEnv, portKey = "MAX_REQUEST_BODY_BYTES", "limits.max_request_body_bytes", "SMTP_PORT", "smtp.port"
+	cases := []struct{ name, yaml, env, val, want, notWant string }{
+		{"body env not a number", "", bodyEnv, "abc", bodyEnv, bodyKey},
+		{"body env zero", "", bodyEnv, "0", bodyEnv, bodyKey},
+		{"body env negative", "", bodyEnv, "-5", bodyEnv, bodyKey},
+		{"body yaml negative", "limits: {max_request_body_bytes: -5}\n", "", "", bodyKey, bodyEnv},
+		{"body yaml zero", "limits: {max_request_body_bytes: 0}\n", "", "", bodyKey, bodyEnv},
+		{"body yaml negative with valid env", "limits: {max_request_body_bytes: -5}\n", bodyEnv, "1024", bodyKey, bodyEnv},
+		{"port env not a number", "", portEnv, "abc", portEnv, portKey},
+		{"port env zero", "", portEnv, "0", portEnv, portKey},
+		{"port env too big", "", portEnv, "70000", portEnv, portKey},
+		{"port yaml too big", "smtp: {port: 70000}\n", "", "", portKey, portEnv},
+		{"port yaml negative", "smtp: {port: -1}\n", "", "", portKey, portEnv},
+		{"port yaml zero", "smtp: {port: 0}\n", "", "", portKey, portEnv},
+		{"port yaml too big with valid env", "smtp: {port: 70000}\n", portEnv, "587", portKey, portEnv},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
+			clearConfigEnv(t)
 			tiersYAML(t, c.yaml)
 			if c.env != "" {
 				t.Setenv(c.env, c.val)
 			}
-			if _, err := loadConfig(); err == nil || !strings.Contains(err.Error(), c.want) {
+			_, err := loadConfig()
+			if err == nil || !strings.Contains(err.Error(), c.want) {
 				t.Fatalf("want error naming %s, got %v", c.want, err)
+			}
+			if strings.Contains(err.Error(), c.notWant) {
+				t.Fatalf("error must not mention %s, got %v", c.notWant, err)
 			}
 		})
 	}
 }
 
 func TestLoadConfigBodyLimitAndSMTPPortDefaultsAndValid(t *testing.T) {
+	clearConfigEnv(t)
 	tiersYAML(t, "")
 	cfg, err := loadConfig()
 	if err != nil || cfg.MaxRequestBodyBytes != 20<<20 || cfg.SMTP.Port != 25 {
@@ -3571,7 +3591,34 @@ func TestLoadConfigBodyLimitAndSMTPPortDefaultsAndValid(t *testing.T) {
 	}
 }
 
+func TestLoadConfigBodyLimitAndSMTPPortFromYAML(t *testing.T) {
+	clearConfigEnv(t)
+	tiersYAML(t, "smtp: {port: 587}\nlimits: {max_request_body_bytes: 1024}\n")
+	cfg, err := loadConfig()
+	if err != nil || cfg.MaxRequestBodyBytes != 1024 || cfg.SMTP.Port != 587 {
+		t.Fatalf("yaml: body=%d port=%d err=%v", cfg.MaxRequestBodyBytes, cfg.SMTP.Port, err)
+	}
+}
+
+func TestLoadConfigSMTPPortEnvWhitespaceAndBounds(t *testing.T) {
+	for _, c := range []struct {
+		val  string
+		want int
+	}{{" 587 ", 587}, {"1", 1}, {"65535", 65535}} {
+		t.Run(c.val, func(t *testing.T) {
+			clearConfigEnv(t)
+			tiersYAML(t, "")
+			t.Setenv("SMTP_PORT", c.val)
+			cfg, err := loadConfig()
+			if err != nil || cfg.SMTP.Port != c.want {
+				t.Fatalf("SMTP_PORT=%q: port=%d err=%v, want %d", c.val, cfg.SMTP.Port, err, c.want)
+			}
+		})
+	}
+}
+
 func TestLoadConfigUsageURLAndCacheTTLFromYAML(t *testing.T) {
+	clearConfigEnv(t)
 	tiersYAML(t, "usage_url: \"https://u.example/usage\"\nusage_cache_ttl: \"5s\"\n")
 	cfg, err := loadConfig()
 	if err != nil || cfg.UsageURL != "https://u.example/usage" || cfg.UsageCacheTTL != 5*time.Second {
@@ -3586,6 +3633,7 @@ func TestLoadConfigUsageURLAndCacheTTLFromYAML(t *testing.T) {
 }
 
 func TestLoadConfigUsageCacheTTLYAMLZeroDefaultAndInvalid(t *testing.T) {
+	clearConfigEnv(t)
 	tiersYAML(t, "usage_cache_ttl: \"0s\"\n")
 	if cfg, err := loadConfig(); err != nil || cfg.UsageCacheTTL != 0 {
 		t.Fatalf("zero: ttl=%v err=%v", cfg.UsageCacheTTL, err)
@@ -3610,7 +3658,8 @@ func TestUsageURLFromYAMLReachesUsageLookup(t *testing.T) {
 		_, _ = w.Write([]byte(`{}`))
 	}))
 	defer up.Close()
-	tiersYAML(t, "usage_url: \""+up.URL+"/usage\"\nusage_cache_ttl: \"1h\"\n")
+	clearConfigEnv(t)
+	tiersYAML(t, "usage_url: \""+up.URL+"/usage\"\nusage_cache_ttl: \"0s\"\n")
 	cfg, err := loadConfig()
 	if err != nil {
 		t.Fatal(err)
@@ -3621,7 +3670,7 @@ func TestUsageURLFromYAMLReachesUsageLookup(t *testing.T) {
 		req.Header.Set("Authorization", "Bearer p")
 		app.ServeHTTP(httptest.NewRecorder(), req)
 	}
-	if n := hits.Load(); n != 1 {
-		t.Fatalf("usage lookups at yaml usage_url = %d, want 1 (second served from the 1h cache)", n)
+	if n := hits.Load(); n != 2 {
+		t.Fatalf("usage lookups at yaml usage_url = %d, want 2 (yaml usage_cache_ttl 0s disables the cache)", n)
 	}
 }

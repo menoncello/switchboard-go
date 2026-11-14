@@ -75,7 +75,7 @@ disables the cooldown: exhausted keys are retried on the very next request and n
   `413`.
 - Startup fails, naming the field, when `max_request_body_bytes` or `smtp.port`
   (or `MAX_REQUEST_BODY_BYTES` / `SMTP_PORT`) is not a valid number, as it does
-  for an invalid duration. A `0` in the YAML for either field keeps the default.
+  for an invalid duration. An invalid value, including `0`, stops startup.
 - Hop-by-hop and proxy headers are stripped when forwarding.
 - The proxy sets a compatible default upstream `User-Agent` if the client does
   not provide one. This avoids upstream blocks of generic HTTP clients.

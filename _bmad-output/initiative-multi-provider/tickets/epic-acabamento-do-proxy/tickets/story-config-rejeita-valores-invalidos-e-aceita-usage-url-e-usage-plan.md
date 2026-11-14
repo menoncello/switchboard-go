@@ -3,7 +3,7 @@ title: 'Config rejeita valores inválidos e aceita usage_url e usage_cache_ttl n
 type: 'bugfix'
 ticket: '5'
 created: '2026-11-14'
-status: 'built'
+status: 'done'
 baseline_revision: '5d9dfa8734559c7c9506e9ea0af7d3ea04978e25'
 route: 'oneshot'
 route_source: 'auto'
@@ -46,7 +46,7 @@ Feito:
 - `yamlConfig` ganhou `usage_url` e `usage_cache_ttl` no topo; TTL inválido ou negativo no YAML falha em `loadYAMLConfig` com `usage_cache_ttl` na mensagem.
 - `main_test.go`: 5 testes novos, um deles confirma que `usage_url` do YAML é consultado por `/admin/keys` e que o `usage_cache_ttl` segura a segunda consulta.
 - Docs: `docs/operations.md` e a tabela e o exemplo de `docs/configuration.md`.
-- Limite: `limits.max_request_body_bytes: 0` e `smtp.port: 0` no YAML seguem lidos como "ausente" (o campo é inteiro, sem ponteiro).
+- Limite (resolvido no code review): `limits.max_request_body_bytes: 0` e `smtp.port: 0` no YAML eram lidos como "ausente"; os campos viraram ponteiro e `0` recusa a partida.
 
 ## Plan Change Log
 
@@ -75,3 +75,25 @@ Feito:
 - **Verificação:** `go test ./...` ok, `go vet` e `gofmt -l` limpos, antes e depois dos patches.
 - **Riscos residuais:** `0` explícito no YAML para `max_request_body_bytes` e `smtp.port` continua lido como ausente (documentado).
 
+
+## Code Review
+
+### 2026-11-14
+
+**Code review complete.** 1 `decision-needed`, 4 `patch`, 0 `defer`, 9 rejected.
+
+- [x] [Review][Patch] `0` explícito no YAML para `max_request_body_bytes`/`smtp.port` recusa a partida: `*int64`/`*int` em `yamlConfig`, como `MinContext` (decisão do Eduardo, opção a) [config.go:213]
+- [x] [Review][Patch] Faixa de `max_request_body_bytes`/`smtp.port` do YAML checada só depois do env (env válido esconde YAML inválido; mensagem única não diz a origem) — validar em `loadYAMLConfig`, como as durações [config.go:361]
+- [x] [Review][Patch] Faltam testes: `smtp.port`/`max_request_body_bytes` válidos pelo YAML, `SMTP_PORT` com espaços, portas 1 e 65535 [main_test.go:3534]
+- [x] [Review][Patch] Testes novos não limpam `SMTP_PORT`/`MAX_REQUEST_BODY_BYTES`/`USAGE_URL`/`USAGE_CACHE_TTL` do ambiente (`t.Setenv(x, "")` resolve sem helper novo) [main_test.go:3557]
+- [x] [Review][Patch] `TestUsageURLFromYAMLReachesUsageLookup` não prova que o TTL do YAML chega ao cache (o padrão de 60s dá o mesmo resultado) [main_test.go:3606]
+
+**Rejected:**
+- `usage_url` sem validação de URL (2 achados) — low: a falha já era a mesma com `USAGE_URL` e aparece logo em `usage_error`; uma URL sem esquema falha em `http.NewRequest` e nenhum token sai.
+- Falta nota de quebra de compatibilidade — low: as docs já dizem que valor inválido para a partida, e o erro nomeia o campo.
+- `mergeConfig` de `SMTP.Port` fora do diff — false: config.go:396 já usa `!= 0`.
+- Texto do plano desatualizado — low: cosmético, num registro de build.
+- Erros de `usage_cache_ttl` no YAML sem contexto e com checagem duplicada — false: segue o padrão de `retry_exhausted_after`, e a checagem é necessária por causa da sentinela `-1`.
+- `mergeConfig` com `src` montado à mão zera o TTL — false: o único chamador de produção recebe `-1`, e os testes não leem o TTL.
+- `validateConfig`, `readyz` e `validate-config` sem teste direto — false: todos recebem a `Config` de `loadConfig`.
+- `/status` sem teste com os valores do YAML — false: usa o mesmo lookup de `/admin/keys` (adminkeys.go:155).

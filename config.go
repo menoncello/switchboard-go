@@ -201,7 +201,7 @@ type yamlConfig struct {
 		Password string `yaml:"password"`
 		From     string `yaml:"from"`
 		To       string `yaml:"to"`
-		Port     int    `yaml:"port"`
+		Port     *int   `yaml:"port"`
 		TLS      bool   `yaml:"tls"`
 		StartTLS bool   `yaml:"starttls"`
 	} `yaml:"smtp"`
@@ -210,7 +210,7 @@ type yamlConfig struct {
 		ChatID   string `yaml:"chat_id"`
 	} `yaml:"telegram"`
 	Limits struct {
-		MaxRequestBodyBytes int64 `yaml:"max_request_body_bytes"`
+		MaxRequestBodyBytes *int64 `yaml:"max_request_body_bytes"`
 	} `yaml:"limits"`
 	MinContext    *int                            `yaml:"min_context"`
 	StateFile     string                          `yaml:"state_file"`
@@ -336,6 +336,20 @@ func loadYAMLConfig(path string) (Config, error) {
 		}
 		minContext = *yc.MinContext
 	}
+	var maxBody int64 // 0: not present in file, keep the default
+	if yc.Limits.MaxRequestBodyBytes != nil {
+		if *yc.Limits.MaxRequestBodyBytes <= 0 {
+			return Config{}, fmt.Errorf("limits.max_request_body_bytes must be a whole number > 0")
+		}
+		maxBody = *yc.Limits.MaxRequestBodyBytes
+	}
+	var smtpPort int // 0: not present in file, keep the default
+	if yc.SMTP.Port != nil {
+		if *yc.SMTP.Port < 1 || *yc.SMTP.Port > 65535 {
+			return Config{}, fmt.Errorf("smtp.port must be a whole number between 1 and 65535")
+		}
+		smtpPort = *yc.SMTP.Port
+	}
 	tiers, err := convertTiers(yc.Tiers)
 	if err != nil {
 		return Config{}, err
@@ -344,7 +358,7 @@ func loadYAMLConfig(path string) (Config, error) {
 	if err != nil {
 		return Config{}, err
 	}
-	return Config{Tiers: tiers, MinContext: minContext, StateFile: strings.TrimSpace(yc.StateFile), UsageFile: strings.TrimSpace(yc.UsageFile), UsageURL: strings.TrimSpace(yc.UsageURL), UsageCacheTTL: usageCacheTTL, Timezone: strings.TrimSpace(yc.Timezone), Prices: prices, ListenAddr: yc.Server.ListenAddr, UpstreamBaseURL: yc.Upstream.BaseURL, ProxyAPIKey: yc.Server.ProxyAPIKey, UpstreamAPIKeys: yc.Upstream.APIKeys, MaxRequestBodyBytes: yc.Limits.MaxRequestBodyBytes, RetryExhaustedAfter: retry, UpstreamResponseHeaderTimeout: headerTimeout, SMTP: SMTPConfig{Host: yc.SMTP.Host, Port: yc.SMTP.Port, Username: yc.SMTP.Username, Password: yc.SMTP.Password, From: yc.SMTP.From, To: yc.SMTP.To, TLS: yc.SMTP.TLS, StartTLS: yc.SMTP.StartTLS}, Telegram: TelegramConfig{BotToken: yc.Telegram.BotToken, ChatID: yc.Telegram.ChatID}}, nil
+	return Config{Tiers: tiers, MinContext: minContext, StateFile: strings.TrimSpace(yc.StateFile), UsageFile: strings.TrimSpace(yc.UsageFile), UsageURL: strings.TrimSpace(yc.UsageURL), UsageCacheTTL: usageCacheTTL, Timezone: strings.TrimSpace(yc.Timezone), Prices: prices, ListenAddr: yc.Server.ListenAddr, UpstreamBaseURL: yc.Upstream.BaseURL, ProxyAPIKey: yc.Server.ProxyAPIKey, UpstreamAPIKeys: yc.Upstream.APIKeys, MaxRequestBodyBytes: maxBody, RetryExhaustedAfter: retry, UpstreamResponseHeaderTimeout: headerTimeout, SMTP: SMTPConfig{Host: yc.SMTP.Host, Port: smtpPort, Username: yc.SMTP.Username, Password: yc.SMTP.Password, From: yc.SMTP.From, To: yc.SMTP.To, TLS: yc.SMTP.TLS, StartTLS: yc.SMTP.StartTLS}, Telegram: TelegramConfig{BotToken: yc.Telegram.BotToken, ChatID: yc.Telegram.ChatID}}, nil
 }
 
 func mergeConfig(dst *Config, src Config) {
@@ -360,7 +374,7 @@ func mergeConfig(dst *Config, src Config) {
 	if len(src.UpstreamAPIKeys) > 0 {
 		dst.UpstreamAPIKeys = append([]string(nil), src.UpstreamAPIKeys...)
 	}
-	if src.MaxRequestBodyBytes != 0 { // a negative value reaches validateConfig
+	if src.MaxRequestBodyBytes > 0 {
 		dst.MaxRequestBodyBytes = src.MaxRequestBodyBytes
 	}
 	if src.RetryExhaustedAfter >= 0 {
@@ -528,7 +542,7 @@ func validateConfig(cfg Config) error {
 		return errors.New("UPSTREAM_BASE_URL is required")
 	}
 	if cfg.MaxRequestBodyBytes <= 0 {
-		return errors.New("MAX_REQUEST_BODY_BYTES (limits.max_request_body_bytes) must be a whole number > 0")
+		return errors.New("MAX_REQUEST_BODY_BYTES must be a whole number > 0")
 	}
 	if cfg.RetryExhaustedAfter < 0 {
 		return errors.New("RETRY_EXHAUSTED_AFTER must be >= 0")
@@ -544,7 +558,7 @@ func validateConfig(cfg Config) error {
 	}
 	// 0 is only "not set" in a hand-built Config; loadConfig starts from port 25.
 	if cfg.SMTP.Port < 0 || cfg.SMTP.Port > 65535 {
-		return errors.New("SMTP_PORT (smtp.port) must be a whole number between 1 and 65535")
+		return errors.New("SMTP_PORT must be a whole number between 1 and 65535")
 	}
 	if cfg.Timezone != "" {
 		_, err := time.LoadLocation(cfg.Timezone)
